@@ -662,3 +662,90 @@ class MiteredSweep:
 
     def watertight_violations(self) -> list:
         return []
+
+
+class SphereOverlap:
+    """Union/intersection/difference of two GENUINELY OVERLAPPING spheres —
+    exact in ℚ[π]. The lens (intersection) is a sum of two spherical caps,
+    each of volume π h²(3r − h)/3 with h rational when the centre distance
+    and radii are rational, so every boolean volume stays in ℚ[π]:
+
+        d1 = (d² + r1² − r2²)/(2d)   (rational plane offset from centre 1)
+        h1 = r1 − d1,  h2 = r2 − (d − d1)   (rational cap heights)
+        lens = cap(r1,h1) + cap(r2,h2),  cap(r,h)=π h²(3r−h)/3
+        union = V1 + V2 − lens,  cut = V1 − lens,  intersect = lens
+
+    Parallel-cylinder overlap and cylinder–wall crossing are TRANSCENDENTAL
+    (arccos/√ lens) and are refused elsewhere — this is the exact case."""
+
+    def __init__(self, a: Sphere, b: Sphere, op: str) -> None:
+        self.a, self.b, self.op = a, b, op
+        d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2 + (a.cz - b.cz) ** 2
+        if d2 >= (a.r + b.r) ** 2:
+            raise ValueError("spheres do not overlap (use DisjointUnion)")
+        if d2 <= (a.r - b.r) ** 2:
+            raise ValueError("one sphere contains the other (K2.3 nesting)")
+        # d must be rational for the caps to stay in ℚ[π]
+        import math as _m
+        dn, dd = d2.numerator, d2.denominator
+        rn, rd = _m.isqrt(dn), _m.isqrt(dd)
+        if rn * rn != dn or rd * rd != dd:
+            raise ValueError(
+                "irrational centre distance — the cap heights leave ℚ[π] "
+                "(K3: algebraic/transcendental)")
+        self.d = Fraction(rn, rd)
+
+    @staticmethod
+    def _cap(r: Fraction, h: Fraction) -> Fraction:
+        # π-coefficient of the cap volume π h²(3r − h)/3
+        return h * h * (3 * r - h) / 3
+
+    def _lens_picoeff(self) -> Fraction:
+        r1, r2, d = self.a.r, self.b.r, self.d
+        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+        h1 = r1 - d1
+        h2 = r2 - (d - d1)
+        return self._cap(r1, h1) + self._cap(r2, h2)
+
+    def volume(self) -> PiVal:
+        v1 = Fraction(4, 3) * self.a.r ** 3
+        v2 = Fraction(4, 3) * self.b.r ** 3
+        lens = self._lens_picoeff()
+        if self.op == "intersect":
+            return PiVal(0, lens)
+        if self.op == "cut":
+            return PiVal(0, v1 - lens)
+        return PiVal(0, v1 + v2 - lens)      # union
+
+    def centroid_f(self) -> tuple:
+        return (float((self.a.cx + self.b.cx) / 2),
+                float((self.a.cy + self.b.cy) / 2),
+                float((self.a.cz + self.b.cz) / 2))
+
+    def bbox(self):
+        a, b = self.a, self.b
+        if self.op == "intersect":
+            lo = (max(a.cx - a.r, b.cx - b.r), max(a.cy - a.r, b.cy - b.r),
+                  max(a.cz - a.r, b.cz - b.r))
+            hi = (min(a.cx + a.r, b.cx + b.r), min(a.cy + a.r, b.cy + b.r),
+                  min(a.cz + a.r, b.cz + b.r))
+            return (tuple(float(v) for v in lo), tuple(float(v) for v in hi))
+        s = a if self.op == "cut" else None
+        boxes = [a] if s else [a, b]
+        lo = (min(float(x.cx - x.r) for x in boxes),
+              min(float(x.cy - x.r) for x in boxes),
+              min(float(x.cz - x.r) for x in boxes))
+        hi = (max(float(x.cx + x.r) for x in boxes),
+              max(float(x.cy + x.r) for x in boxes),
+              max(float(x.cz + x.r) for x in boxes))
+        return (lo, hi)
+
+    def watertight_violations(self) -> list:
+        return []
+
+
+def steinmetz(r) -> PiVal:
+    """Intersection of two equal perpendicular cylinders radius r (the
+    bicylinder / Steinmetz solid) — famously EXACT and π-free: 16 r³/3."""
+    r = F(r)
+    return PiVal(Fraction(16, 3) * r ** 3, 0)

@@ -425,3 +425,36 @@ def test_axisstack_mesh_converges() -> None:
     fine = mesh_volume(s.tessellate(0.02))
     assert abs(fine - exact) < abs(coarse - exact)        # finer is closer
     assert abs(fine - exact) / exact < 0.02
+
+
+# -- K2.2: non-coaxial quadric booleans that stay exact in Q[pi] --------------
+
+def test_sphere_overlap_booleans_exact() -> None:
+    from forgekernel.quadric import PiVal, Sphere, SphereOverlap
+
+    a = Sphere.make(5)
+    b = Sphere.make(5).translated(6, 0, 0)   # d=6 < 10 overlap, > 0 not nested
+    # d1=3, h1=h2=2, cap=52/3 each, lens=104/3
+    assert SphereOverlap(a, b, "intersect").volume() == PiVal(0, Fraction(104, 3))
+    assert SphereOverlap(a, b, "union").volume() == PiVal(0, Fraction(896, 3))
+    assert SphereOverlap(a, b, "cut").volume() == PiVal(0, 132)   # 500/3 - 104/3
+
+
+def test_sphere_overlap_refuses_nonoverlap_and_irrational() -> None:
+    import pytest as _pytest
+
+    from forgekernel.quadric import Sphere, SphereOverlap
+
+    with _pytest.raises(ValueError, match="do not overlap"):
+        SphereOverlap(Sphere.make(2), Sphere.make(2).translated(10, 0, 0), "union")
+    with _pytest.raises(ValueError, match="contains"):
+        SphereOverlap(Sphere.make(5), Sphere.make(1).translated(1, 0, 0), "union")
+    with _pytest.raises(ValueError, match="irrational"):
+        SphereOverlap(Sphere.make(5), Sphere.make(5).translated(1, 1, 0), "union")  # d=√2
+
+
+def test_steinmetz_is_exact_and_pi_free() -> None:
+    from forgekernel.quadric import PiVal, steinmetz
+
+    assert steinmetz(3) == PiVal(144, 0)      # 16*27/3, no pi at all
+    assert steinmetz(Fraction(1, 2)) == PiVal(Fraction(2, 3), 0)
