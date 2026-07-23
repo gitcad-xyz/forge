@@ -797,16 +797,35 @@ class FilletedBox:
                 v[a], v[o1], v[o2] = end, c1, c2
                 vset.add(tuple(v))
             verts.append(vset)
-        for i in range(len(verts)):
-            for j in range(i + 1, len(verts)):
-                if verts[i] & verts[j]:
-                    raise ValueError(
-                        "adjacent filleted edges need the spherical corner "
-                        "patch (arrives at K5.1)")
+        # K5.1: classify every box vertex by how many SELECTED edges meet
+        # there. 0/1 → nothing special; 3 → the sphere-OCTANT corner
+        # patch (exact in ℚ[π]: removed corner material = r³ − πr³/6,
+        # and each incident edge's run is shortened by r); 2 → the blend
+        # is a genuinely non-spherical surface — refuses (K5.2).
+        incident: dict = {}
+        for i, vset in enumerate(verts):
+            for v in vset:
+                incident.setdefault(v, []).append(i)
+        self.corners: list[tuple] = []
+        self._shorten: dict[int, int] = {i: 0 for i in range(len(self.edges))}
+        for v, idxs in incident.items():
+            if len(idxs) == 2:
+                raise ValueError(
+                    "two filleted edges meeting at a corner (third sharp) "
+                    "need a non-spherical blend (arrives at K5.2)")
+            if len(idxs) == 3:
+                self.corners.append(v)
+                for i in idxs:
+                    self._shorten[i] += 1
 
-    def _edge_len(self, axis: str) -> F:
+    def _edge_len(self, i: int) -> F:
+        axis = self.edges[i][0]
         a = {"x": 0, "y": 1, "z": 2}[axis]
-        return self.hi[a] - self.lo[a]
+        full = self.hi[a] - self.lo[a]
+        eff = full - self.r * self._shorten[i]
+        if eff < 0:
+            raise ValueError("fillet radius exceeds the edge length")
+        return eff
 
     def volume(self) -> PiVal:
         vbox = F(1)
@@ -814,10 +833,15 @@ class FilletedBox:
             vbox *= self.hi[c] - self.lo[c]
         rat = vbox
         pi_c = F(0)
-        for axis, _, _ in self.edges:
-            L = self._edge_len(axis)
+        for i in range(len(self.edges)):
+            L = self._edge_len(i)
             rat -= self.r * self.r * L
             pi_c += self.r * self.r * L / 4
+        # sphere-octant corner patches: removed = r³ − πr³/6 each
+        r3 = self.r ** 3
+        n = len(self.corners)
+        rat -= n * r3
+        pi_c += n * r3 / 6
         return PiVal(rat, pi_c)
 
     def centroid_f(self):
@@ -837,13 +861,20 @@ class FilletedBox:
         #   c* = (r/2·r² − (r−4r/3π)·πr²/4) / (r²−πr²/4)
         area = r * r - math.pi * r * r / 4
         cstar = (r * r * (r / 2) - (math.pi * r * r / 4) * (r - 4 * r / (3 * math.pi))) / area
-        for axis, sa, sb in self.edges:
+        for i, (axis, sa, sb) in enumerate(self.edges):
             a = axes[axis]
             o1, o2 = [c for c in range(3) if c != a]
-            L = float(self._edge_len(axis))
+            L = float(self._edge_len(i))
             vrem = area * L
             crem = [0.0, 0.0, 0.0]
-            crem[a] = float(self.lo[a] + self.hi[a]) / 2
+            # midpoint of the EFFECTIVE run (shortened r at 3-corner ends)
+            run_lo, run_hi = float(self.lo[a]), float(self.hi[a])
+            for v in self.corners:
+                if v[a] == self.lo[a] and self._touches(i, v):
+                    run_lo += r
+                if v[a] == self.hi[a] and self._touches(i, v):
+                    run_hi -= r
+            crem[a] = (run_lo + run_hi) / 2
             crem[o1] = (float(self.lo[o1]) + cstar if sa == "min"
                         else float(self.hi[o1]) - cstar)
             crem[o2] = (float(self.lo[o2]) + cstar if sb == "min"
@@ -851,7 +882,28 @@ class FilletedBox:
             vtot -= vrem
             for c in range(3):
                 num[c] -= vrem * crem[c]
+        # corner terms: removed cube-minus-octant at each 3-corner; its
+        # centroid sits c*₃ = r(1/2 − 5π/48)/(1 − π/6) inward per axis
+        if self.corners:
+            vrem_c = r ** 3 - math.pi * r ** 3 / 6
+            c3 = r * (0.5 - 5 * math.pi / 48) / (1 - math.pi / 6)
+            for v in self.corners:
+                crem = [0.0, 0.0, 0.0]
+                for c in range(3):
+                    inward = 1.0 if v[c] == self.lo[c] else -1.0
+                    crem[c] = float(v[c]) + inward * c3
+                vtot -= vrem_c
+                for c in range(3):
+                    num[c] -= vrem_c * crem[c]
         return tuple(n / vtot for n in num)
+
+    def _touches(self, edge_i: int, vertex) -> bool:
+        axis, sa, sb = self.edges[edge_i]
+        a = {"x": 0, "y": 1, "z": 2}[axis]
+        o1, o2 = [c for c in range(3) if c != a]
+        c1 = self.lo[o1] if sa == "min" else self.hi[o1]
+        c2 = self.lo[o2] if sb == "min" else self.hi[o2]
+        return vertex[o1] == c1 and vertex[o2] == c2
 
     def bbox(self):
         return self.lo, self.hi
