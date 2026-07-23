@@ -416,39 +416,66 @@ def _hodo_list(p, U, pts):
     return p - 1, U[1:-1], D
 
 
-def surface_partials2(surface: "BSplineSurface", u, v):
-    """(S, S_u, S_v, S_uu, S_uv, S_vv) — all exact ℚ³ for a POLYNOMIAL
-    surface (weights 1). Rational second partials arrive at K6.1."""
-    if any(w != F(1) for row in surface.w for w in row):
-        raise ValueError("second partials: polynomial surfaces only (K6.1)")
+def _h_partials2(surface: "BSplineSurface", u, v):
+    """Homogeneous 4-vector derivatives (H, H_u, H_v, H_uu, H_uv, H_vv)
+    of the weighted net — exact via double hodographs."""
     u, v = F(u), F(v)
     p, q, U, V = surface.p, surface.q, surface.U, surface.V
+    zero4 = (F(0),) * 4
 
     def eval_curve(pp, UU, pts, t):
-        return _deboor4(pp, UU, pts, t) if pp >= 0 and pts else \
-            (F(0),) * len(surface.cp[0][0])
+        return _deboor4(pp, UU, pts, t) if pp >= 0 and pts else zero4
 
-    # rows evaluated in v, then u-curves (S, S_u, S_uu from u-hodographs)
-    rows_v = [tuple(x) for x in
-              [_deboor4(q, V, [tuple(pt) for pt in row], v)
-               for row in [[pt for pt in r] for r in surface.cp]]]
-    S = _deboor4(p, U, rows_v, u)
+    rows_v = [tuple(_deboor4(q, V, [tuple(pt) for pt in row], v))
+              for row in surface.H]
+    H = _deboor4(p, U, rows_v, u)
     pu, Uu, Du = _hodo_list(p, U, rows_v)
-    S_u = eval_curve(pu, Uu, Du, u)
+    H_u = eval_curve(pu, Uu, Du, u)
     puu, Uuu, Duu = _hodo_list(pu, Uu, Du) if pu >= 1 else (-1, [], [])
-    S_uu = eval_curve(puu, Uuu, Duu, u)
-    # v-hodograph rows → S_v, S_vv; and u-hodograph of S_v rows → S_uv
+    H_uu = eval_curve(puu, Uuu, Duu, u)
     rows_dv, rows_dvv = [], []
-    for r in surface.cp:
+    for r in surface.H:
         qv, Vv, Dv = _hodo_list(q, V, [tuple(pt) for pt in r])
         rows_dv.append(eval_curve(qv, Vv, Dv, v))
         if qv >= 1:
             qvv, Vvv, Dvv = _hodo_list(qv, Vv, Dv)
             rows_dvv.append(eval_curve(qvv, Vvv, Dvv, v))
         else:
-            rows_dvv.append((F(0),) * 3)
-    S_v = _deboor4(p, U, rows_dv, u)
-    S_vv = _deboor4(p, U, rows_dvv, u)
+            rows_dvv.append(zero4)
+    H_v = _deboor4(p, U, rows_dv, u)
+    H_vv = _deboor4(p, U, rows_dvv, u)
     puv, Uuv, Duv = _hodo_list(p, U, rows_dv)
-    S_uv = eval_curve(puv, Uuv, Duv, u)
+    H_uv = eval_curve(puv, Uuv, Duv, u)
+    return H, H_u, H_v, H_uu, H_uv, H_vv
+
+
+def surface_partials2(surface: "BSplineSurface", u, v):
+    """(S, S_u, S_v, S_uu, S_uv, S_vv) — all exact ℚ³, polynomial OR
+    rational (K6.1). Recursive quotient rule in homogeneous space:
+
+        S    = A/w
+        S_x  = (A_x − S·w_x)/w
+        S_xy = (A_xy − S_x·w_y − S_y·w_x − S·w_xy)/w
+
+    — only +, ×, ÷ by rationals, so the result is exact whenever the
+    weights are."""
+    H, H_u, H_v, H_uu, H_uv, H_vv = _h_partials2(surface, u, v)
+    w = H[3]
+
+    def sub3(A, *terms):
+        """(A[0:3] − Σ coeff·vec)/w componentwise."""
+        out = []
+        for c in range(3):
+            acc = A[c]
+            for coeff, vec in terms:
+                acc -= coeff * vec[c]
+            out.append(acc / w)
+        return tuple(out)
+
+    S = (H[0] / w, H[1] / w, H[2] / w)
+    S_u = sub3(H_u, (H_u[3], S))
+    S_v = sub3(H_v, (H_v[3], S))
+    S_uu = sub3(H_uu, (2 * H_u[3], S_u), (H_uu[3], S))
+    S_vv = sub3(H_vv, (2 * H_v[3], S_v), (H_vv[3], S))
+    S_uv = sub3(H_uv, (H_u[3], S_v), (H_v[3], S_u), (H_uv[3], S))
     return S, S_u, S_v, S_uu, S_uv, S_vv

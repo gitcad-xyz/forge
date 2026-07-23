@@ -82,3 +82,52 @@ def test_g1_certification_is_a_proof_not_a_heuristic() -> None:
                             [(F(3, 2), 0, 2), (F(3, 2), 1, 2)],
                             [(2, 0, 4), (2, 1, 4)]])
     assert not g1_certify(A, B_gap)
+
+
+# -- K6.1: rational 2nd partials, G2 proofs, curvature combs ------------------
+
+def test_rational_second_partials_consistent() -> None:
+    from forgekernel.nurbs import BSplineSurface, surface_partials2
+
+    arc = [(1, 0), (1, 1), (0, 1)]
+    net = [[(x, y, F(-1, 2)), (x, y, F(1, 2))] for (x, y) in arc]
+    wts = [[F(1), F(1)], [F(3, 4), F(3, 4)], [F(1), F(1)]]
+    s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 1, 1], [0, 0, 1, 1], wts)
+    # first partials from the quotient-rule partials2 must equal the
+    # independently implemented (and OCCT-oracle-tested) partials()
+    S, Su, Sv = s.partials(F(1, 3), F(2, 5))
+    S2, Su2, Sv2, Suu, Suv, Svv = surface_partials2(s, F(1, 3), F(2, 5))
+    assert (S, Su, Sv) == (S2, Su2, Sv2)
+    assert all(isinstance(c, Fraction) for c in Suu + Suv + Svv)
+
+
+def test_g2_certifies_curvature_continuity() -> None:
+    from forgekernel.surfacing import g1_certify, g2_certify
+
+    # A: z = x² on [0,1]; B continues z = x² on [1,2] → C∞ → G2 holds
+    A = bezier_surface([[(0, 0, 0), (0, 1, 0)],
+                        [(F(1, 2), 0, 0), (F(1, 2), 1, 0)],
+                        [(1, 0, 1), (1, 1, 1)]])
+    B = bezier_surface([[(1, 0, 1), (1, 1, 1)],
+                        [(F(3, 2), 0, 2), (F(3, 2), 1, 2)],
+                        [(2, 0, 4), (2, 1, 4)]])
+    assert g2_certify(A, B)
+    # z = 2(x−1)² + 2(x−1) + 1: SAME tangent at the seam (G1 true) but
+    # curvature 4 vs 2 — the G2 certifier must catch what G1 cannot
+    B2 = bezier_surface([[(1, 0, 1), (1, 1, 1)],
+                         [(F(3, 2), 0, 2), (F(3, 2), 1, 2)],
+                         [(2, 0, 5), (2, 1, 5)]])
+    assert g1_certify(A, B2)          # tangent-continuous...
+    assert not g2_certify(A, B2)      # ...but curvature breaks
+
+
+def test_curvature_comb_peaks_at_the_apex() -> None:
+    from forgekernel.surfacing import curve_curvature_comb
+
+    comb = curve_curvature_comb(bezier([(0, 0, 0), (1, 2, 0), (2, 0, 0)]), n=8)
+    lens = [((t[0] - p[0]) ** 2 + (t[1] - p[1]) ** 2) ** 0.5
+            for p, t in comb]
+    assert max(lens) == lens[len(lens) // 2]      # parabola: κ max at apex
+    # the comb is a float VIEWER artifact (unlike the exact curvature
+    # values) — symmetric ends agree to float precision, not bitwise
+    assert lens[0] == pytest.approx(lens[-1])

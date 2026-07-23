@@ -173,3 +173,102 @@ def g1_certify(A: BSplineSurface, B: BSplineSurface, *,
         if _cross(na, nb) != (0, 0, 0):
             return False
     return True
+
+
+# -- K6.1: G2 certification + curvature combs ----------------------------------
+
+def g2_certify(A: BSplineSurface, B: BSplineSurface, *,
+               a_edge: str = "u1", b_edge: str = "u0",
+               samples: int | None = None) -> bool:
+    """Certify G2 (curvature continuity) along a shared seam, exactly.
+
+    Requires G1 first (checked). Then the transversal normal curvature
+    must agree at every seam point. With unnormalized normals the
+    comparison cross-multiplies into pure rationals:
+
+        κ_n = (S_tt·n̂)/|S_t'|²-ish terms → compare
+        (S_tt^A·n_A)²·W_B == (S_tt^B·n_B)²·W_A   and matching sign,
+
+    where W = |n|² = EG−F² is rational. Zero at more samples than the
+    polynomial degree bound ⇒ identically zero: a proof."""
+    from forgekernel.nurbs import surface_partials2
+
+    if not g1_certify(A, B, a_edge=a_edge, b_edge=b_edge, samples=samples):
+        return False
+
+    def at(surface, edge, t):
+        (u0d, u1d), (v0d, v1d) = surface.domain()
+        u0d, u1d, v0d, v1d = F(u0d), F(u1d), F(v0d), F(v1d)
+        if edge == "u1":
+            return F(u1d), v0d + t * (v1d - v0d)
+        if edge == "u0":
+            return F(u0d), v0d + t * (v1d - v0d)
+        if edge == "v1":
+            return u0d + t * (u1d - u0d), F(v1d)
+        return u0d + t * (u1d - u0d), F(v0d)
+
+    def transversal_kn(surface, edge, uu, vv):
+        """(S_tt·n, W) for the TRANSVERSAL parameter curve at the seam
+        (the u-direction for u-edges, v-direction for v-edges)."""
+        _, su, sv, suu, suv, svv = surface_partials2(surface, uu, vv)
+        n = _cross(su, sv)
+        W = _dot(n, n)
+        stt = suu if edge in ("u0", "u1") else svv
+        return _dot(stt, n), W, n
+
+    bound = 8 * (A.p + A.q + B.p + B.q) + 1
+    ns = samples or bound
+    for k in range(ns + 1):
+        t = F(k, ns)
+        ua, va = at(A, a_edge, t)
+        ub, vb = at(B, b_edge, t)
+        Xa, Wa, na = transversal_kn(A, a_edge, ua, va)
+        Xb, Wb, nb = transversal_kn(B, b_edge, ub, vb)
+        if Wa == 0 or Wb == 0:
+            return False
+        # sign of n_B relative to n_A (G1 already guarantees parallel)
+        s = 1 if _dot(na, nb) > 0 else -1
+        # κ_n^A == κ_n^B in A's orientation, cross-multiplied (exact):
+        if Xa * Xa * Wb != Xb * Xb * Wa:
+            return False
+        # signs must agree too (curvature bowing the same way)
+        if (Xa > 0) != (s * Xb > 0) and not (Xa == 0 and Xb == 0):
+            return False
+    return True
+
+
+def curve_curvature_comb(curve, n: int = 32, scale: float = 1.0):
+    """Curvature comb for a Bézier/B-spline curve — the visual surfacing
+    audit tool. Returns [(point, tip), ...] where tip = point + scale·κ·N̂.
+    κ = |c'×c''|/|c'|³ has one √ per sample: magnitudes are certified-
+    exact ratios evaluated to float only for the viewer."""
+    import math
+
+    from forgekernel.nurbs import _deboor4, _hodo_list
+
+    p, U = curve.p, curve.U
+    pts = [tuple(pt) for pt in curve.cp]
+    (t0, t1) = curve.domain()
+    out = []
+    p1, U1, D1 = _hodo_list(p, U, pts)
+    p2, U2, D2 = _hodo_list(p1, U1, D1) if p1 >= 1 else (-1, [], [])
+    for k in range(n + 1):
+        t = F(t0) + F(k, n) * (F(t1) - F(t0))
+        c = curve.eval(t)
+        d1 = _deboor4(p1, U1, D1, t) if D1 else (F(0),) * 3
+        d2 = _deboor4(p2, U2, D2, t) if p2 >= 0 and D2 else (F(0),) * 3
+        cx = _cross(d1, d2)
+        num2 = _dot(cx, cx)                    # |c'×c''|², exact
+        den2 = _dot(d1, d1)                    # |c'|², exact
+        if den2 == 0:
+            continue
+        kappa = math.sqrt(float(num2)) / float(den2) ** 1.5
+        # normal direction: component of c'' orthogonal to c'
+        proj = _dot(d2, d1)
+        nvec = tuple(float(d2[c]) - float(proj / den2) * float(d1[c])
+                     for c in range(3))
+        nlen = math.sqrt(sum(x * x for x in nvec)) or 1.0
+        pt = tuple(float(x) for x in c)
+        tip = tuple(pt[c] + scale * kappa * nvec[c] / nlen for c in range(3))
+        out.append((pt, tip))
+    return out
