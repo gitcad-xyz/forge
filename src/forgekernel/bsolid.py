@@ -134,3 +134,74 @@ def box_patches(dx, dy, dz, origin=(0, 0, 0)):
         patch((x0, y0, z0), (x0, y0, z1), (x0, y1, z0), (x0, y1, z1)),   # x0
         patch((x1, y0, z0), (x1, y1, z0), (x1, y0, z1), (x1, y1, z1)),   # x1
     ]
+
+
+# -- K7.0b: exact inertia tensor (same flux trick, one degree higher) ---------
+
+def _flux_moment(surface: BSplineSurface, fx, fy, fz):
+    """(1/1) ∮∮ (fx,fy,fz)·(S_u×S_v) du dv where fx,fy,fz are callables
+    of the point S — used to lift a volume integral to a surface flux.
+    Polynomial integrand ⇒ exact ℚ."""
+    if any(w != F(1) for row in surface.w for w in row):
+        raise ValueError("exact moments: polynomial patches only (K7.1)")
+    p, q = surface.p, surface.q
+    (u0, u1), (v0, v1) = surface.domain()
+    u0, u1, v0, v1 = F(u0), F(u1), F(v0), F(v1)
+    du, dv = u1 - u0, v1 - v0
+    # integrand degree rises by up to +2 for second moments → 3p+2 nodes
+    un, vn = _nodes(3 * p + 2), _nodes(3 * q + 2)
+    uw, vw = _lagrange_weights(un), _lagrange_weights(vn)
+    total = F(0)
+    for i, uu in enumerate(un):
+        for j, vv in enumerate(vn):
+            S, Su, Sv = surface_partials2(surface, u0 + uu * du, v0 + vv * dv)[:3]
+            nx = (du * Su[1]) * (dv * Sv[2]) - (du * Su[2]) * (dv * Sv[1])
+            ny = (du * Su[2]) * (dv * Sv[0]) - (du * Su[0]) * (dv * Sv[2])
+            nz = (du * Su[0]) * (dv * Sv[1]) - (du * Su[1]) * (dv * Sv[0])
+            total += uw[i] * vw[j] * (fx(S) * nx + fy(S) * ny + fz(S) * nz)
+    return total
+
+
+def mass_properties(solid: "PatchSolid") -> dict:
+    """Exact volume, centroid, and inertia tensor (about the centroid) of
+    a Bézier-patch solid — every entry an exact ``Fraction``.
+
+    Divergence theorem lifts each volume integral to a boundary flux of a
+    polynomial: V=∮(x,·,·)·n, ∫x=∮(x²/2,·,·)·n, ∫x²=∮(x³/3,·,·)·n,
+    ∫xy=∮(x²y/2,·,·)·n, …"""
+    zero = lambda S: F(0)
+    V = sum((_flux_moment(p, lambda S: S[0], zero, zero)
+             for p in solid.patches), F(0))
+    sign = 1 if V >= 0 else -1
+    V *= sign
+
+    def moment(fx):
+        return sign * sum((_flux_moment(p, fx, zero, zero)
+                           for p in solid.patches), F(0))
+
+    mx = moment(lambda S: S[0] * S[0] / 2)
+    my = sign * sum((_flux_moment(p, zero, lambda S: S[1] * S[1] / 2, zero)
+                     for p in solid.patches), F(0))
+    mz = sign * sum((_flux_moment(p, zero, zero, lambda S: S[2] * S[2] / 2)
+                     for p in solid.patches), F(0))
+    cx, cy, cz = mx / V, my / V, mz / V
+    Ixx_o = moment(lambda S: S[0] ** 3 / 3)              # ∫x² dV
+    Iyy_o = sign * sum((_flux_moment(p, zero, lambda S: S[1] ** 3 / 3, zero)
+                        for p in solid.patches), F(0))
+    Izz_o = sign * sum((_flux_moment(p, zero, zero, lambda S: S[2] ** 3 / 3)
+                        for p in solid.patches), F(0))
+    Ixy_o = moment(lambda S: S[0] * S[0] * S[1] / 2)     # ∫xy dV
+    Iyz_o = sign * sum((_flux_moment(p, zero, lambda S: S[1] * S[1] * S[2] / 2,
+                                     zero) for p in solid.patches), F(0))
+    Izx_o = sign * sum((_flux_moment(p, zero, zero,
+                                     lambda S: S[2] * S[2] * S[0] / 2)
+                        for p in solid.patches), F(0))
+    # inertia tensor about the CENTROID (parallel-axis, exact)
+    Ixx = (Iyy_o + Izz_o) - V * (cy * cy + cz * cz)
+    Iyy = (Izz_o + Ixx_o) - V * (cz * cz + cx * cx)
+    Izz = (Ixx_o + Iyy_o) - V * (cx * cx + cy * cy)
+    Ixy = -(Ixy_o - V * cx * cy)
+    Iyz = -(Iyz_o - V * cy * cz)
+    Izx = -(Izx_o - V * cz * cx)
+    return {"volume": V, "centroid": (cx, cy, cz),
+            "inertia": ((Ixx, Ixy, Izx), (Ixy, Iyy, Iyz), (Izx, Iyz, Izz))}

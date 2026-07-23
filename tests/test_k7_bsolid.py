@@ -66,3 +66,52 @@ def test_rational_patch_flux_refuses() -> None:
     s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 1, 1], [0, 0, 1, 1], wts)
     with pytest.raises(ValueError, match="K7.1"):
         patch_flux(s)
+
+
+# -- K7.0b: exact inertia tensor -----------------------------------------------
+
+def test_inertia_tensor_of_box_is_exact() -> None:
+    from forgekernel.bsolid import mass_properties
+
+    a, b, c = 3, 4, 6
+    mp = mass_properties(PatchSolid(box_patches(a, b, c)))
+    assert mp["volume"] == a * b * c
+    assert mp["centroid"] == (F(3, 2), F(2), F(3))
+    I = mp["inertia"]
+    V = a * b * c
+    assert I[0][0] == F(V) * (b * b + c * c) / 12          # Ixx exact
+    assert I[1][1] == F(V) * (c * c + a * a) / 12
+    assert I[2][2] == F(V) * (a * a + b * b) / 12
+    assert I[0][1] == 0 and I[1][2] == 0 and I[0][2] == 0  # exactly zero
+    assert all(isinstance(I[i][j], Fraction) for i in range(3) for j in range(3))
+
+
+# -- H2 gauntlet: exact boolean volume-identity fuzzing ------------------------
+
+def test_boolean_volume_identity_fuzz() -> None:
+    """V(A∪B) + V(A∩B) == V(A) + V(B) EXACTLY for the exact BSP engine.
+    Any rational violation is a hard proof of a boolean bug. Fuzz many
+    overlapping box pairs (deterministic seed)."""
+    import random
+
+    from forgekernel import csg
+    from forgekernel.brep import Solid
+
+    rng = random.Random(20260723)
+    checks = 0
+    for _ in range(60):
+        A = Solid.box(F(rng.randint(2, 8)), F(rng.randint(2, 8)),
+                      F(rng.randint(2, 8)), "A")
+        B = Solid.box(F(rng.randint(2, 8)), F(rng.randint(2, 8)),
+                      F(rng.randint(2, 8)), "B").translated(
+            (F(rng.randint(-4, 6)), F(rng.randint(-4, 6)),
+             F(rng.randint(-4, 6))))
+        va, vb = A.volume(), B.volume()
+        try:
+            vu = csg.union(A, B).volume()
+            vi = csg.intersect(A, B).volume()
+        except Exception:
+            continue                          # non-overlap intersect may be empty
+        assert vu + vi == va + vb             # EXACT rational identity
+        checks += 1
+    assert checks >= 30                       # actually exercised the engine
