@@ -305,39 +305,69 @@ def _cluster(keys):
     return list(groups.values())
 
 
-def ssi_surfaces(A, B, depth: int = 4):
-    """SSI between two (polynomial) B-spline surfaces: exact Bézier
-    extraction, pairwise subdivision detection, branch clustering in the
-    ORIGINAL parameter squares (branches crossing patch boundaries stay
-    one branch), certified points in global parameters."""
+def _rstr(x) -> str:
+    f = F(x)
+    return f"{f.numerator}/{f.denominator}"
+
+
+def _net_str(net):
+    return [[[_rstr(c) for c in pt] for pt in row] for row in net]
+
+
+def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
+    """SSI between two B-spline surfaces: exact Bézier extraction,
+    pairwise subdivision detection, branch clustering in the ORIGINAL
+    parameter squares (branches crossing patch boundaries stay one
+    branch), certified points in global parameters.
+
+    Detection — the hot loop — runs in the Rust port (``ssi_pairs``,
+    oracle-verified bit-identical) when the extension is built; the
+    Python path is the fallback and stays the executable spec."""
     from forgekernel.nurbs import bezier_patches
 
-    pa = [BezierPatch(net, u0, u1, v0, v1)
-          for u0, u1, v0, v1, net in bezier_patches(A)]
-    pb = [BezierPatch(net, u0, u1, v0, v1)
-          for u0, u1, v0, v1, net in bezier_patches(B)]
-    all_pairs = []
-    for a in pa:
-        ba = a.bbox()
-        for b in pb:
-            if not _boxes_overlap(ba, b.bbox()):
+    rs = None
+    if use_rust is not False:
+        try:
+            import forgekernel_rs as rs
+        except ImportError:
+            if use_rust is True:
+                raise
+            rs = None
+
+    pa = [(u0, u1, v0, v1, net) for u0, u1, v0, v1, net in bezier_patches(A)]
+    pb = [(u0, u1, v0, v1, net) for u0, u1, v0, v1, net in bezier_patches(B)]
+    # (a_box, b_box) surviving leaf pairs, as Fraction 4-tuples
+    boxes: list[tuple[tuple, tuple]] = []
+    for au0, au1, av0, av1, na in pa:
+        patch_a = BezierPatch(na, au0, au1, av0, av1)
+        ba = patch_a.bbox()
+        for bu0, bu1, bv0, bv1, nb in pb:
+            patch_b = BezierPatch(nb, bu0, bu1, bv0, bv1)
+            if not _boxes_overlap(ba, patch_b.bbox()):
                 continue                        # proven disjoint
-            _, pairs = ssi_branches(a, b, depth)
-            all_pairs.extend(pairs)
-    if not all_pairs:
+            if rs is not None:
+                rows = rs.ssi_pairs(
+                    _net_str(na), _net_str(nb), depth,
+                    [_rstr(au0), _rstr(au1), _rstr(av0), _rstr(av1)],
+                    [_rstr(bu0), _rstr(bu1), _rstr(bv0), _rstr(bv1)])
+                for row in rows:
+                    vals = [F(x) for x in row]
+                    boxes.append((tuple(vals[:4]), tuple(vals[4:])))
+            else:
+                _, pairs = ssi_branches(patch_a, patch_b, depth)
+                boxes.extend(((p.u0, p.u1, p.v0, p.v1),
+                              (q.u0, q.u1, q.v0, q.v1)) for p, q in pairs)
+    if not boxes:
         return {"branches": 0, "points": [], "uncertified": 0,
                 "empty_certified": True}
-    cells = {}
-    for a, b in all_pairs:
-        cells.setdefault((a.u0, a.u1, a.v0, a.v1), (a, b))
+    cells: dict = {}
+    for abox, bbox_ in boxes:
+        cells.setdefault(abox, bbox_)
     branches = _cluster(list(cells))
     pts, bad = [], 0
-    for key, (a, b) in cells.items():
-        um, vm = (a.u0 + a.u1) / 2, (a.v0 + a.v1) / 2
-        sm, tm = (b.u0 + b.u1) / 2, (b.v0 + b.v1) / 2
-        # local params inside the leaf patches are recovered by refine on
-        # the ORIGINAL patch nets: find the top patches containing these
-        # cells — the leaves carry global boxes, so evaluate via A directly
+    for abox, bbox_ in cells.items():
+        um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
+        sm, tm = (bbox_[0] + bbox_[1]) / 2, (bbox_[2] + bbox_[3]) / 2
         u, v, s, t, ok, _ = _refine_global(A, B, um, vm, sm, tm)
         if ok:
             pts.append((u, v, s, t))
