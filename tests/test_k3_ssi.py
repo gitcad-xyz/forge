@@ -226,3 +226,31 @@ def test_step_planar_solid_import_is_exact() -> None:
     s = read_step_planar_solid(text)
     assert s.volume() == 1                       # exact
     assert not s.watertight_violations()
+
+
+# -- K5.2: variable-radius (linear-taper) fillets, exact in ℚ[π] --------------
+
+def test_variable_fillet_exact_and_reduces_to_constant() -> None:
+    from forgekernel.quadric import FilletedBox, PiVal, VariableFilletedBox
+
+    # r0==r1 must reduce EXACTLY to the constant FilletedBox (self-oracle)
+    v_const = VariableFilletedBox((0, 0, 0), (10, 20, 30),
+                                  [("z", "max", "max", 2, 2)]).volume()
+    assert v_const == FilletedBox((0, 0, 0), (10, 20, 30),
+                                  [("z", "max", "max")], 2).volume()
+    # genuine taper r0=1→r1=3 on the L=30 z-edge:
+    # X = 30(1+3+9)/3 = 130 → V = 6000 − 130 + (130/4)π = 5870 + 65/2·π
+    v_taper = VariableFilletedBox((0, 0, 0), (10, 20, 30),
+                                  [("z", "max", "max", 1, 3)]).volume()
+    assert v_taper == PiVal(5870, F(65, 2))          # exact ℚ[π]
+
+
+def test_variable_fillet_refuses_adjacent_edges() -> None:
+    import pytest
+
+    from forgekernel.quadric import VariableFilletedBox
+
+    with pytest.raises(ValueError, match="K5.3"):
+        VariableFilletedBox((0, 0, 0), (10, 10, 10),
+                            [("z", "max", "max", 1, 2),
+                             ("x", "max", "max", 1, 2)])

@@ -910,3 +910,64 @@ class FilletedBox:
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         raise NotImplementedError("FilletedBox mesh arrives at K5.1")
+
+
+class VariableFilletedBox:
+    """A box with LINEAR-TAPER rolling-ball fillets on non-adjacent
+    straight edges — still exact in ℚ[π].
+
+    A fillet whose radius runs linearly r(t)=r0+(r1−r0)t/L along an edge
+    removes cross-section area r(t)²(1−π/4), and ∫₀^L r(t)² dt =
+    L(r0²+r0r1+r1²)/3 exactly, so
+
+        V = V_box − Σ (1−π/4)·L(r0²+r0r1+r1²)/3      — a PiVal, exact.
+
+    Edges: (axis, side_a, side_b, r0, r1). Selected edges must be
+    pairwise non-adjacent (a shared vertex needs a variable corner
+    patch → K5.3)."""
+
+    def __init__(self, lo, hi, edges) -> None:
+        self.lo = tuple(F(v) for v in lo)
+        self.hi = tuple(F(v) for v in hi)
+        self.edges = [(ax, sa, sb, F(r0), F(r1)) for ax, sa, sb, r0, r1 in edges]
+        dims = [self.hi[c] - self.lo[c] for c in range(3)]
+        axes = {"x": 0, "y": 1, "z": 2}
+        verts: list[set] = []
+        for ax, sa, sb, r0, r1 in self.edges:
+            a = axes[ax]
+            o1, o2 = [c for c in range(3) if c != a]
+            if r0 <= 0 or r1 <= 0:
+                raise ValueError("taper fillet wants positive radii")
+            if 2 * max(r0, r1) > min(dims[o1], dims[o2]):
+                raise ValueError("taper radius exceeds the face half-width")
+            c1 = self.lo[o1] if sa == "min" else self.hi[o1]
+            c2 = self.lo[o2] if sb == "min" else self.hi[o2]
+            vset = {tuple(v) for v in (
+                [self.lo[a] if k == a else (c1 if k == o1 else c2)
+                 for k in range(3)],
+                [self.hi[a] if k == a else (c1 if k == o1 else c2)
+                 for k in range(3)])}
+            verts.append(frozenset(vset))
+        for i in range(len(verts)):
+            for j in range(i + 1, len(verts)):
+                if verts[i] & verts[j]:
+                    raise ValueError(
+                        "adjacent taper-filleted edges need a variable "
+                        "corner patch (arrives at K5.3)")
+
+    def volume(self) -> PiVal:
+        vbox = F(1)
+        for c in range(3):
+            vbox *= self.hi[c] - self.lo[c]
+        rat, pic = vbox, F(0)
+        axes = {"x": 0, "y": 1, "z": 2}
+        for ax, _, _, r0, r1 in self.edges:
+            a = axes[ax]
+            L = self.hi[a] - self.lo[a]
+            X = L * (r0 * r0 + r0 * r1 + r1 * r1) / 3
+            rat -= X
+            pic += X / 4
+        return PiVal(rat, pic)
+
+    def bbox(self):
+        return self.lo, self.hi
