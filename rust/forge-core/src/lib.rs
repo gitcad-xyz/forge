@@ -881,16 +881,25 @@ fn side_filtered(plane: &Plane, pf: &[f64; 4], fp: &[f64; 3], p: &V) -> i32 {
     plane.side(p) // ambiguous or non-finite → exact fallback
 }
 
-fn split(plane: &Plane, poly: &Polygon) -> Split {
-    let mut r = Split::default();
-    let pf = [
+/// Cache a plane's f64 coefficients once, so `split` (called per polygon
+/// against the same node plane) never reconverts BigRationals in the loop.
+fn plane_floats(plane: &Plane) -> [f64; 4] {
+    [
         plane.n[0].to_f64().unwrap_or(f64::NAN),
         plane.n[1].to_f64().unwrap_or(f64::NAN),
         plane.n[2].to_f64().unwrap_or(f64::NAN),
         plane.d.to_f64().unwrap_or(f64::NAN),
-    ];
+    ]
+}
+
+/// Classify `poly` against `plane` and route it into coplanar/front/back.
+/// Takes the polygon BY VALUE so the common whole-on-one-side cases MOVE it
+/// (no BigRational vertex clone); only a genuinely straddling polygon (kind
+/// 3) is decomposed into two freshly built pieces.
+fn split(plane: &Plane, pf: &[f64; 4], poly: Polygon) -> Split {
+    let mut r = Split::default();
     let sides: Vec<i32> = (0..poly.verts.len())
-        .map(|i| side_filtered(plane, &pf, &poly.fverts[i], &poly.verts[i]))
+        .map(|i| side_filtered(plane, pf, &poly.fverts[i], &poly.verts[i]))
         .collect();
     let mut kind = 0;
     for &s in &sides {
@@ -899,13 +908,13 @@ fn split(plane: &Plane, poly: &Polygon) -> Split {
     match kind {
         0 => {
             if dot(&plane.n, &poly.plane.n).is_positive() {
-                r.cof.push(poly.clone());
+                r.cof.push(poly);
             } else {
-                r.cob.push(poly.clone());
+                r.cob.push(poly);
             }
         }
-        1 => r.front.push(poly.clone()),
-        2 => r.back.push(poly.clone()),
+        1 => r.front.push(poly),
+        2 => r.back.push(poly),
         _ => {
             let mut f: Vec<V> = Vec::new();
             let mut b: Vec<V> = Vec::new();
@@ -962,10 +971,11 @@ impl Node {
             self.plane = Some(polys[0].plane.clone());
         }
         let plane = self.plane.clone().unwrap();
+        let pf = plane_floats(&plane);
         let mut front = Vec::new();
         let mut back = Vec::new();
-        for p in &polys {
-            let mut s = split(&plane, p);
+        for p in polys {
+            let mut s = split(&plane, &pf, p);
             self.polys.append(&mut s.cof);
             self.polys.append(&mut s.cob);
             front.append(&mut s.front);
@@ -1004,10 +1014,11 @@ impl Node {
             return polys;
         }
         let plane = self.plane.clone().unwrap();
+        let pf = plane_floats(&plane);
         let mut front = Vec::new();
         let mut back = Vec::new();
-        for p in &polys {
-            let mut s = split(&plane, p);
+        for p in polys {
+            let mut s = split(&plane, &pf, p);
             front.append(&mut s.cof);
             back.append(&mut s.cob);
             front.append(&mut s.front);
