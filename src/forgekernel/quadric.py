@@ -180,6 +180,12 @@ class DrilledSolid:
     def bbox(self):
         return self.base.bbox()
 
+    def translated(self, x, y, z) -> "DrilledSolid":
+        """Rigid translation — base and every bore move together (exact).
+        Enables patterning a drilled feature (bolt patterns)."""
+        base = self.base.translated((F(x), F(y), F(z)))
+        return DrilledSolid(base, [b.translated(x, y, z) for b in self.bores])
+
     def watertight_violations(self) -> list[str]:
         return self.base.watertight_violations()
 
