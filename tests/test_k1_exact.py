@@ -276,3 +276,41 @@ def test_internally_tangent_cylinders_exact() -> None:
     # r=10 and r=4, centers 6 apart: d^2 = 36 = (10-4)^2 internally tangent
     u = DisjointUnion([Cyl.make(10, 8), Cyl.make(4, 8).translated(6, 0, 0)])
     assert u.volume() == PiVal(0, (100 + 16) * 8)
+
+
+# -- W-B: draft (frustum via exact prismatoid) --------------------------------
+
+def test_draft_frustum_matches_exact_integral() -> None:
+    import math as _m
+
+    from forgekernel.exact import F
+    from forgekernel.kernel import box, draft
+
+    d = draft(box(30, 30, 15), 3.0)
+    tf = F(_m.tan(_m.radians(3.0)))
+    Vp = lambda z: -(30 - 2 * tf * z) ** 3 / (6 * tf)   # noqa: E731
+    assert d.volume() == Vp(F(15)) - Vp(F(0))
+    assert d.watertight_violations() == []
+
+
+def test_prismatoid_exact_volume() -> None:
+    from forgekernel.brep import prismatoid
+    from forgekernel.exact import F
+
+    # frustum: 10x10 base at z=0, 4x4 top at z=6; prismatoid formula
+    # V = h/6 (A0 + 4Am + A1), Am = 7x7 = 49 -> 6/6(100+196+16)=312
+    p = prismatoid([(0, 0), (10, 0), (10, 10), (0, 10)], 0,
+                   [(3, 3), (7, 3), (7, 7), (3, 7)], 6)
+    assert p.volume() == F(312)
+    assert p.watertight_violations() == []
+
+
+def test_draft_nonrect_refuses() -> None:
+    import pytest as _pytest
+
+    from forgekernel.brep import Solid
+    from forgekernel.kernel import draft
+
+    tri = Solid.prism([(0, 0), (10, 0), (5, 8)], 6)
+    with _pytest.raises(ValueError, match="K2.3"):
+        draft(tri, 3.0)

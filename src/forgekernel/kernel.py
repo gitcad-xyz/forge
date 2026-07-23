@@ -59,3 +59,14 @@ def chamfer(s: Solid, distance) -> Solid:
     edges = logical_edges(s)
     out = chamfer_planar(s, distance, edges)
     return chamfer_corners(out, distance, edges)
+
+
+def draft(s: Solid, angle_deg: float, neutral_z=0, faces=None) -> Solid:
+    """Draft vertical faces by angle (tan converted exactly at input)."""
+    import math as _m
+
+    from forgekernel.brep import draft_box
+    from forgekernel.exact import F
+
+    t = F(_m.tan(_m.radians(angle_deg)))
+    return draft_box(s, t, F(neutral_z))

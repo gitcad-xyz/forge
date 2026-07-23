@@ -544,3 +544,57 @@ def chamfer_corners(solid: Solid, distance,
             continue
         out = csg.cut(out, tool)
     return out
+
+
+def prismatoid(bottom: list[tuple], z0, top: list[tuple], z1,
+               source: str = "prismatoid") -> "Solid":
+    """Exact solid between two same-count CCW xy loops at heights z0<z1:
+    bottom cap, top cap, and side quads (each split into 2 triangles so a
+    twisted/tapered side stays exactly planar-triangulated and closed)."""
+    z0, z1 = F(z0), F(z1)
+    b = [(F(x), F(y)) for x, y in bottom]
+    tp = [(F(x), F(y)) for x, y in top]
+    if len(b) != len(tp) or len(b) < 3:
+        raise ValueError("prismatoid needs two equal-length loops (>=3)")
+    if _loop_area2(b) < 0:
+        b, tp = list(reversed(b)), list(reversed(tp))
+    polys: list[Polygon] = []
+    for a, bb, c in _ear_clip(b):
+        polys.append(Polygon([vec(*a, z0), vec(*c, z0), vec(*bb, z0)],
+                             f"{source}.bottom"))
+    for a, bb, c in _ear_clip(tp):
+        polys.append(Polygon([vec(*a, z1), vec(*bb, z1), vec(*c, z1)],
+                             f"{source}.top"))
+    n = len(b)
+    for i in range(n):
+        j = (i + 1) % n
+        b0, b1 = b[i], b[j]
+        t0, t1 = tp[i], tp[j]
+        # side quad b0-b1-t1-t0 -> two triangles (consistent winding)
+        polys.append(Polygon([vec(*b0, z0), vec(*b1, z0), vec(*t1, z1)],
+                             f"{source}.side{i}"))
+        polys.append(Polygon([vec(*b0, z0), vec(*t1, z1), vec(*t0, z1)],
+                             f"{source}.side{i}"))
+    return Solid(polys)
+
+
+def draft_box(solid: Solid, t: Fraction, neutral_z: Fraction) -> Solid:
+    """Draft ALL four vertical faces of an axis-aligned rectangular prism
+    into a frustum, exact. Inset at height z is (z-neutral_z)*t on each
+    side. General (non-rectangular) prism draft arrives at K2.3."""
+    lo, hi = solid.bbox()
+    x0, y0, z0 = lo
+    x1, y1, z1 = hi
+    # verify rectangular footprint: all vertices at the 4 xy corners
+    corners = {(x0, y0), (x1, y0), (x1, y1), (x0, y1)}
+    for p in solid.polys:
+        for vx, vy, _vz in p.verts:
+            if (vx, vy) not in corners:
+                raise ValueError("draft of a non-rectangular prism arrives at K2.3")
+
+    def rect(z):
+        d = (z - neutral_z) * t
+        return [(x0 + d, y0 + d), (x1 - d, y0 + d),
+                (x1 - d, y1 - d), (x0 + d, y1 - d)]
+
+    return prismatoid(rect(z0), z0, rect(z1), z1, "draft")
