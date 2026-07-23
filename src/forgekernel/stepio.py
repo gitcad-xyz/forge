@@ -324,3 +324,137 @@ def read_step_planar_solid(text: str):
     if s.volume() <= 0:
         raise ValueError("import_step: could not orient the shell")
     return s
+
+
+# -- K7.0c: native STEP AP214 export (planar solids) --------------------------
+
+def _dec(x: Fraction, digits: int = 15) -> str:
+    """Rational → STEP decimal real. Exact for terminating rationals;
+    high-precision rounded otherwise (STEP is a decimal interchange
+    format — this is the honest boundary of an exact→float export)."""
+    from decimal import Decimal, getcontext
+    getcontext().prec = digits + 6
+    d = (Decimal(x.numerator) / Decimal(x.denominator))
+    s = format(d.normalize(), "f")
+    if "." not in s:
+        s += "."
+    return s
+
+
+def _unit3(v):
+    """Float unit vector of an exact rational direction."""
+    import math
+    f = [float(c) for c in v]
+    n = math.sqrt(sum(c * c for c in f)) or 1.0
+    return (f[0] / n, f[1] / n, f[2] / n), n
+
+
+def _perp(n):
+    """A float unit vector orthogonal to n (for the plane's ref dir)."""
+    import math
+    a = (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0)
+    d = a[0] * n[0] + a[1] * n[1] + a[2] * n[2]
+    p = (a[0] - d * n[0], a[1] - d * n[1], a[2] - d * n[2])
+    m = math.sqrt(sum(c * c for c in p)) or 1.0
+    return (p[0] / m, p[1] / m, p[2] / m)
+
+
+def write_step_planar_solid(solid, *, name: str = "gitcad_part") -> str:
+    """Emit a planar-faced forge Solid as a valid AP214 STEP file
+    (full product structure + MANIFOLD_SOLID_BREP with shared straight
+    edges). Round-trips through OCCT and :func:`read_step_planar_solid`."""
+    lines: list[str] = []
+    nid = [0]
+
+    def emit(body: str) -> int:
+        nid[0] += 1
+        lines.append(f"#{nid[0]} = {body};")
+        return nid[0]
+
+    def fnum(x):
+        return f"{x:.15g}"
+
+    # --- product + context chain (required for OCCT to transfer a solid)
+    appctx = emit("APPLICATION_CONTEXT('automotive_design')")
+    emit(f"APPLICATION_PROTOCOL_DEFINITION('international standard',"
+         f"'automotive_design',2000,#{appctx})")
+    pctx = emit(f"PRODUCT_CONTEXT('',#{appctx},'mechanical')")
+    pdctx = emit(f"PRODUCT_DEFINITION_CONTEXT('part definition',#{appctx},"
+                 f"'design')")
+    prod = emit(f"PRODUCT('{name}','{name}','',(#{pctx}))")
+    emit(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',(#{prod}))")
+    pdf = emit(f"PRODUCT_DEFINITION_FORMATION('','',#{prod})")
+    pdef = emit(f"PRODUCT_DEFINITION('design','',#{pdf},#{pdctx})")
+    pds = emit(f"PRODUCT_DEFINITION_SHAPE('','',#{pdef})")
+    # units + geometric context
+    lu = emit("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))")
+    au = emit("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))")
+    su = emit("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())")
+    unc = emit(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{lu},"
+               f"'distance_accuracy_value','')")
+    ctx = emit(f"(GEOMETRIC_REPRESENTATION_CONTEXT(3)"
+               f"GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc}))"
+               f"GLOBAL_UNIT_ASSIGNED_CONTEXT((#{lu},#{au},#{su}))"
+               f"REPRESENTATION_CONTEXT('',''))")
+
+    vids: dict = {}
+
+    def vertex(v):
+        key = (v[0], v[1], v[2])
+        if key not in vids:
+            cp = emit(f"CARTESIAN_POINT('',({_dec(v[0])},{_dec(v[1])},"
+                      f"{_dec(v[2])}))")
+            vids[key] = emit(f"VERTEX_POINT('',#{cp})")
+        return vids[key]
+
+    edges: dict = {}
+
+    def edge_curve(a, b):
+        ka, kb = (a[0], a[1], a[2]), (b[0], b[1], b[2])
+        key = frozenset((ka, kb))
+        if key not in edges:
+            va, vb = vertex(a), vertex(b)
+            p0 = emit(f"CARTESIAN_POINT('',({_dec(a[0])},{_dec(a[1])},"
+                      f"{_dec(a[2])}))")
+            (dx, dy, dz), ln = _unit3((b[0] - a[0], b[1] - a[1], b[2] - a[2]))
+            dr = emit(f"DIRECTION('',({fnum(dx)},{fnum(dy)},{fnum(dz)}))")
+            vec = emit(f"VECTOR('',#{dr},{fnum(ln)})")
+            crv = emit(f"LINE('',#{p0},#{vec})")
+            edges[key] = (emit(f"EDGE_CURVE('',#{va},#{vb},#{crv},.T.)"),
+                          ka, kb)
+        return edges[key]
+
+    face_ids = []
+    for poly in solid.polys:
+        vs = [tuple(v) for v in poly.verts]
+        oe = []
+        for i in range(len(vs)):
+            a, b = vs[i], vs[(i + 1) % len(vs)]
+            ec, ka, kb = edge_curve(a, b)
+            fwd = (a[0], a[1], a[2]) == ka
+            oe.append(emit(f"ORIENTED_EDGE('',*,*,#{ec},"
+                           f"{'.T.' if fwd else '.F.'})"))
+        loop = emit(f"EDGE_LOOP('',({','.join('#' + str(x) for x in oe)}))")
+        bound = emit(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+        (nx, ny, nz), _ = _unit3(poly.plane.n)
+        rx, ry, rz = _perp((nx, ny, nz))
+        origin = emit(f"CARTESIAN_POINT('',({_dec(vs[0][0])},{_dec(vs[0][1])},"
+                      f"{_dec(vs[0][2])}))")
+        axis = emit(f"DIRECTION('',({fnum(nx)},{fnum(ny)},{fnum(nz)}))")
+        rdir = emit(f"DIRECTION('',({fnum(rx)},{fnum(ry)},{fnum(rz)}))")
+        place = emit(f"AXIS2_PLACEMENT_3D('',#{origin},#{axis},#{rdir})")
+        plane = emit(f"PLANE('',#{place})")
+        face_ids.append(emit(f"ADVANCED_FACE('',(#{bound}),#{plane},.T.)"))
+
+    shell = emit(f"CLOSED_SHELL('',({','.join('#' + str(x) for x in face_ids)}))")
+    brep = emit(f"MANIFOLD_SOLID_BREP('{name}',#{shell})")
+    absr = emit(f"ADVANCED_BREP_SHAPE_REPRESENTATION('{name}',(#{brep}),#{ctx})")
+    emit(f"SHAPE_DEFINITION_REPRESENTATION(#{pds},#{absr})")
+
+    body = "\n".join(lines)
+    header = (
+        "ISO-10303-21;\nHEADER;\n"
+        "FILE_DESCRIPTION(('gitcad forge STEP export'),'2;1');\n"
+        f"FILE_NAME('{name}.step','',(''),(''),'forgekernel','','');\n"
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n")
+    return header + body + "\nENDSEC;\nEND-ISO-10303-21;\n"
