@@ -58,6 +58,12 @@ def segments_to_beziers(start, segments):
             raise ValueError(f"profile2d: segment kind {kind!r} not exact "
                              f"(arcs → ℚ[π] path)")
         cur = to
+    # close the loop back to the start if the last point doesn't already —
+    # Green's theorem needs a CLOSED contour or the area is meaningless
+    # (the line-extrude path auto-closes; the spline path must too).
+    s0 = (F(start[0]), F(start[1]))
+    if cur != s0:
+        beziers.append([cur, s0])
     return beziers
 
 
