@@ -247,6 +247,16 @@ volume-of-mesh within deflection bound of exact volume (test).
 
 ## 3. Milestone summary
 
+### STATUS (2026-07-23, executed)
+
+W-A..W-F, W-H, W-J, W-K DONE. W-G (spring) correctly deferred to K3
+(transcendental helix). W-I (Rust) scaffolded in `rust/`, BLOCKED on
+toolchain (no rustup in the build env) — specified, not faked.
+
+Actual milestone reached: **ref 94.4% (17/18) > OCCT 88.9% (16/18)**.
+ref builds both mitered sweeps OCCT fails; ref fails only spring.
+Zero substantive disagreements across every snapshot. See bench/TREND.md.
+
 | after | ref capability | headline |
 |---|---|---|
 | W-A | 64.7%, torture 4/5 | tangencies exact — the classic killers |
