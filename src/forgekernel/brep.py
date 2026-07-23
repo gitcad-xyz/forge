@@ -295,3 +295,252 @@ def _ear_clip(loop: list[tuple]) -> list[tuple]:
             raise ValueError("no ear found (degenerate loop)")
     tris.append((pts[0], pts[1], pts[2]))
     return tris
+
+
+def _canon_dir(d: Vec):
+    from math import gcd as _g
+
+    den = 1
+    for v in d:
+        den = den * v.denominator // _g(den, v.denominator)
+    ints = [int(v * den) for v in d]
+    g = 0
+    for v in ints:
+        g = _g(g, abs(v))
+    if g == 0:
+        return None
+    ints = [v // g for v in ints]
+    for v in ints:
+        if v != 0:
+            if v < 0:
+                ints = [-w for w in ints]
+            break
+    return (F(ints[0]), F(ints[1]), F(ints[2]))
+
+
+def logical_edges(solid: Solid) -> list[dict]:
+    """Solid edges as carrier lines with their two adjacent face planes —
+    derived by exact grouping of polygon boundary segments. An edge is a
+    line where exactly two distinct face planes meet."""
+    from collections import defaultdict
+
+    lines: dict = defaultdict(lambda: {"planes": {}, "tmin": None,
+                                       "tmax": None, "point": None,
+                                       "dir": None})
+    for p in solid.polys:
+        n = len(p.verts)
+        for i in range(n):
+            a, b = p.verts[i], p.verts[(i + 1) % n]
+            cd = _canon_dir(sub(b, a))
+            if cd is None:
+                continue
+            key = (cd, cross(a, cd))
+            e = lines[key]
+            e["planes"][p.plane.canonical()] = p.plane
+            e["dir"] = cd
+            ta, tb = dot(a, cd), dot(b, cd)
+            lo, hi = min(ta, tb), max(ta, tb)
+            e["tmin"] = lo if e["tmin"] is None else min(e["tmin"], lo)
+            e["tmax"] = hi if e["tmax"] is None else max(e["tmax"], hi)
+            if e["point"] is None:
+                e["point"] = a
+    out = []
+    for e in lines.values():
+        if len(e["planes"]) == 2:
+            pa, pb = list(e["planes"].values())
+            out.append({"point": e["point"], "dir": e["dir"],
+                        "tmin": e["tmin"], "tmax": e["tmax"],
+                        "plane_a": pa, "plane_b": pb})
+    return out
+
+
+def _unit_normal(plane: Plane) -> Vec | None:
+    """Exact unit normal when it exists in the rationals (axis-aligned
+    faces, and any face whose |n| is a perfect rational square)."""
+    c = plane.canonical()[:3]
+    nn = c[0] * c[0] + c[1] * c[1] + c[2] * c[2]
+    import math as _m
+
+    root = _m.isqrt(int(nn))
+    if root * root != int(nn):
+        return None
+    return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
+
+
+def chamfer_planar(solid: Solid, distance, edges: list[dict] | None = None) -> Solid:
+    """Exact chamfer on convex edges whose face normals admit rational
+    unit vectors (axis-aligned and Pythagorean orientations). Each edge
+    is cut by the plane through the two lines offset ``distance`` along
+    each adjacent face — a parallelepiped tool per edge, subtracted with
+    the exact boolean engine. Non-rational orientations refuse (K2
+    brings bounded-error constructions)."""
+    from forgekernel import csg
+
+    d = F(distance)
+    if d <= 0:
+        raise ValueError("chamfer wants positive distance")
+    todo = edges if edges is not None else logical_edges(solid)
+    lo, hi = solid.bbox()
+    extent = (hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2]) + 1
+    out = solid
+    for e in todo:
+        pa, pb = e["plane_a"], e["plane_b"]
+        na, nb = _unit_normal(pa), _unit_normal(pb)
+        if na is None or nb is None:
+            raise ValueError(
+                "chamfer: face normal is not rational-unit (arrives at K2)")
+        u = e["dir"]
+        p0 = e["point"]
+        # direction from the edge into each face: perpendicular to both the
+        # edge and the face normal, signed to point into the OTHER face's
+        # negative half-space (exact convexity-aware sign choice)
+        ca = cross(u, na)
+        if pb.side(add(p0, ca)) > 0:
+            ca = neg(ca)
+        cb = cross(u, nb)
+        if pa.side(add(p0, cb)) > 0:
+            cb = neg(cb)
+        if pb.side(add(p0, ca)) >= 0 or pa.side(add(p0, cb)) >= 0:
+            continue                          # reflex edge: skip in K1.1
+        qa = add(p0, smul(d, ca))
+        qb = add(p0, smul(d, cb))
+        span = sub(qb, qa)
+        if is_zero(span):
+            continue
+        # parallelepiped tool: rectangle spanning the cut plane, extruded
+        # toward the edge (the material side)
+        mid = smul(Fraction(1, 2), add(qa, qb))
+        toward = sub(p0, mid)                 # cut plane -> edge direction
+        e1 = smul(extent / _norm1(u), u)
+        e2 = smul(extent / _norm1(span), span)
+        e3 = smul(Fraction(2), toward)
+        base = sub(sub(mid, smul(Fraction(1, 2), e1)), smul(Fraction(1, 2), e2))
+        tool = _parallelepiped(base, e1, e2, e3, "chamfer")
+        out = csg.cut(out, tool)
+    return out
+
+
+def _norm1(v: Vec) -> Fraction:
+    return abs(v[0]) + abs(v[1]) + abs(v[2])
+
+
+def _parallelepiped(base: Vec, e1: Vec, e2: Vec, e3: Vec,
+                    source: str) -> Solid:
+    v = [base, add(base, e1), add(add(base, e1), e2), add(base, e2)]
+    v += [add(p, e3) for p in v]
+    faces = [([0, 3, 2, 1], "b"), ([4, 5, 6, 7], "t"), ([0, 1, 5, 4], "f"),
+             ([2, 3, 7, 6], "k"), ([1, 2, 6, 5], "r"), ([3, 0, 4, 7], "l")]
+    s = Solid([Polygon([v[i] for i in idx], f"{source}.{n}")
+               for idx, n in faces])
+    return s if s.volume() > 0 else Solid([p.flipped() for p in s.polys])
+
+
+def _unit_dir(cd: Vec) -> Vec | None:
+    import math as _m
+
+    nn = int(cd[0] * cd[0] + cd[1] * cd[1] + cd[2] * cd[2])
+    root = _m.isqrt(nn)
+    if root * root != nn:
+        return None
+    return (cd[0] / root, cd[1] / root, cd[2] / root)
+
+
+def _solve3(rows: list[Vec], rhs: list[Fraction]) -> Vec | None:
+    """Exact 3x3 linear solve (Cramer). None when singular."""
+    a, b, c = rows
+    det = dot(a, cross(b, c))
+    if det == 0:
+        return None
+
+    def rep(i: int, col: Vec) -> Fraction:
+        m = [list(a), list(b), list(c)]
+        for r, v in zip(m, rhs):
+            r[i] = v
+        return dot((m[0][0], m[0][1], m[0][2]),
+                   cross((m[1][0], m[1][1], m[1][2]),
+                         (m[2][0], m[2][1], m[2][2]))) / det
+
+    # column replacement via transpose trick: solve A x = rhs
+    ax = dot((rhs[0], a[1], a[2]), cross((rhs[1], b[1], b[2]), (rhs[2], c[1], c[2]))) / det
+    ay = dot((a[0], rhs[0], a[2]), cross((b[0], rhs[1], b[2]), (c[0], rhs[2], c[2]))) / det
+    az = dot((a[0], a[1], rhs[0]), cross((b[0], b[1], rhs[1]), (c[0], c[1], rhs[2]))) / det
+    return (ax, ay, az)
+
+
+def _tetra(p0: Vec, p1: Vec, p2: Vec, p3: Vec, source: str) -> Solid:
+    s = Solid([Polygon([p0, p1, p2], f"{source}.a"),
+               Polygon([p0, p2, p3], f"{source}.b"),
+               Polygon([p0, p3, p1], f"{source}.c"),
+               Polygon([p1, p3, p2], f"{source}.d")])
+    return s if s.volume() > 0 else Solid([q.flipped() for q in s.polys])
+
+
+def chamfer_corners(solid: Solid, distance,
+                    edges: list[dict]) -> Solid:
+    """Vertex truncation matching industrial chamfer semantics (the
+    OCCT/SolidWorks corner facet). Geometry, derived exactly from the
+    first real ref-vs-OCCT disagreement (5568 pure plane-cuts vs 16688/3
+    oracle; delta d^3/12 per corner, hand-verified both ways):
+
+    at a corner where three chamfered edges meet, the remaining apex
+    pyramid is bounded by the three chamfer planes; the corner facet
+    passes through the three points where PAIRWISE chamfer-plane
+    intersection lines pierce the original faces. The removed piece is
+    the exact rational tetrahedron (facet triangle + chamfer triple
+    point), cut with the exact boolean engine."""
+    from collections import defaultdict
+
+    from forgekernel import csg
+
+    d = F(distance)
+    at_vertex: dict = defaultdict(list)
+    for e in edges:
+        cd = e["dir"]
+        nn = dot(cd, cd)
+        p0 = e["point"]
+        t0 = dot(p0, cd)
+        for t_end, sign in ((e["tmin"], 1), (e["tmax"], -1)):
+            v = add(p0, smul((t_end - t0) / nn, cd))
+            at_vertex[v].append((smul(F(sign), cd),
+                                 e["plane_a"], e["plane_b"]))
+    out = solid
+    for v, incident in at_vertex.items():
+        if len(incident) != 3:
+            continue
+        units = [_unit_dir(cd) for cd, _, _ in incident]
+        if any(u is None for u in units):
+            continue                              # K2: non-rational dirs
+        # chamfer plane of edge k: normal = u_i + u_j, through v + d*u_i
+        m = [add(units[(k + 1) % 3], units[(k + 2) % 3]) for k in range(3)]
+        rhs = [dot(m[k], add(v, smul(d, units[(k + 1) % 3])))
+               for k in range(3)]
+        apex = _solve3(m, rhs)
+        if apex is None:
+            continue
+        # face_k = the original face shared by edges i and j
+        pts = []
+        ok = True
+        for k in range(3):
+            i, j = (k + 1) % 3, (k + 2) % 3
+            keys_i = {incident[i][1].coplanar_key(),
+                      incident[i][2].coplanar_key()}
+            shared = None
+            for pl in (incident[j][1], incident[j][2]):
+                if pl.coplanar_key() in keys_i:
+                    shared = pl
+                    break
+            if shared is None:
+                ok = False
+                break
+            p = _solve3([m[i], m[j], shared.n], [rhs[i], rhs[j], shared.d])
+            if p is None:
+                ok = False
+                break
+            pts.append(p)
+        if not ok:
+            continue
+        tool = _tetra(pts[0], pts[1], pts[2], apex, "corner")
+        if tool.volume() == 0:
+            continue
+        out = csg.cut(out, tool)
+    return out

@@ -49,3 +49,13 @@ def mirror(s: Solid, axis: str) -> Solid:
 
 def rotate_quarter(s: Solid, axis: str, quarters: int) -> Solid:
     return s.rotated_quarter(axis, quarters)
+
+
+def chamfer(s: Solid, distance) -> Solid:
+    """Exact chamfer on all convex rational-normal edges, with industrial
+    corner-triangle vertex truncation (oracle-matched semantics)."""
+    from forgekernel.brep import chamfer_corners, chamfer_planar, logical_edges
+
+    edges = logical_edges(s)
+    out = chamfer_planar(s, distance, edges)
+    return chamfer_corners(out, distance, edges)

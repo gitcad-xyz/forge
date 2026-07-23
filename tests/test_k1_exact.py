@@ -76,3 +76,42 @@ def test_lineage_survives_booleans() -> None:
     sources = {src for _, src in u.logical_faces()}
     assert any(s.startswith("A.") for s in sources)
     assert any(s.startswith("B.") for s in sources)
+
+
+def test_chamfered_cube_topology_and_exactness() -> None:
+    from forgekernel.kernel import chamfer
+
+    c = chamfer(box(10, 10, 10), 2)
+    assert c.watertight_violations() == []
+    # hand-derived, twice over: edge cuts give 1000 - 480/wedges + 64/pairs
+    # - 16/triples = 808; industrial corner facets remove d^3/12 per corner
+    # (8 x 2/3) more. ref returns the EXACT rational OCCT approximates.
+    assert c.volume() == Fraction(2408, 3)
+    # the classic chamfered-cube topology: 6 octagons + 12 chamfer faces
+    # + 8 corner triangles = 26 planes
+    planes = {key[0] for key in c.logical_faces()}
+    assert len(planes) == 26
+    assert chamfer(box(10, 10, 10), 2).volume() == c.volume()
+
+
+def test_chamfer_block_matches_oracle_exactly() -> None:
+    from forgekernel.kernel import chamfer
+
+    # the first real ref-vs-OCCT disagreement, resolved: OCCT reports
+    # 5562.666666666667 for box(30,20,10) chamfer 2 — ref returns the
+    # exact rational behind that float.
+    assert chamfer(box(30, 20, 10), 2).volume() == Fraction(16688, 3)
+
+
+def test_serialization_round_trip_bit_exact() -> None:
+    from forgekernel import io
+    from forgekernel.kernel import boolean
+
+    s = boolean("cut", box(30, 30, 10),
+                translate(box(30, 30, 10), 29.999, 0, 0))
+    text = io.dumps(s)
+    s2 = io.loads(text)
+    assert io.dumps(s2) == text                  # bit-exact round trip
+    assert s2.volume() == s.volume()
+    stl = io.to_stl(s)
+    assert stl.startswith("solid") and "endsolid" in stl
