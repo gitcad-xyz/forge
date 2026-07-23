@@ -358,3 +358,14 @@ def test_fillet_too_large_refuses() -> None:
     # 2r == dim is the valid degenerate: a fully-rounded cube is a sphere
     from forgekernel.quadric import PiVal
     assert RoundedBox(10, 10, 10, 5).volume() == PiVal(0, Fraction(500, 3))
+
+
+def test_loft_square_to_square_prismatoid() -> None:
+    from forgekernel.brep import prismatoid
+    from forgekernel.exact import F
+
+    # corpus loft: 20x20 at z=0 -> 8x8 at z=25; prismatoid 25/6(400+4*196+64)
+    p = prismatoid([(-10, -10), (10, -10), (10, 10), (-10, 10)], 0,
+                   [(-4, -4), (4, -4), (4, 4), (-4, 4)], 25)
+    assert p.volume() == F(5200)
+    assert p.watertight_violations() == []
