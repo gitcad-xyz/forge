@@ -369,3 +369,33 @@ def test_loft_square_to_square_prismatoid() -> None:
                    [(-4, -4), (4, -4), (4, 4), (-4, 4)], 25)
     assert p.volume() == F(5200)
     assert p.watertight_violations() == []
+
+
+# -- W-E: mitered sweep in Q[sqrt d] — the model OCCT cannot build -------------
+
+def test_surd_field_arithmetic() -> None:
+    from forgekernel.surd import SurdVal, sqrt_rational
+
+    assert sqrt_rational(450) == SurdVal(0, 15, 2)      # 15√2
+    assert sqrt_rational(16) == SurdVal(4, 0, 1)        # exactly 4
+    assert (SurdVal(1, 1, 2) * SurdVal(1, 1, 2)) == SurdVal(3, 2, 2)   # (1+√2)^2
+    assert sqrt_rational(Fraction(9, 4)) == SurdVal(Fraction(3, 2), 0, 1)
+
+
+def test_mixed_radicals_refuse() -> None:
+    import pytest as _pytest
+
+    from forgekernel.surd import sqrt_rational
+
+    with _pytest.raises(ValueError, match="bigger field"):
+        sqrt_rational(2) + sqrt_rational(3)
+
+
+def test_mitered_sweep_exact_in_root2() -> None:
+    from forgekernel.kernel import sweep
+    from forgekernel.surd import SurdVal
+
+    # corpus swept_channel: 4x4 profile, path with a 45-degree corner
+    ms = sweep(16, [[0, 0, 0], [0, 0, 20], [15, 0, 35], [40, 0, 35]])
+    assert ms.length() == SurdVal(45, 15, 2)            # 20 + 15√2 + 25
+    assert ms.volume() == SurdVal(720, 240, 2)          # 16 × length, EXACT

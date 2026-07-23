@@ -590,3 +590,58 @@ class RoundedBox:
 
     def watertight_violations(self) -> list:
         return []
+
+
+class MiteredSweep:
+    """A convex profile swept along a polyline with miter joints — exact
+    in ℚ[√d]. Volume = profile_area × centerline_length: at a miter the
+    bisector plane removes a wedge from one segment that the neighbour
+    adds back identically, so the swept volume is exactly the straight
+    area×length even through corners. Segment lengths accumulate in one
+    quadratic-surd field; a path mixing radicals (e.g. √2 and √3) refuses
+    (K3.1). This is the model OCCT cannot build (swept_channel)."""
+
+    def __init__(self, area, path: list) -> None:
+        from forgekernel.surd import SurdVal, sqrt_rational
+
+        self.area = F(area)
+        self.path = [tuple(F(c) for c in p) for p in path]
+        if len(self.path) < 2:
+            raise ValueError("sweep path needs >= 2 points")
+        length = SurdVal(0, 0, 1)
+        for a, b in zip(self.path, self.path[1:]):
+            d2 = sum((b[i] - a[i]) ** 2 for i in range(3))
+            length = length + sqrt_rational(d2)      # may raise on mixed radicals
+        self._length = length
+
+    def length(self):
+        return self._length
+
+    def volume(self):
+        return self._length * self.area              # SurdVal
+
+    def centroid_f(self) -> tuple:
+        # centroid on the centerline, length-weighted midpoints (floated)
+        from forgekernel.surd import sqrt_rational
+
+        acc = [0.0, 0.0, 0.0]
+        tot = 0.0
+        for a, b in zip(self.path, self.path[1:]):
+            seg = float(sqrt_rational(sum((b[i] - a[i]) ** 2 for i in range(3))))
+            mid = [(float(a[i]) + float(b[i])) / 2 for i in range(3)]
+            for i in range(3):
+                acc[i] += seg * mid[i]
+            tot += seg
+        return (acc[0] / tot, acc[1] / tot, acc[2] / tot)
+
+    def bbox(self):
+        # centerline bbox padded by the profile's circumradius estimate
+        pad = math.sqrt(float(self.area))
+        xs = [p[0] for p in self.path]
+        ys = [p[1] for p in self.path]
+        zs = [p[2] for p in self.path]
+        return ((float(min(xs)) - pad, float(min(ys)) - pad, float(min(zs)) - pad),
+                (float(max(xs)) + pad, float(max(ys)) + pad, float(max(zs)) + pad))
+
+    def watertight_violations(self) -> list:
+        return []

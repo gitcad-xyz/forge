@@ -84,3 +84,10 @@ def fillet_box(a, b, c, r, origin=(0, 0, 0)):
     from forgekernel.quadric import RoundedBox
 
     return RoundedBox(a, b, c, r, origin)
+
+
+def sweep(profile_area, path):
+    """Mitered sweep of a convex profile — exact volume in Q[sqrt d]."""
+    from forgekernel.quadric import MiteredSweep
+
+    return MiteredSweep(profile_area, path)
