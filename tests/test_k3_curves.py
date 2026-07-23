@@ -97,3 +97,62 @@ def test_tube_bbox_and_centroid_are_tight() -> None:
     assert z0 == pytest.approx(-0.75) and z1 == pytest.approx(24.75)
     cx, cy, cz = tube.centroid_f()
     assert (cx, cy) == (0.0, 0.0) and cz == pytest.approx(12.0)  # mid-height
+
+
+# -- K3.1: NURBS / B-spline curve evaluation via de Boor ----------------------
+
+def test_bezier_de_boor_is_exact_rational() -> None:
+    from forgekernel.nurbs import bezier
+
+    P = [(0, 0, 0), (1, 3, 0), (3, 3, 0), (4, 0, 0)]
+    c = bezier(P)
+    # cubic Bézier midpoint = (P0 + 3P1 + 3P2 + P3)/8, exactly
+    mid = c.eval(Fraction(1, 2))
+    want = tuple((Fraction(P[0][i]) + 3 * Fraction(P[1][i])
+                  + 3 * Fraction(P[2][i]) + Fraction(P[3][i])) / 8
+                 for i in range(3))
+    assert mid == want
+    assert all(isinstance(v, Fraction) for v in mid)     # exact, not float
+    # clamped endpoints interpolate the first/last control points
+    assert c.eval(0) == tuple(Fraction(v) for v in P[0])
+    assert c.eval(1) == tuple(Fraction(v) for v in P[3])
+
+
+def test_bspline_partition_of_unity() -> None:
+    from forgekernel.nurbs import BSplineCurve
+
+    # all control points equal → the curve is that point for every t
+    pt = (5, 7, 2)
+    c = BSplineCurve(2, [pt, pt, pt, pt], [0, 0, 0, 1, 2, 2, 2])
+    for t in (Fraction(1, 5), Fraction(1), Fraction(3, 2)):
+        assert c.eval(t) == tuple(Fraction(v) for v in pt)
+
+
+def test_bspline_interior_knot_span() -> None:
+    from forgekernel.nurbs import BSplineCurve
+
+    # a quadratic B-spline with one interior knot; a straight collinear
+    # control polygon must stay exactly on the line y = x
+    c = BSplineCurve(2, [(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 3, 0)],
+                     [0, 0, 0, 1, 2, 2, 2])
+    for t in (Fraction(1, 2), Fraction(1), Fraction(3, 2)):
+        x, y, _ = c.eval(t)
+        assert x == y
+
+
+def test_nurbs_circle_is_certifiably_on_the_circle() -> None:
+    from forgekernel.nurbs import BSplineCurve
+
+    # true quarter circle: rational control points, irrational weight √2/2
+    half_s2 = CInterval.exact(2).sqrt() * CInterval.exact(Fraction(1, 2))
+    qc = BSplineCurve(2, [(1, 0, 0), (1, 1, 0), (0, 1, 0)], [0, 0, 0, 1, 1, 1],
+                      weights=[Fraction(1), half_s2, Fraction(1)])
+    # exact eval is unavailable (irrational weight); certified eval is
+    with pytest.raises(ValueError, match="irrational weights"):
+        qc.eval(Fraction(1, 2))
+    px, py, _ = qc.eval_ci(Fraction(1, 2))
+    r2 = px * px + py * py
+    assert r2.lo <= 1 <= r2.hi                # certifiably on the unit circle
+    assert r2.width < Fraction(1, 10) ** 40
+    # rational endpoints come back exact
+    assert tuple(round(c.to_float(), 12) for c in qc.eval_ci(0)) == (1.0, 0.0, 0.0)
