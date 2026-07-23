@@ -399,3 +399,29 @@ def test_mitered_sweep_exact_in_root2() -> None:
     ms = sweep(16, [[0, 0, 0], [0, 0, 20], [15, 0, 35], [40, 0, 35]])
     assert ms.length() == SurdVal(45, 15, 2)            # 20 + 15√2 + 25
     assert ms.volume() == SurdVal(720, 240, 2)          # 16 × length, EXACT
+
+
+# -- W-K: composite tessellation (bounded-error view) -------------------------
+
+def test_revolve_mesh_approximates_exact_volume() -> None:
+    from forgekernel.quadric import RevolveSolid
+    from forgekernel.tess import mesh_volume
+
+    rs = RevolveSolid([(2, 0), (4, 0), (4, 5), (2, 5)])   # washer, 60pi
+    exact = float(rs.volume())
+    for defl in (0.5, 0.1, 0.01):
+        v = mesh_volume(rs.tessellate(defl))
+        assert v <= exact                                 # inscribed
+        assert (exact - v) / exact < 0.5 * defl + 0.05    # converges
+
+
+def test_axisstack_mesh_converges() -> None:
+    from forgekernel.quadric import AxisStack, Cone, Cyl
+    from forgekernel.tess import mesh_volume
+
+    s = AxisStack(0, 0, [Cyl.make(10, 8)]).fuse(Cone.make(10, 6, 12).translated(0, 0, 8))
+    exact = float(s.volume())
+    coarse = mesh_volume(s.tessellate(0.5))
+    fine = mesh_volume(s.tessellate(0.02))
+    assert abs(fine - exact) < abs(coarse - exact)        # finer is closer
+    assert abs(fine - exact) / exact < 0.02

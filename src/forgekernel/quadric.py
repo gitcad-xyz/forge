@@ -357,6 +357,18 @@ class AxisStack:
         zbar = sum((q.z_integral(lo, hi) for lo, hi, q in pieces), F(0)) / v
         return (float(self.cx), float(self.cy), float(zbar))
 
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        from forgekernel.tess import lathe
+
+        pieces = self._pieces()
+        profile = [(0.0, float(pieces[0][0]))]
+        for lo, hi, q in pieces:
+            import math as _m
+            profile.append((_m.sqrt(max(0.0, float(q.at(lo)))), float(lo)))
+            profile.append((_m.sqrt(max(0.0, float(q.at(hi)))), float(hi)))
+        profile.append((0.0, float(pieces[-1][1])))
+        return lathe(profile, deflection, float(self.cx), float(self.cy))
+
     def bbox(self):
         pieces = self._pieces()
         z0 = min(lo for lo, _, _ in pieces)
@@ -415,6 +427,11 @@ class RevolveSolid:
         zs = [z for _, z in self.loop]
         return ((-float(rmax), -float(rmax), float(min(zs))),
                 (float(rmax), float(rmax), float(max(zs))))
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        from forgekernel.tess import lathe
+
+        return lathe([(float(r), float(z)) for r, z in self.loop], deflection)
 
 
 def _member_volume(m):
