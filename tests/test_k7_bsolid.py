@@ -1,0 +1,68 @@
+"""K7.0 — exact volume of a freeform (Bézier-patch) solid via the flux
+theorem. The integrand is polynomial, so the volume is an exact ℚ."""
+
+from __future__ import annotations
+
+from fractions import Fraction
+
+import pytest
+
+from forgekernel.bsolid import (PatchSolid, box_patches, patch_flux,
+                                _lagrange_weights, _nodes)
+from forgekernel.nurbs import bezier_surface
+
+F = Fraction
+
+
+def test_exact_quadrature_integrates_polynomials_exactly() -> None:
+    for n in (2, 3, 5):
+        nodes = _nodes(n)
+        w = _lagrange_weights(nodes)
+        assert sum(w) == 1                                  # ∫₀¹ 1 = 1
+        for k in range(n):                                  # ∫₀¹ xᵏ = 1/(k+1)
+            assert sum(wi * ni ** k for wi, ni in zip(w, nodes)) == F(1, k + 1)
+
+
+def test_box_patch_solid_volume_is_exact() -> None:
+    assert PatchSolid(box_patches(3, 4, 5)).volume() == 60
+    assert PatchSolid(box_patches(7, 11, 13)).volume() == 1001
+
+
+def test_bulged_solid_volume_is_exact_rational() -> None:
+    # box 3×4×5 with a biquadratic bulge on top (center pole lifted +3);
+    # the added volume is exact — a freeform solid with a ℚ volume
+    xs, ys = [F(0), F(3, 2), F(3)], [F(0), F(2), F(4)]
+    znet = [[5, 5, 5], [5, 8, 5], [5, 5, 5]]
+    top = bezier_surface([[(xs[i], ys[j], znet[i][j]) for j in range(3)]
+                          for i in range(3)])
+    patches = box_patches(3, 4, 5)
+    patches[1] = top
+    v = PatchSolid(patches).volume()
+    assert isinstance(v, Fraction)
+    assert v == 64            # 60 + bulge; exact
+
+
+def test_higher_degree_bulge_still_exact() -> None:
+    # a bicubic bulge → flux of degree (8,8); the 3p=9-node quadrature
+    # nails it exactly, proving the degree bookkeeping is right
+    xs = [F(k, 1) for k in (0, 1, 2, 3)]
+    ys = [F(k, 1) for k in (0, 1, 2, 3)]
+    z = [[5, 5, 5, 5], [5, 9, 9, 5], [5, 9, 9, 5], [5, 5, 5, 5]]
+    top = bezier_surface([[(xs[i], ys[j], z[i][j]) for j in range(4)]
+                          for i in range(4)])
+    patches = box_patches(3, 3, 5)
+    patches[1] = top
+    v = PatchSolid(patches).volume()
+    assert isinstance(v, Fraction)
+    assert v > 45             # 45 box + positive bulge
+
+
+def test_rational_patch_flux_refuses() -> None:
+    from forgekernel.nurbs import BSplineSurface
+
+    arc = [(1, 0), (1, 1), (0, 1)]
+    net = [[(x, y, 0), (x, y, 1)] for (x, y) in arc]
+    wts = [[F(1), F(1)], [F(3, 4), F(3, 4)], [F(1), F(1)]]
+    s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 1, 1], [0, 0, 1, 1], wts)
+    with pytest.raises(ValueError, match="K7.1"):
+        patch_flux(s)
