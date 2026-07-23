@@ -115,3 +115,59 @@ def test_serialization_round_trip_bit_exact() -> None:
     assert s2.volume() == s.volume()
     stl = io.to_stl(s)
     assert stl.startswith("solid") and "endsolid" in stl
+
+
+# -- K2.0: exact ℚ[π] drilled solids ------------------------------------------
+
+def test_pival_field_arithmetic() -> None:
+    from forgekernel.quadric import PiVal
+
+    v = PiVal(9600) - PiVal(0, 100)
+    assert v == PiVal(9600, -100)
+    assert abs(float(v) - (9600 - 100 * 3.141592653589793)) < 1e-12
+
+
+def test_drilled_plate_volume_is_exact_in_pi() -> None:
+    from forgekernel.quadric import Cyl, DrilledSolid, PiVal
+
+    plate = DrilledSolid(box(60, 40, 4), [])
+    for i in range(4):
+        plate = plate.cut(Cyl.make(Fraction(5, 2), 4).translated(10 + 13 * i, 20, 0))
+    # EXACTLY 9600 - 4·π·(5/2)²·4 = 9600 - 25π... per hole: 6.25·4=25
+    assert plate.volume() == PiVal(9600, -100)
+    assert len(plate.cylinder_faces()) == 4
+    assert plate.cylinder_faces()[0]["surface"] == "cylinder"
+
+
+def test_counterbore_stack_unions_by_z() -> None:
+    from forgekernel.quadric import Cyl, DrilledSolid, PiVal
+
+    base = DrilledSolid(box(20, 20, 10), [])
+    base = base.cut(Cyl.make(2, 10).translated(10, 10, 0))          # thru r2
+    base = base.cut(Cyl.make(4, 3).translated(10, 10, 7))           # cbore r4
+    # removed = π(4·7 + 16·3) = π·76
+    assert base.volume() == PiVal(400 * 10, -76)
+
+
+def test_drill_preconditions_refuse_exactly() -> None:
+    import pytest as _pytest
+
+    from forgekernel.quadric import Cyl, DrilledSolid
+
+    base = DrilledSolid(box(20, 20, 10), [])
+    with _pytest.raises(ValueError, match="lateral wall"):
+        base.cut(Cyl.make(3, 10).translated(1, 10, 0))     # crosses x=0 wall
+    ok = base.cut(Cyl.make(3, 10).translated(6, 10, 0))
+    with _pytest.raises(ValueError, match="intersect"):
+        ok.cut(Cyl.make(3, 10).translated(11, 10, 0))      # touches first bore
+    with _pytest.raises(ValueError, match="misses"):
+        base.cut(Cyl.make(2, 5).translated(10, 10, 20))    # above the solid
+
+
+def test_blind_hole_clamps_to_material() -> None:
+    from forgekernel.quadric import Cyl, DrilledSolid, PiVal
+
+    base = DrilledSolid(box(20, 20, 10), [])
+    # drilled from above, tool extends past the top: clamped to material
+    out = base.cut(Cyl.make(2, 8).translated(10, 10, 6))
+    assert out.volume() == PiVal(4000, -16)                # π·4·(10-6)
