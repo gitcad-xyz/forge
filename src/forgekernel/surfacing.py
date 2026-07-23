@@ -272,3 +272,70 @@ def curve_curvature_comb(curve, n: int = 32, scale: float = 1.0):
         tip = tuple(pt[c] + scale * kappa * nvec[c] / nlen for c in range(3))
         out.append((pt, tip))
     return out
+
+
+# -- K6.2: G1 blend strip (fill between two patches, proven smooth) -----------
+
+def _edge_data(surface: BSplineSurface, edge: str):
+    """(boundary curve net, transversal derivative net) along an edge —
+    exact Bézier control rows extracted from the surface net.
+
+    For a Bézier patch the boundary curve is the edge row/column of the
+    control net, and the transversal derivative along that edge is
+    p·(row₁ − row₀) (a Bézier curve of the edge parameter)."""
+    net = surface.cp
+    p, q = surface.p, surface.q
+    if any(w != F(1) for row in surface.w for w in row):
+        raise ValueError("blend strip: polynomial patches only (K6.3)")
+    if edge == "u1":        # u = 1 edge, parameter runs along v
+        c = net[-1]
+        d = [tuple(F(p) * (net[-1][j][k] - net[-2][j][k]) for k in range(3))
+             for j in range(q + 1)]
+    elif edge == "u0":
+        c = net[0]
+        d = [tuple(F(p) * (net[1][j][k] - net[0][j][k]) for k in range(3))
+             for j in range(q + 1)]
+    elif edge == "v1":
+        c = [net[i][-1] for i in range(p + 1)]
+        d = [tuple(F(q) * (net[i][-1][k] - net[i][-2][k]) for k in range(3))
+             for i in range(p + 1)]
+    else:
+        c = [net[i][0] for i in range(p + 1)]
+        d = [tuple(F(q) * (net[i][1][k] - net[i][0][k]) for k in range(3))
+             for i in range(p + 1)]
+    return [tuple(x) for x in c], d
+
+
+def g1_blend_strip(A: BSplineSurface, B: BSplineSurface, *,
+                   a_edge: str = "u1", b_edge: str = "u0") -> BSplineSurface:
+    """Fill the gap between an edge of ``A`` and an edge of ``B`` with a
+    cubic Hermite strip that meets BOTH with G1 continuity — by
+    construction, and certifiable by :func:`g1_certify` afterwards.
+
+    The strip is cubic transversally: Hermite data (position + outward
+    transversal derivative) at each end, converted to an exact Bézier
+    net via the Hermite→Bézier map  [P0, P0+m0/3, P1−m1/3, P1]."""
+    ca, da = _edge_data(A, a_edge)
+    cb, db = _edge_data(B, b_edge)
+    if len(ca) != len(cb):
+        raise ValueError("blend strip: edges must share degree (K6.3)")
+    # outward direction: A's edge derivative points OUT of A when the
+    # edge is u1/v1, INTO A when u0/v0 (flip). Likewise B's must point
+    # INTO the strip (i.e. out of B flipped at u1/v1... B's edge faces
+    # the strip, so B's outward transversal at u0/v0 is already inward).
+    sa = 1 if a_edge in ("u1", "v1") else -1
+    sb = 1 if b_edge in ("u1", "v1") else -1
+    n = len(ca)
+    net = []
+    for i in range(n):
+        p0 = ca[i]
+        p1 = cb[i]
+        m0 = tuple(sa * da[i][k] for k in range(3))       # d/dv at strip v=0
+        m1 = tuple(-sb * db[i][k] for k in range(3))      # d/dv at strip v=1
+        net.append([
+            p0,
+            tuple(p0[k] + m0[k] / 3 for k in range(3)),
+            tuple(p1[k] - m1[k] / 3 for k in range(3)),
+            p1,
+        ])
+    return bezier_surface(net)

@@ -131,3 +131,25 @@ def test_curvature_comb_peaks_at_the_apex() -> None:
     # the comb is a float VIEWER artifact (unlike the exact curvature
     # values) — symmetric ends agree to float precision, not bitwise
     assert lens[0] == pytest.approx(lens[-1])
+
+
+# -- K6.2: the G1 blend strip — self-certifying fill --------------------------
+
+def test_blend_strip_certifies_g1_to_both_neighbours() -> None:
+    from forgekernel.surfacing import g1_blend_strip, g1_certify
+
+    # A: z=x² over [0,1]; B: z=(x−3)² over [3,4] — a gap from x=1 to 3.
+    A = bezier_surface([[(0, 0, 0), (0, 1, 0)],
+                        [(F(1, 2), 0, 0), (F(1, 2), 1, 0)],
+                        [(1, 0, 1), (1, 1, 1)]])
+    B = bezier_surface([[(3, 0, 1), (3, 1, 1)],
+                        [(F(7, 2), 0, 0), (F(7, 2), 1, 0)],
+                        [(4, 0, 0), (4, 1, 0)]])
+    strip = g1_blend_strip(A, B, a_edge="u1", b_edge="u0")
+    # the construction is Hermite; the PROOF is the polynomial-identity
+    # certifier — the strip must pass it against both neighbours
+    assert g1_certify(A, strip, a_edge="u1", b_edge="v0")
+    assert g1_certify(strip, B, a_edge="v1", b_edge="u0")
+    # boundary interpolation is exact
+    assert strip.eval(0, 0) == (1, 0, 1)
+    assert strip.eval(0, 1) == (3, 0, 1)
