@@ -314,3 +314,22 @@ def test_draft_nonrect_refuses() -> None:
     tri = Solid.prism([(0, 0), (10, 0), (5, 8)], 6)
     with _pytest.raises(ValueError, match="K2.3"):
         draft(tri, 3.0)
+
+
+# -- W-C: shell (hollow box, exact) -------------------------------------------
+
+def test_shell_box_exact() -> None:
+    from forgekernel.kernel import box, shell
+
+    s = shell(box(40, 30, 20), 2)
+    assert s.volume() == 40 * 30 * 20 - 36 * 26 * 16   # == 9024
+    assert s.watertight_violations() == []
+
+
+def test_shell_too_thick_refuses() -> None:
+    import pytest as _pytest
+
+    from forgekernel.kernel import box, shell
+
+    with _pytest.raises(ValueError, match="exceeds"):
+        shell(box(10, 10, 10), 5)                       # 2t == smallest dim

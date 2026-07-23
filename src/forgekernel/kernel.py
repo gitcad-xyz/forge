@@ -70,3 +70,10 @@ def draft(s: Solid, angle_deg: float, neutral_z=0, faces=None) -> Solid:
 
     t = F(_m.tan(_m.radians(angle_deg)))
     return draft_box(s, t, F(neutral_z))
+
+
+def shell(s: Solid, thickness) -> Solid:
+    """Hollow to a wall thickness (closed shell, exact for box solids)."""
+    from forgekernel.brep import shell_box
+
+    return shell_box(s, thickness)

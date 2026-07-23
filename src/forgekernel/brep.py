@@ -598,3 +598,27 @@ def draft_box(solid: Solid, t: Fraction, neutral_z: Fraction) -> Solid:
                 (x1 - d, y1 - d), (x0 + d, y1 - d)]
 
     return prismatoid(rect(z0), z0, rect(z1), z1, "draft")
+
+
+def shell_box(solid: Solid, thickness) -> Solid:
+    """Hollow an axis-aligned rectangular prism to wall thickness t (all
+    faces closed — a shell with no openings). Result = outer minus the
+    inner box inset by t on every face. Exact. Non-box or t too large
+    refuse (K2.3 / invalid)."""
+    from forgekernel import csg
+
+    t = F(thickness)
+    lo, hi = solid.bbox()
+    x0, y0, z0 = lo
+    x1, y1, z1 = hi
+    corners = {(x0, y0), (x1, y0), (x1, y1), (x0, y1)}
+    for p in solid.polys:
+        for vx, vy, vz in p.verts:
+            if (vx, vy) not in corners or vz not in (z0, z1):
+                raise ValueError("shell of a non-box solid arrives at K2.3")
+    if 2 * t >= min(x1 - x0, y1 - y0, z1 - z0):
+        raise ValueError("shell thickness exceeds half the smallest dimension")
+    inner = Solid.box(x1 - x0 - 2 * t, y1 - y0 - 2 * t, z1 - z0 - 2 * t,
+                      "shell.void").translated(
+                          (x0 + t, y0 + t, z0 + t))
+    return csg.cut(solid, inner)
