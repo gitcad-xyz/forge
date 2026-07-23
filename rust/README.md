@@ -32,3 +32,23 @@ fast. It never invents behavior — every forge answer must already be a
 ref answer. That is why W-I comes AFTER the exact reference is complete
 through K2, and why its acceptance test is "identical to ref", not
 "looks right".
+
+## Status update (2026-07-23): K1 core BUILT and oracle-verified
+
+Toolchain installed (rustup 1.29 / rustc 1.97, MSVC). `forge-core`
+(`src/lib.rs`) ports the K1 exact planar core — BigRational Vec3/Plane
+with exact sign predicates, box + translate, and the full BSP
+union/cut/intersect — behind a pyo3 module `forgekernel_rs`. Build:
+
+    cd rust/forge-core && VIRTUAL_ENV=<venv> maturin develop --release
+
+Oracle (`tests/test_rust_oracle.py`, 7 tests, skips if the extension
+isn't built): every case runs through BOTH forgekernel_rs and the
+Python `forgekernel` reference; asserts IDENTICAL exact volume AND
+identical canonical face-set. All pass — the Rust port reproduces ref
+bit-for-bit. Performance: ~2.5x faster than the Python ref on a boolean
+cut (larger wins expected on deep chains where ref's denominators grow).
+
+Remaining port work (mechanical, ref stays the oracle): prism, scale,
+mirror, rotated_quarter, chamfer, exact line-coverage closure, and the
+K2 ℚ[π] composites — each added the same way, gated by ref-identity.
