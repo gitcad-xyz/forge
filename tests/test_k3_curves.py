@@ -156,3 +156,44 @@ def test_nurbs_circle_is_certifiably_on_the_circle() -> None:
     assert r2.width < Fraction(1, 10) ** 40
     # rational endpoints come back exact
     assert tuple(round(c.to_float(), 12) for c in qc.eval_ci(0)) == (1.0, 0.0, 0.0)
+
+
+# -- K3.2: tensor-product NURBS surfaces --------------------------------------
+
+def test_bezier_surface_is_exact_rational() -> None:
+    from forgekernel.nurbs import bezier_surface
+
+    # bilinear patch: center is the exact average of the four corners
+    s = bezier_surface([[(0, 0, 0), (2, 0, 0)], [(0, 2, 0), (2, 2, 4)]])
+    assert s.eval(0, 0) == (0, 0, 0)
+    assert s.eval(1, 1) == (2, 2, 4)
+    assert s.eval(Fraction(1, 2), Fraction(1, 2)) == \
+        (Fraction(1), Fraction(1), Fraction(1))
+
+
+def test_surface_partials_and_normal_exact() -> None:
+    from forgekernel.nurbs import bezier_surface
+
+    # flat z=0 patch: normal is exactly along z everywhere
+    flat = bezier_surface([[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+                           [(0, 1, 0), (1, 1, 0), (2, 1, 0)],
+                           [(0, 2, 0), (1, 2, 0), (2, 2, 0)]])
+    n = flat.normal(Fraction(1, 3), Fraction(2, 5))
+    assert n[0] == 0 and n[1] == 0 and n[2] != 0
+    # paraboloid-like patch: S_u X S_v of the bilinear at the center
+    s = bezier_surface([[(0, 0, 0), (2, 0, 0)], [(0, 2, 0), (2, 2, 4)]])
+    S, Su, Sv = s.partials(Fraction(1, 2), Fraction(1, 2))
+    assert S == (1, 1, 1)
+    assert all(isinstance(v, Fraction) for v in Su + Sv)
+
+
+def test_bspline_surface_interior_knots() -> None:
+    from forgekernel.nurbs import BSplineSurface
+
+    # biquadratic with an interior knot in u; a flat control net stays flat
+    net = [[(x, y, 0) for y in range(3)] for x in range(4)]
+    s = BSplineSurface(2, 2, net, [0, 0, 0, 1, 2, 2, 2], [0, 0, 0, 1, 1, 1])
+    for uv in ((Fraction(1, 2), Fraction(1, 3)), (Fraction(3, 2), Fraction(2, 3))):
+        pt = s.eval(*uv)
+        assert pt[2] == 0                       # exactly in the plane
+        assert all(isinstance(v, Fraction) for v in pt)

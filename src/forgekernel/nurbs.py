@@ -164,3 +164,143 @@ def _ci_reciprocal(x: CInterval) -> CInterval:
     s = x.sign()                                    # raises if straddles 0
     lo, hi = (F(1) / x.hi, F(1) / x.lo) if s > 0 else (F(1) / x.hi, F(1) / x.lo)
     return CInterval(min(lo, hi), max(lo, hi))
+
+
+# -- K3.2: tensor-product NURBS surfaces --------------------------------------
+
+def _deboor4(p: int, U, pts, u):
+    """De Boor on homogeneous 4-vectors (exact rational). ``pts`` spans one
+    curve; returns the 4-vector at parameter ``u``."""
+    n = len(pts) - 1
+    # span
+    if u >= U[n + 1]:
+        k = n
+    elif u <= U[p]:
+        k = p
+    else:
+        lo, hi = p, n + 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if u < U[mid]:
+                hi = mid
+            else:
+                lo = mid
+        k = lo
+    d = [list(pts[k - p + j]) for j in range(p + 1)]
+    for r in range(1, p + 1):
+        for j in range(p, r - 1, -1):
+            i = k - p + j
+            denom = U[i + p - r + 1] - U[i]
+            a = F(0) if denom == 0 else (u - U[i]) / denom
+            b = 1 - a
+            d[j] = [b * d[j - 1][c] + a * d[j][c] for c in range(4)]
+    return tuple(d[p])
+
+
+def _hodograph4(p: int, U, pts):
+    """Derivative curve of a (homogeneous) B-spline: degree p-1, control
+    points p·(P[i+1]−P[i])/(U[i+p+1]−U[i+1]), knots U[1:-1]. Exact."""
+    D = []
+    for i in range(len(pts) - 1):
+        denom = U[i + p + 1] - U[i + 1]
+        s = F(0) if denom == 0 else F(p) / denom
+        D.append(tuple(s * (pts[i + 1][c] - pts[i][c]) for c in range(4)))
+    return p - 1, U[1:-1], D
+
+
+class BSplineSurface:
+    """A tensor-product NURBS surface: degrees (p, q), an nu×nv control
+    net, clamped knot vectors U (nu+p+1) and V (nv+q+1), optional
+    weights. Rational data at rational parameters evaluates exactly."""
+
+    def __init__(self, degree_u: int, degree_v: int, control_net,
+                 knots_u, knots_v, weights=None) -> None:
+        self.p = int(degree_u)
+        self.q = int(degree_v)
+        self.cp = [[tuple(F(c) for c in pt) for pt in row] for row in control_net]
+        self.nu = len(self.cp)
+        self.nv = len(self.cp[0])
+        if any(len(r) != self.nv for r in self.cp):
+            raise ValueError("ragged control net")
+        self.U = [F(u) for u in knots_u]
+        self.V = [F(v) for v in knots_v]
+        if len(self.U) != self.nu + self.p + 1:
+            raise ValueError(f"knots_u wants {self.nu + self.p + 1} entries")
+        if len(self.V) != self.nv + self.q + 1:
+            raise ValueError(f"knots_v wants {self.nv + self.q + 1} entries")
+        if weights is None:
+            self.w = [[F(1)] * self.nv for _ in range(self.nu)]
+        else:
+            self.w = [[F(x) for x in row] for row in weights]
+        # homogeneous net
+        self.H = [[(self.w[i][j] * self.cp[i][j][0],
+                    self.w[i][j] * self.cp[i][j][1],
+                    self.w[i][j] * self.cp[i][j][2],
+                    self.w[i][j]) for j in range(self.nv)]
+                  for i in range(self.nu)]
+
+    # -- exact evaluation ------------------------------------------------------
+
+    def _eval_h(self, u, v):
+        """Homogeneous 4-vector at (u, v): de Boor down v then across u."""
+        u, v = F(u), F(v)
+        col = [_deboor4(self.q, self.V, row, v) for row in self.H]
+        return _deboor4(self.p, self.U, col, u)
+
+    def eval(self, u, v):
+        """Exact surface point in ℚ³ (rational in → rational out)."""
+        hx, hy, hz, hw = self._eval_h(u, v)
+        return (hx / hw, hy / hw, hz / hw)
+
+    def eval_f(self, u: float, v: float):
+        x, y, z = self.eval(F(u).limit_denominator(10 ** 9),
+                            F(v).limit_denominator(10 ** 9))
+        return (float(x), float(y), float(z))
+
+    # -- exact partial derivatives (quotient rule in homogeneous space) -------
+
+    def _partials_h(self, u, v):
+        """(H, H_u, H_v) homogeneous 4-vectors, all exact."""
+        u, v = F(u), F(v)
+        col = [_deboor4(self.q, self.V, row, v) for row in self.H]
+        H = _deboor4(self.p, self.U, col, u)
+        pu, Uu, Du = _hodograph4(self.p, self.U, col)
+        H_u = _deboor4(pu, Uu, Du, u) if pu >= 0 and Du else (F(0),) * 4
+        # v-partial: hodograph each row in v, evaluate, then de Boor in u
+        rows_dv = []
+        for row in self.H:
+            qv, Vv, Dv = _hodograph4(self.q, self.V, row)
+            rows_dv.append(_deboor4(qv, Vv, Dv, v) if qv >= 0 and Dv
+                           else (F(0),) * 4)
+        H_v = _deboor4(self.p, self.U, rows_dv, u)
+        return H, H_u, H_v
+
+    def partials(self, u, v):
+        """(S, S_u, S_v) in ℚ³ — the exact tangent plane data SSI needs.
+        Quotient rule: S_u = (A_u·w − A·w_u)/w² with H = (A, w)."""
+        H, H_u, H_v = self._partials_h(u, v)
+        w, wu, wv = H[3], H_u[3], H_v[3]
+        S = tuple(H[c] / w for c in range(3))
+        S_u = tuple((H_u[c] * w - H[c] * wu) / (w * w) for c in range(3))
+        S_v = tuple((H_v[c] * w - H[c] * wv) / (w * w) for c in range(3))
+        return S, S_u, S_v
+
+    def normal(self, u, v):
+        """Exact (unnormalized) normal S_u × S_v in ℚ³."""
+        _, su, sv = self.partials(u, v)
+        return (su[1] * sv[2] - su[2] * sv[1],
+                su[2] * sv[0] - su[0] * sv[2],
+                su[0] * sv[1] - su[1] * sv[0])
+
+    def domain(self):
+        return ((float(self.U[self.p]), float(self.U[self.nu])),
+                (float(self.V[self.q]), float(self.V[self.nv])))
+
+
+def bezier_surface(control_net, weights=None) -> BSplineSurface:
+    """A Bézier patch as a clamped B-spline surface on [0,1]²."""
+    nu, nv = len(control_net), len(control_net[0])
+    p, q = nu - 1, nv - 1
+    ku = [F(0)] * (p + 1) + [F(1)] * (p + 1)
+    kv = [F(0)] * (q + 1) + [F(1)] * (q + 1)
+    return BSplineSurface(p, q, control_net, ku, kv, weights)
