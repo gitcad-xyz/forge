@@ -749,3 +749,112 @@ def steinmetz(r) -> PiVal:
     bicylinder / Steinmetz solid) — famously EXACT and π-free: 16 r³/3."""
     r = F(r)
     return PiVal(Fraction(16, 3) * r ** 3, 0)
+
+
+# -- K5.0: rolling-ball fillets on SELECTED straight box edges ----------------
+
+class FilletedBox:
+    """A box with a constant-radius rolling-ball fillet on a chosen
+    subset of its straight edges — exact in ℚ[π].
+
+    Removed material per edge = (square corner prism) − (quarter
+    cylinder): ΔV = (r² − πr²/4)·L, so
+
+        V = V_box − Σ r²L  +  π·Σ (r²/4)L      — a PiVal, exact.
+
+    Selected edges must be pairwise NON-ADJACENT (sharing a box vertex
+    would need the spherical corner patch — that is K5.1); adjacency
+    refuses with the stage name. Edges are given as (axis, side_a,
+    side_b): the edge parallel to ``axis`` on the (min/max, min/max)
+    sides of the other two axes, e.g. ('z', 'max', 'max')."""
+
+    def __init__(self, lo, hi, edges, radius) -> None:
+        self.lo = tuple(F(v) for v in lo)
+        self.hi = tuple(F(v) for v in hi)
+        self.r = F(radius)
+        self.edges = list(edges)
+        dims = [self.hi[c] - self.lo[c] for c in range(3)]
+        if self.r <= 0:
+            raise ValueError("fillet wants positive radius")
+        axes = {"x": 0, "y": 1, "z": 2}
+        seen = set()
+        verts: list[set] = []
+        for axis, sa, sb in self.edges:
+            a = axes[axis]
+            o1, o2 = [c for c in range(3) if c != a]
+            if 2 * self.r > min(dims[o1], dims[o2]):
+                raise ValueError("fillet radius exceeds the face half-width")
+            key = (a, sa, sb)
+            if key in seen:
+                raise ValueError("edge selected twice")
+            seen.add(key)
+            # the edge's two box vertices, for adjacency detection
+            c1 = self.lo[o1] if sa == "min" else self.hi[o1]
+            c2 = self.lo[o2] if sb == "min" else self.hi[o2]
+            vset = set()
+            for end in (self.lo[a], self.hi[a]):
+                v = [0, 0, 0]
+                v[a], v[o1], v[o2] = end, c1, c2
+                vset.add(tuple(v))
+            verts.append(vset)
+        for i in range(len(verts)):
+            for j in range(i + 1, len(verts)):
+                if verts[i] & verts[j]:
+                    raise ValueError(
+                        "adjacent filleted edges need the spherical corner "
+                        "patch (arrives at K5.1)")
+
+    def _edge_len(self, axis: str) -> F:
+        a = {"x": 0, "y": 1, "z": 2}[axis]
+        return self.hi[a] - self.lo[a]
+
+    def volume(self) -> PiVal:
+        vbox = F(1)
+        for c in range(3):
+            vbox *= self.hi[c] - self.lo[c]
+        rat = vbox
+        pi_c = F(0)
+        for axis, _, _ in self.edges:
+            L = self._edge_len(axis)
+            rat -= self.r * self.r * L
+            pi_c += self.r * self.r * L / 4
+        return PiVal(rat, pi_c)
+
+    def centroid_f(self):
+        import math
+        axes = {"x": 0, "y": 1, "z": 2}
+        vbox = 1.0
+        cb = [0.0, 0.0, 0.0]
+        for c in range(3):
+            vbox *= float(self.hi[c] - self.lo[c])
+            cb[c] = float(self.lo[c] + self.hi[c]) / 2
+        r = float(self.r)
+        num = [vbox * cb[c] for c in range(3)]
+        vtot = vbox
+        # removed region cross-section: square r×r at the edge corner minus
+        # the quarter disk about the inner corner. Exact area r²−πr²/4;
+        # centroid distance from the OUTER corner along each face:
+        #   c* = (r/2·r² − (r−4r/3π)·πr²/4) / (r²−πr²/4)
+        area = r * r - math.pi * r * r / 4
+        cstar = (r * r * (r / 2) - (math.pi * r * r / 4) * (r - 4 * r / (3 * math.pi))) / area
+        for axis, sa, sb in self.edges:
+            a = axes[axis]
+            o1, o2 = [c for c in range(3) if c != a]
+            L = float(self._edge_len(axis))
+            vrem = area * L
+            crem = [0.0, 0.0, 0.0]
+            crem[a] = float(self.lo[a] + self.hi[a]) / 2
+            crem[o1] = (float(self.lo[o1]) + cstar if sa == "min"
+                        else float(self.hi[o1]) - cstar)
+            crem[o2] = (float(self.lo[o2]) + cstar if sb == "min"
+                        else float(self.hi[o2]) - cstar)
+            vtot -= vrem
+            for c in range(3):
+                num[c] -= vrem * crem[c]
+        return tuple(n / vtot for n in num)
+
+    def bbox(self):
+        return self.lo, self.hi
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        raise NotImplementedError("FilletedBox mesh arrives at K5.1")
