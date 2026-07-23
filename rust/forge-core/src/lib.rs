@@ -134,24 +134,37 @@ impl Plane {
     }
 }
 
+fn to_f3(v: &V) -> [f64; 3] {
+    [
+        v[0].to_f64().unwrap_or(f64::NAN),
+        v[1].to_f64().unwrap_or(f64::NAN),
+        v[2].to_f64().unwrap_or(f64::NAN),
+    ]
+}
+
 #[derive(Clone)]
 struct Polygon {
     verts: Vec<V>,
+    fverts: Vec<[f64; 3]>, // lazy: cached float approximations (predicate fast path)
     plane: Plane,
     source: String,
 }
 impl Polygon {
     fn new(verts: Vec<V>, source: String) -> Polygon {
         let plane = Plane::from_points(&verts[0], &verts[1], &verts[2]);
-        Polygon { verts, plane, source }
+        let fverts = verts.iter().map(to_f3).collect();
+        Polygon { verts, fverts, plane, source }
     }
     fn with_plane(verts: Vec<V>, source: String, plane: Plane) -> Polygon {
-        Polygon { verts, plane, source }
+        let fverts = verts.iter().map(to_f3).collect();
+        Polygon { verts, fverts, plane, source }
     }
     fn flipped(&self) -> Polygon {
         let mut v = self.verts.clone();
         v.reverse();
-        Polygon::with_plane(v, self.source.clone(), self.plane.flipped())
+        let mut fv = self.fverts.clone();
+        fv.reverse();
+        Polygon { verts: v, fverts: fv, plane: self.plane.flipped(), source: self.source.clone() }
     }
     fn area2(&self) -> R {
         let mut acc = [ri(0), ri(0), ri(0)];
@@ -165,12 +178,11 @@ impl Polygon {
     /// non-zero float area normal proves non-degenerate without the exact
     /// area2; only near-zero falls back to exact. Answer is always exact.
     fn is_degenerate(&self) -> bool {
-        let f = |v: &V| [v[0].to_f64().unwrap_or(f64::NAN), v[1].to_f64().unwrap_or(f64::NAN), v[2].to_f64().unwrap_or(f64::NAN)];
-        let v0 = f(&self.verts[0]);
+        let v0 = self.fverts[0];
         let mut acc = [0.0f64; 3];
-        for i in 1..self.verts.len() - 1 {
-            let a = f(&self.verts[i]);
-            let b = f(&self.verts[i + 1]);
+        for i in 1..self.fverts.len() - 1 {
+            let a = self.fverts[i];
+            let b = self.fverts[i + 1];
             let e1 = [a[0] - v0[0], a[1] - v0[1], a[2] - v0[2]];
             let e2 = [b[0] - v0[0], b[1] - v0[1], b[2] - v0[2]];
             acc[0] += e1[1] * e2[2] - e1[2] * e2[1];
@@ -851,13 +863,10 @@ struct Split {
 /// only when the float magnitude is within the bound of zero. The answer
 /// is ALWAYS the exact sign — the filter only skips slow exact arithmetic
 /// on the common, unambiguous case (the chamfer/deep-boolean hot path).
-fn side_filtered(plane: &Plane, pf: &[f64; 4], p: &V) -> i32 {
-    let px = p[0].to_f64().unwrap_or(f64::NAN);
-    let py = p[1].to_f64().unwrap_or(f64::NAN);
-    let pz = p[2].to_f64().unwrap_or(f64::NAN);
-    let t0 = pf[0] * px;
-    let t1 = pf[1] * py;
-    let t2 = pf[2] * pz;
+fn side_filtered(plane: &Plane, pf: &[f64; 4], fp: &[f64; 3], p: &V) -> i32 {
+    let t0 = pf[0] * fp[0];
+    let t1 = pf[1] * fp[1];
+    let t2 = pf[2] * fp[2];
     let s = t0 + t1 + t2 - pf[3];
     // conservative static bound: a few ulps of the summed magnitudes
     let bound = 16.0 * f64::EPSILON * (t0.abs() + t1.abs() + t2.abs() + pf[3].abs() + 1.0);
@@ -880,7 +889,9 @@ fn split(plane: &Plane, poly: &Polygon) -> Split {
         plane.n[2].to_f64().unwrap_or(f64::NAN),
         plane.d.to_f64().unwrap_or(f64::NAN),
     ];
-    let sides: Vec<i32> = poly.verts.iter().map(|v| side_filtered(plane, &pf, v)).collect();
+    let sides: Vec<i32> = (0..poly.verts.len())
+        .map(|i| side_filtered(plane, &pf, &poly.fverts[i], &poly.verts[i]))
+        .collect();
     let mut kind = 0;
     for &s in &sides {
         kind |= if s > 0 { 1 } else if s < 0 { 2 } else { 0 };
