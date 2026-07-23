@@ -115,3 +115,18 @@ def test_boolean_volume_identity_fuzz() -> None:
         assert vu + vi == va + vb             # EXACT rational identity
         checks += 1
     assert checks >= 30                       # actually exercised the engine
+
+
+def test_curved_patch_inertia_is_exact_after_node_fix() -> None:
+    # REGRESSION (review finding): a degree-2 patch's second-moment flux
+    # needs 5p nodes, not 3p+2. Before the fix this returned a wrong
+    # rational; the true value is -21971/3675.
+    from forgekernel.bsolid import _flux_moment
+    from forgekernel.nurbs import bezier_surface
+
+    net = [[(0, 0, 0), (1, 1, 0), (0, 2, 1)],
+           [(1, 0, 0), (3, 1, 2), (1, 2, 0)],
+           [(2, 0, 1), (1, 1, 0), (4, 2, 3)]]
+    patch = bezier_surface(net)
+    z = lambda S: F(0)
+    assert _flux_moment(patch, lambda S: S[0] ** 3 / 3, z, z) == F(-21971, 3675)

@@ -85,6 +85,38 @@ def exact_area(start, segments) -> Fraction:
     return abs(total)
 
 
+def _boundary_is_simple(start, segments, samples: int = 16) -> bool:
+    """Flatten the line/Bézier boundary to a polyline and test for a proper
+    self-intersection of non-adjacent edges (a simple-loop guard)."""
+    ring = []
+    for bez in segments_to_beziers(start, segments):
+        steps = 1 if len(bez) == 2 else samples
+        for k in range(steps):
+            t = F(k, steps)
+            ring.append(_bezier2(bez, t))
+    n = len(ring)
+    if n < 3:
+        return False
+
+    def seg_cross(a, b, c, d):
+        def orient(p, q, r):
+            return ((q[0] - p[0]) * (r[1] - p[1])
+                    - (q[1] - p[1]) * (r[0] - p[0]))
+        o1, o2 = orient(a, b, c), orient(a, b, d)
+        o3, o4 = orient(c, d, a), orient(c, d, b)
+        return (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0)
+
+    for i in range(n):
+        a, b = ring[i], ring[(i + 1) % n]
+        for j in range(i + 1, n):
+            if j == i or (j + 1) % n == i or j == (i + 1) % n:
+                continue                       # skip shared-vertex neighbours
+            c, d = ring[j], ring[(j + 1) % n]
+            if seg_cross(a, b, c, d):
+                return False
+    return True
+
+
 class SplinePrism:
     """Extrusion of a closed line/Bézier profile — exact rational volume
     A·h (Green's-theorem area). Curved boundary; planar top/bottom caps."""
@@ -96,9 +128,16 @@ class SplinePrism:
         self.segments = segments
         self.h = F(height)
         self.z0 = F(base_z)
+        if self.h == 0:
+            raise ValueError("spline prism has zero height")
+        # a self-intersecting boundary makes the signed Green's area
+        # meaningless (opposite lobes cancel) — catch it explicitly rather
+        # than mis-diagnosing it as "zero area".
+        if not _boundary_is_simple(start, segments):
+            raise ValueError("profile boundary self-intersects (not a simple loop)")
         self._area = exact_area(start, segments)
-        if self._area == 0 or self.h == 0:
-            raise ValueError("spline prism has zero area or height")
+        if self._area == 0:
+            raise ValueError("spline prism has zero enclosed area")
 
     def volume(self) -> Fraction:
         return self._area * abs(self.h)

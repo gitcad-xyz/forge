@@ -148,8 +148,12 @@ def _flux_moment(surface: BSplineSurface, fx, fy, fz):
     (u0, u1), (v0, v1) = surface.domain()
     u0, u1, v0, v1 = F(u0), F(u1), F(v0), F(v1)
     du, dv = u1 - u0, v1 - v0
-    # integrand degree rises by up to +2 for second moments → 3p+2 nodes
-    un, vn = _nodes(3 * p + 2), _nodes(3 * q + 2)
+    # A moment ∮ f(S)·n with f of coordinate-degree m has integrand degree
+    # m·p + (2p−1) = (m+2)p−1 in u. The heaviest moment used here is the
+    # SECOND moment (m=3 → 5p−1), so 5p nodes are needed — NOT 3p+2, which
+    # only coincides at p=1 (the trap that let degree-1 box tests pass while
+    # degree≥2 patches returned a wrong, non-exact inertia tensor).
+    un, vn = _nodes(5 * p), _nodes(5 * q)
     uw, vw = _lagrange_weights(un), _lagrange_weights(vn)
     total = F(0)
     for i, uu in enumerate(un):
