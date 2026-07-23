@@ -106,3 +106,72 @@ def test_prismatoid_identical() -> None:
                             [_rr(c) for xy in top for c in xy], "25/1", "prismatoid")
     assert rp.volume6_str() == _vol6(ref)
     assert rp.canonical() == _canon(ref)
+
+
+# -- K3 port: NURBS eval + SSI detection are ref-identical --------------------
+
+def test_rust_nurbs_curve_eval_identical() -> None:
+    from fractions import Fraction
+    rs = pytest.importorskip("forgekernel_rs")
+    from forgekernel.nurbs import bezier
+
+    def rstr(x):
+        f = Fraction(x)
+        return f"{f.numerator}/{f.denominator}"
+
+    c = bezier([(0, 0, 0), (1, 3, 0), (3, 3, 1), (4, 0, 0)])
+    for t in (Fraction(1, 2), Fraction(3, 10), Fraction(7, 9)):
+        py = c.eval(t)
+        ru = rs.nurbs_curve_eval(3, [[rstr(v) for v in p] for p in c.cp],
+                                 [rstr(k) for k in c.U], rstr(t))
+        assert all(Fraction(ru[i]) == py[i] for i in range(3))
+
+
+def test_rust_nurbs_surface_eval_identical() -> None:
+    from fractions import Fraction
+    rs = pytest.importorskip("forgekernel_rs")
+    from forgekernel.nurbs import BSplineSurface
+
+    def rstr(x):
+        f = Fraction(x)
+        return f"{f.numerator}/{f.denominator}"
+
+    net = [[(x, y, Fraction(x * y, 3)) for y in range(3)] for x in range(4)]
+    s = BSplineSurface(2, 2, net, [0, 0, 0, 1, 2, 2, 2], [0, 0, 0, 1, 1, 1])
+    for (u, v) in ((Fraction(3, 4), Fraction(1, 3)), (Fraction(3, 2), Fraction(4, 5))):
+        py = s.eval(u, v)
+        ru = rs.nurbs_surface_eval(
+            2, 2, [[[rstr(c) for c in p] for p in row] for row in net],
+            [rstr(k) for k in s.U], [rstr(k) for k in s.V], rstr(u), rstr(v))
+        assert all(Fraction(ru[i]) == py[i] for i in range(3))
+
+
+def test_rust_ssi_pairs_identical_to_python() -> None:
+    from fractions import Fraction
+    rs = pytest.importorskip("forgekernel_rs")
+    from forgekernel.ssi import BezierPatch, ssi_branches
+
+    def rstr(x):
+        f = Fraction(x)
+        return f"{f.numerator}/{f.denominator}"
+
+    def to_s(net):
+        return [[[rstr(v) for v in p] for p in row] for row in net]
+
+    plane = [[(0, 0, 0), (0, 1, 0)], [(1, 0, 0), (1, 1, 0)]]
+
+    def quad(b0, b1, b2):
+        return [[(0, 0, b0), (0, 1, b0)],
+                [(Fraction(1, 2), 0, b1), (Fraction(1, 2), 1, b1)],
+                [(1, 0, b2), (1, 1, b2)]]
+
+    for net2 in (quad(Fraction(3, 16), Fraction(-5, 16), Fraction(3, 16)),
+                 quad(1, 1, 2),
+                 quad(Fraction(1, 4), Fraction(-1, 4), Fraction(1, 4))):
+        _, py_pairs = ssi_branches(BezierPatch(plane), BezierPatch(net2), depth=4)
+        rs_pairs = rs.ssi_pairs(to_s(plane), to_s(net2), 4)
+        pk = sorted(tuple(map(str, (a.u0, a.u1, a.v0, a.v1,
+                                    b.u0, b.u1, b.v0, b.v1)))
+                    for a, b in py_pairs)
+        rk = sorted(tuple(str(Fraction(x)) for x in row) for row in rs_pairs)
+        assert pk == rk                       # bit-identical surviving pairs

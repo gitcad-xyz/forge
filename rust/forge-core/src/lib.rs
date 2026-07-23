@@ -1213,6 +1213,275 @@ fn box_form(dx: &str, dy: &str, dz: &str) -> (String, String) {
     (r_str(&s.volume6()), s.canonical())
 }
 
+// -- K3 Rust port: de Boor NURBS eval + SSI subdivision detection -------------
+// Ported from forgekernel/nurbs.py and ssi.py AFTER the Python semantics
+// were oracle-settled; Python ref stays the executable specification.
+
+fn deboor_h(p: usize, u_knots: &[R], pts: &[Vec<R>], u: &R) -> Vec<R> {
+    let n = pts.len() - 1;
+    let dim = pts[0].len();
+    let k = if *u >= u_knots[n + 1] {
+        n
+    } else if *u <= u_knots[p] {
+        p
+    } else {
+        let (mut lo, mut hi) = (p, n + 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if *u < u_knots[mid] {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo
+    };
+    let mut d: Vec<Vec<R>> = (0..=p).map(|j| pts[k - p + j].clone()).collect();
+    for r in 1..=p {
+        for j in (r..=p).rev() {
+            let i = k - p + j;
+            let denom = &u_knots[i + p - r + 1] - &u_knots[i];
+            let a = if denom.is_zero() {
+                R::zero()
+            } else {
+                (u - &u_knots[i]) / denom
+            };
+            let b = R::one() - &a;
+            d[j] = (0..dim)
+                .map(|c| &b * &d[j - 1][c] + &a * &d[j][c])
+                .collect();
+        }
+    }
+    d[p].clone()
+}
+
+#[pyfunction]
+#[pyo3(signature = (degree, cps, knots, t, weights=None))]
+fn nurbs_curve_eval(
+    degree: usize, cps: Vec<Vec<String>>, knots: Vec<String>, t: &str,
+    weights: Option<Vec<String>>,
+) -> Vec<String> {
+    let u_knots: Vec<R> = knots.iter().map(|s| parse_r(s)).collect();
+    let w: Vec<R> = match &weights {
+        Some(ws) => ws.iter().map(|s| parse_r(s)).collect(),
+        None => vec![R::one(); cps.len()],
+    };
+    let pts: Vec<Vec<R>> = cps
+        .iter()
+        .zip(w.iter())
+        .map(|(pt, wi)| {
+            let mut h: Vec<R> = pt.iter().map(|c| wi * &parse_r(c)).collect();
+            h.push(wi.clone());
+            h
+        })
+        .collect();
+    let h = deboor_h(degree, &u_knots, &pts, &parse_r(t));
+    (0..3).map(|c| r_str(&(&h[c] / &h[3]))).collect()
+}
+
+#[pyfunction]
+#[pyo3(signature = (pu, pv, net, ku, kv, u, v, weights=None))]
+fn nurbs_surface_eval(
+    pu: usize, pv: usize, net: Vec<Vec<Vec<String>>>, ku: Vec<String>,
+    kv: Vec<String>, u: &str, v: &str, weights: Option<Vec<Vec<String>>>,
+) -> Vec<String> {
+    let uk: Vec<R> = ku.iter().map(|s| parse_r(s)).collect();
+    let vk: Vec<R> = kv.iter().map(|s| parse_r(s)).collect();
+    let vr = parse_r(v);
+    // homogeneous rows, de Boor down v per row then across u
+    let col: Vec<Vec<R>> = net
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let hrow: Vec<Vec<R>> = row
+                .iter()
+                .enumerate()
+                .map(|(j, pt)| {
+                    let wi = match &weights {
+                        Some(w) => parse_r(&w[i][j]),
+                        None => R::one(),
+                    };
+                    let mut h: Vec<R> =
+                        pt.iter().map(|c| &wi * &parse_r(c)).collect();
+                    h.push(wi);
+                    h
+                })
+                .collect();
+            deboor_h(pv, &vk, &hrow, &vr)
+        })
+        .collect();
+    let h = deboor_h(pu, &uk, &col, &parse_r(u));
+    (0..3).map(|c| r_str(&(&h[c] / &h[3]))).collect()
+}
+
+// -- SSI subdivision detection (the hot loop) ---------------------------------
+
+#[derive(Clone)]
+struct RPatch {
+    net: Vec<Vec<Vec<R>>>, // (p+1)x(q+1) of dim-3 or dim-4 points
+    u0: R,
+    u1: R,
+    v0: R,
+    v1: R,
+}
+
+impl RPatch {
+    fn dim(&self) -> usize {
+        self.net[0][0].len()
+    }
+    fn bbox(&self) -> ([R; 3], [R; 3]) {
+        let d = self.dim();
+        let mut lo: Option<[R; 3]> = None;
+        let mut hi: Option<[R; 3]> = None;
+        for row in &self.net {
+            for pt in row {
+                let cart: [R; 3] = if d == 3 {
+                    [pt[0].clone(), pt[1].clone(), pt[2].clone()]
+                } else {
+                    [&pt[0] / &pt[3], &pt[1] / &pt[3], &pt[2] / &pt[3]]
+                };
+                match (&mut lo, &mut hi) {
+                    (Some(l), Some(h)) => {
+                        for c in 0..3 {
+                            if cart[c] < l[c] {
+                                l[c] = cart[c].clone();
+                            }
+                            if cart[c] > h[c] {
+                                h[c] = cart[c].clone();
+                            }
+                        }
+                    }
+                    _ => {
+                        lo = Some(cart.clone());
+                        hi = Some(cart);
+                    }
+                }
+            }
+        }
+        (lo.unwrap(), hi.unwrap())
+    }
+    fn split_rows(rows: &[Vec<Vec<R>>], dim: usize) -> (Vec<Vec<Vec<R>>>, Vec<Vec<Vec<R>>>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let half = R::new(BigInt::one(), BigInt::from(2));
+        for row in rows {
+            let mut pts: Vec<Vec<R>> = row.clone();
+            let n = pts.len();
+            let mut lo = vec![pts[0].clone()];
+            let mut hi = vec![pts[n - 1].clone()];
+            for r in 1..n {
+                for i in 0..n - r {
+                    pts[i] = (0..dim)
+                        .map(|c| (&pts[i][c] + &pts[i + 1][c]) * &half)
+                        .collect();
+                }
+                lo.push(pts[0].clone());
+                hi.push(pts[n - r - 1].clone());
+            }
+            hi.reverse();
+            left.push(lo);
+            right.push(hi);
+        }
+        (left, right)
+    }
+    fn split4(&self) -> Vec<RPatch> {
+        let dim = self.dim();
+        let half = R::new(BigInt::one(), BigInt::from(2));
+        // split in u: transpose so rows run along u
+        let nu = self.net.len();
+        let nv = self.net[0].len();
+        let cols: Vec<Vec<Vec<R>>> = (0..nv)
+            .map(|j| (0..nu).map(|i| self.net[i][j].clone()).collect())
+            .collect();
+        let (l, r) = Self::split_rows(&cols, dim);
+        let um = (&self.u0 + &self.u1) * &half;
+        let untrans = |m: &Vec<Vec<Vec<R>>>| -> Vec<Vec<Vec<R>>> {
+            let a = m[0].len();
+            (0..a)
+                .map(|i| (0..m.len()).map(|j| m[j][i].clone()).collect())
+                .collect()
+        };
+        let mk = |net: Vec<Vec<Vec<R>>>, u0: R, u1: R, v0: R, v1: R| RPatch {
+            net, u0, u1, v0, v1,
+        };
+        let a = mk(untrans(&l), self.u0.clone(), um.clone(), self.v0.clone(), self.v1.clone());
+        let b = mk(untrans(&r), um, self.u1.clone(), self.v0.clone(), self.v1.clone());
+        let mut out = Vec::with_capacity(4);
+        for p in [a, b] {
+            let (pl, pr) = Self::split_rows(&p.net, dim);
+            let vm = (&p.v0 + &p.v1) * &half;
+            out.push(mk(pl, p.u0.clone(), p.u1.clone(), p.v0.clone(), vm.clone()));
+            out.push(mk(pr, p.u0.clone(), p.u1.clone(), vm, p.v1.clone()));
+        }
+        out
+    }
+}
+
+fn boxes_overlap_r(a: &([R; 3], [R; 3]), b: &([R; 3], [R; 3])) -> bool {
+    (0..3).all(|c| a.0[c] <= b.1[c] && b.0[c] <= a.1[c])
+}
+
+fn parse_net(net: &[Vec<Vec<String>>]) -> Vec<Vec<Vec<R>>> {
+    net.iter()
+        .map(|row| row.iter().map(|pt| pt.iter().map(|c| parse_r(c)).collect()).collect())
+        .collect()
+}
+
+/// Subdivision detection: returns surviving leaf-pair parameter boxes
+/// (au0,au1,av0,av1,bu0,bu1,bv0,bv1) as exact rational strings. Empty
+/// result = certified non-intersection. Clustering/refinement stay in
+/// Python (they are not the hot loop).
+#[pyfunction]
+#[pyo3(signature = (net_a, net_b, depth, a_box=None, b_box=None))]
+fn ssi_pairs(
+    net_a: Vec<Vec<Vec<String>>>, net_b: Vec<Vec<Vec<String>>>, depth: usize,
+    a_box: Option<Vec<String>>, b_box: Option<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let parse_box = |b: &Option<Vec<String>>| -> (R, R, R, R) {
+        match b {
+            Some(v) => (parse_r(&v[0]), parse_r(&v[1]), parse_r(&v[2]), parse_r(&v[3])),
+            None => (R::zero(), R::one(), R::zero(), R::one()),
+        }
+    };
+    let (au0, au1, av0, av1) = parse_box(&a_box);
+    let (bu0, bu1, bv0, bv1) = parse_box(&b_box);
+    let a = RPatch { net: parse_net(&net_a), u0: au0, u1: au1, v0: av0, v1: av1 };
+    let b = RPatch { net: parse_net(&net_b), u0: bu0, u1: bu1, v0: bv0, v1: bv1 };
+    let mut pairs = vec![(a, b)];
+    for _ in 0..depth {
+        let mut nxt = Vec::new();
+        for (pa, pb) in &pairs {
+            if !boxes_overlap_r(&pa.bbox(), &pb.bbox()) {
+                continue;
+            }
+            let subs_a = pa.split4();
+            let subs_b = pb.split4();
+            let boxes_b: Vec<_> = subs_b.iter().map(|s| s.bbox()).collect();
+            for sa in subs_a {
+                let ba = sa.bbox();
+                for (sb, bb) in subs_b.iter().zip(boxes_b.iter()) {
+                    if boxes_overlap_r(&ba, bb) {
+                        nxt.push((sa.clone(), sb.clone()));
+                    }
+                }
+            }
+        }
+        pairs = nxt;
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+    }
+    pairs
+        .iter()
+        .map(|(pa, pb)| {
+            vec![
+                r_str(&pa.u0), r_str(&pa.u1), r_str(&pa.v0), r_str(&pa.v1),
+                r_str(&pb.u0), r_str(&pb.u1), r_str(&pb.v0), r_str(&pb.v1),
+            ]
+        })
+        .collect()
+}
+
 #[pymodule]
 fn forgekernel_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySolid>()?;
@@ -1221,5 +1490,8 @@ fn forgekernel_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_prismatoid, m)?)?;
     m.add_function(wrap_pyfunction!(box_boolean, m)?)?;
     m.add_function(wrap_pyfunction!(box_form, m)?)?;
+    m.add_function(wrap_pyfunction!(nurbs_curve_eval, m)?)?;
+    m.add_function(wrap_pyfunction!(nurbs_surface_eval, m)?)?;
+    m.add_function(wrap_pyfunction!(ssi_pairs, m)?)?;
     Ok(())
 }
