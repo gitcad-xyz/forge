@@ -1,16 +1,19 @@
-//! forge-core — the Rust port of the K1 exact planar kernel.
+//! forge-core — Rust port of the exact planar kernel (K1), pyo3-exposed.
 //!
 //! Structure-for-structure with `src/forgekernel/{exact,brep,csg}.py`.
-//! Every number is a BigRational; topological decisions use exact signs.
-//! ref (the Python reference) is this port's oracle: the Python test
-//! suite builds each case in BOTH and compares exact volume + a canonical
-//! face-set. This crate never invents behaviour — it only makes ref fast.
+//! Every number is a BigRational; topological decisions use exact signs,
+//! never epsilons. ref (the Python reference) is this port's oracle: the
+//! Python suite builds each case in BOTH and compares exact volume + a
+//! canonical face-set. `PySolid` is an opaque handle the Python seam
+//! adapter holds and operates on, exactly like it holds ref solids.
 
 use num_bigint::BigInt;
+use num_integer::Integer;
 use num_rational::BigRational;
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 type R = BigRational;
 type V = [R; 3];
@@ -18,12 +21,17 @@ type V = [R; 3];
 fn ri(n: i64) -> R {
     BigRational::from_integer(BigInt::from(n))
 }
-
+fn half() -> R {
+    BigRational::new(BigInt::from(1), BigInt::from(2))
+}
 fn add(a: &V, b: &V) -> V {
     [&a[0] + &b[0], &a[1] + &b[1], &a[2] + &b[2]]
 }
 fn sub(a: &V, b: &V) -> V {
     [&a[0] - &b[0], &a[1] - &b[1], &a[2] - &b[2]]
+}
+fn neg(a: &V) -> V {
+    [-&a[0], -&a[1], -&a[2]]
 }
 fn smul(s: &R, a: &V) -> V {
     [s * &a[0], s * &a[1], s * &a[2]]
@@ -40,6 +48,12 @@ fn cross(a: &V, b: &V) -> V {
 }
 fn is_zero(a: &V) -> bool {
     a[0].is_zero() && a[1].is_zero() && a[2].is_zero()
+}
+fn norm1(a: &V) -> R {
+    a[0].abs() + a[1].abs() + a[2].abs()
+}
+fn isqrt(n: &BigInt) -> BigInt {
+    n.sqrt()
 }
 
 #[derive(Clone)]
@@ -63,10 +77,60 @@ impl Plane {
         }
     }
     fn flipped(&self) -> Plane {
-        Plane {
-            n: [-&self.n[0], -&self.n[1], -&self.n[2]],
-            d: -&self.d,
+        Plane { n: neg(&self.n), d: -&self.d }
+    }
+    /// Integer coprime canonical (nx,ny,nz,d) with a sign convention.
+    fn canonical(&self) -> [BigInt; 4] {
+        let nums = [&self.n[0], &self.n[1], &self.n[2], &self.d];
+        let mut den = BigInt::one();
+        for v in nums.iter() {
+            den = den.lcm(v.denom());
         }
+        let mut ints: Vec<BigInt> = nums.iter().map(|v| v.numer() * (&den / v.denom())).collect();
+        let mut g = BigInt::zero();
+        for v in ints.iter() {
+            g = g.gcd(v);
+        }
+        if !g.is_zero() {
+            for v in ints.iter_mut() {
+                *v /= &g;
+            }
+        }
+        for v in ints.iter() {
+            if !v.is_zero() {
+                if v.is_negative() {
+                    for w in ints.iter_mut() {
+                        *w = -&*w;
+                    }
+                }
+                break;
+            }
+        }
+        [ints[0].clone(), ints[1].clone(), ints[2].clone(), ints[3].clone()]
+    }
+    fn coplanar_key(&self) -> [BigInt; 4] {
+        let c = self.canonical();
+        let neg: [BigInt; 4] = [-&c[0], -&c[1], -&c[2], -&c[3]];
+        if c <= neg {
+            c
+        } else {
+            neg
+        }
+    }
+    /// Exact rational unit normal when |n|^2 is a perfect square.
+    fn unit_normal(&self) -> Option<V> {
+        let c = self.canonical();
+        let nn = &c[0] * &c[0] + &c[1] * &c[1] + &c[2] * &c[2];
+        let root = isqrt(&nn);
+        if &root * &root != nn {
+            return None;
+        }
+        let rr = BigRational::from_integer(root);
+        Some([
+            BigRational::from_integer(c[0].clone()) / &rr,
+            BigRational::from_integer(c[1].clone()) / &rr,
+            BigRational::from_integer(c[2].clone()) / &rr,
+        ])
     }
 }
 
@@ -126,29 +190,145 @@ impl Solid {
             ([1, 2, 6, 5], "right"),
             ([3, 0, 4, 7], "left"),
         ];
-        let polys = faces
-            .iter()
-            .map(|(idx, name)| {
-                Polygon::new(idx.iter().map(|&i| vs(i)).collect(), format!("{}.{}", prefix, name))
-            })
-            .collect();
+        Solid::new(
+            faces
+                .iter()
+                .map(|(idx, name)| {
+                    Polygon::new(idx.iter().map(|&i| vs(i)).collect(), format!("{}.{}", prefix, name))
+                })
+                .collect(),
+        )
+    }
+
+    fn prism(loop2d: Vec<[R; 2]>, h: R, prefix: &str) -> Solid {
+        let mut lp = loop2d;
+        if loop_area2(&lp).is_negative() {
+            lp.reverse();
+        }
+        let tris = ear_clip(&lp);
+        let mut polys = Vec::new();
+        let z0 = ri(0);
+        for (a, b, c) in &tris {
+            polys.push(Polygon::new(
+                vec![[a[0].clone(), a[1].clone(), z0.clone()],
+                     [c[0].clone(), c[1].clone(), z0.clone()],
+                     [b[0].clone(), b[1].clone(), z0.clone()]],
+                format!("{}.bottom", prefix),
+            ));
+            polys.push(Polygon::new(
+                vec![[a[0].clone(), a[1].clone(), h.clone()],
+                     [b[0].clone(), b[1].clone(), h.clone()],
+                     [c[0].clone(), c[1].clone(), h.clone()]],
+                format!("{}.top", prefix),
+            ));
+        }
+        let n = lp.len();
+        for i in 0..n {
+            let (p1, p2) = (&lp[i], &lp[(i + 1) % n]);
+            polys.push(Polygon::new(
+                vec![[p1[0].clone(), p1[1].clone(), z0.clone()],
+                     [p2[0].clone(), p2[1].clone(), z0.clone()],
+                     [p2[0].clone(), p2[1].clone(), h.clone()],
+                     [p1[0].clone(), p1[1].clone(), h.clone()]],
+                format!("{}.side{}", prefix, i),
+            ));
+        }
         Solid::new(polys)
     }
 
-    fn translated(&self, t: &V) -> Solid {
+    fn prismatoid(bottom: Vec<[R; 2]>, z0: R, top: Vec<[R; 2]>, z1: R, prefix: &str) -> Solid {
+        let mut b = bottom;
+        let mut t = top;
+        if loop_area2(&b).is_negative() {
+            b.reverse();
+            t.reverse();
+        }
+        let mut polys = Vec::new();
+        for (a, bb, c) in ear_clip(&b) {
+            polys.push(Polygon::new(
+                vec![[a[0].clone(), a[1].clone(), z0.clone()],
+                     [c[0].clone(), c[1].clone(), z0.clone()],
+                     [bb[0].clone(), bb[1].clone(), z0.clone()]],
+                format!("{}.bottom", prefix),
+            ));
+        }
+        for (a, bb, c) in ear_clip(&t) {
+            polys.push(Polygon::new(
+                vec![[a[0].clone(), a[1].clone(), z1.clone()],
+                     [bb[0].clone(), bb[1].clone(), z1.clone()],
+                     [c[0].clone(), c[1].clone(), z1.clone()]],
+                format!("{}.top", prefix),
+            ));
+        }
+        let n = b.len();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let b0 = &b[i];
+            let b1 = &b[j];
+            let t0 = &t[i];
+            let t1 = &t[j];
+            polys.push(Polygon::new(
+                vec![[b0[0].clone(), b0[1].clone(), z0.clone()],
+                     [b1[0].clone(), b1[1].clone(), z0.clone()],
+                     [t1[0].clone(), t1[1].clone(), z1.clone()]],
+                format!("{}.side{}", prefix, i),
+            ));
+            polys.push(Polygon::new(
+                vec![[b0[0].clone(), b0[1].clone(), z0.clone()],
+                     [t1[0].clone(), t1[1].clone(), z1.clone()],
+                     [t0[0].clone(), t0[1].clone(), z1.clone()]],
+                format!("{}.side{}", prefix, i),
+            ));
+        }
+        Solid::new(polys)
+    }
+
+    fn mapped(&self, f: &dyn Fn(&V) -> V) -> Solid {
         Solid {
             polys: self
                 .polys
                 .iter()
                 .map(|p| {
-                    Polygon::with_plane(
-                        p.verts.iter().map(|v| add(v, t)).collect(),
-                        p.source.clone(),
-                        Plane::from_points(&add(&p.verts[0], t), &add(&p.verts[1], t), &add(&p.verts[2], t)),
-                    )
+                    let nv: Vec<V> = p.verts.iter().map(|v| f(v)).collect();
+                    let pl = Plane::from_points(&nv[0], &nv[1], &nv[2]);
+                    Polygon::with_plane(nv, p.source.clone(), pl)
                 })
                 .collect(),
         }
+    }
+
+    fn translated(&self, t: &V) -> Solid {
+        self.mapped(&|v| add(v, t))
+    }
+    fn scaled(&self, fx: R, fy: R, fz: R) -> Solid {
+        let s = self.mapped(&|v| [&v[0] * &fx, &v[1] * &fy, &v[2] * &fz]);
+        if (&fx * &fy * &fz).is_negative() {
+            Solid { polys: s.polys.iter().map(|p| p.flipped()).collect() }
+        } else {
+            s
+        }
+    }
+    fn mirrored(&self, axis: usize) -> Solid {
+        let m = self.mapped(&|v| {
+            let mut w = v.clone();
+            w[axis] = -&w[axis];
+            w
+        });
+        Solid { polys: m.polys.iter().map(|p| p.flipped()).collect() }
+    }
+    fn rotated_quarter(&self, axis: usize, quarters: i64) -> Solid {
+        let q = ((quarters % 4) + 4) % 4;
+        let a = (axis + 1) % 3;
+        let b = (axis + 2) % 3;
+        self.mapped(&|v| {
+            let mut w = v.clone();
+            for _ in 0..q {
+                let (na, nb) = (-&w[b], w[a].clone());
+                w[a] = na;
+                w[b] = nb;
+            }
+            w
+        })
     }
 
     fn volume6(&self) -> R {
@@ -161,26 +341,481 @@ impl Solid {
         }
         acc
     }
+    fn volume(&self) -> R {
+        self.volume6() / ri(6)
+    }
+    fn bbox(&self) -> (V, V) {
+        let mut lo = self.polys[0].verts[0].clone();
+        let mut hi = lo.clone();
+        for p in &self.polys {
+            for v in &p.verts {
+                for k in 0..3 {
+                    if v[k] < lo[k] {
+                        lo[k] = v[k].clone();
+                    }
+                    if v[k] > hi[k] {
+                        hi[k] = v[k].clone();
+                    }
+                }
+            }
+        }
+        (lo, hi)
+    }
 
-    /// Canonical face-set for the oracle: each polygon as its sorted vertex
-    /// multiset ("n/d" strings), the whole set sorted. Order-independent —
-    /// proves identical geometry regardless of internal BSP fragment order.
+    /// Exact closure test (T-junction tolerant): signed interval coverage
+    /// on each Plücker-keyed carrier line must cancel. Empty == closed.
+    fn watertight_bad(&self) -> usize {
+        // key: (canon_dir, moment(cross(a,dir))) -> Vec<(lo,hi,sign)>
+        let mut lines: BTreeMap<String, Vec<(R, R, i32)>> = BTreeMap::new();
+        for p in &self.polys {
+            let n = p.verts.len();
+            for i in 0..n {
+                let a = &p.verts[i];
+                let b = &p.verts[(i + 1) % n];
+                let d = sub(b, a);
+                if let Some(cd) = canon_dir(&d) {
+                    let mom = cross(a, &cd);
+                    let key = format!(
+                        "{}/{},{}/{},{}/{}|{}/{},{}/{},{}/{}",
+                        cd[0].numer(), cd[0].denom(), cd[1].numer(), cd[1].denom(),
+                        cd[2].numer(), cd[2].denom(),
+                        mom[0].numer(), mom[0].denom(), mom[1].numer(), mom[1].denom(),
+                        mom[2].numer(), mom[2].denom()
+                    );
+                    let ta = dot(a, &cd);
+                    let tb = dot(b, &cd);
+                    let (lo, hi, sign) = if ta < tb { (ta, tb, 1) } else { (tb, ta, -1) };
+                    lines.entry(key).or_default().push((lo, hi, sign));
+                }
+            }
+        }
+        let mut bad = 0;
+        for segs in lines.values() {
+            let mut cuts: BTreeSet<R> = BTreeSet::new();
+            for (lo, hi, _) in segs {
+                cuts.insert(lo.clone());
+                cuts.insert(hi.clone());
+            }
+            let cv: Vec<R> = cuts.into_iter().collect();
+            for w in cv.windows(2) {
+                let (lo, hi) = (&w[0], &w[1]);
+                let mut cov = 0i32;
+                for (slo, shi, s) in segs {
+                    if slo <= lo && hi <= shi {
+                        cov += s;
+                    }
+                }
+                if cov != 0 {
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+        bad
+    }
+
     fn canonical(&self) -> String {
         let mut faces: BTreeSet<String> = BTreeSet::new();
         for p in &self.polys {
             let mut vs: Vec<String> = p
                 .verts
                 .iter()
-                .map(|v| format!("{}/{},{}/{},{}/{}", v[0].numer(), v[0].denom(), v[1].numer(), v[1].denom(), v[2].numer(), v[2].denom()))
+                .map(|v| {
+                    format!(
+                        "{}/{},{}/{},{}/{}",
+                        v[0].numer(), v[0].denom(), v[1].numer(), v[1].denom(),
+                        v[2].numer(), v[2].denom()
+                    )
+                })
                 .collect();
             vs.sort();
             faces.insert(vs.join("|"));
         }
         faces.into_iter().collect::<Vec<_>>().join(";")
     }
+
+    fn logical_face_count(&self) -> usize {
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for p in &self.polys {
+            let c = p.plane.canonical();
+            keys.insert(format!("{},{},{},{}", c[0], c[1], c[2], c[3]));
+        }
+        keys.len()
+    }
 }
 
-// -- BSP boolean engine (ports csg.py) ---------------------------------------
+fn loop_area2(lp: &[[R; 2]]) -> R {
+    let mut acc = ri(0);
+    let n = lp.len();
+    for i in 0..n {
+        let (a, b) = (&lp[i], &lp[(i + 1) % n]);
+        acc += &a[0] * &b[1] - &b[0] * &a[1];
+    }
+    acc
+}
+
+fn ear_clip(lp: &[[R; 2]]) -> Vec<([R; 2], [R; 2], [R; 2])> {
+    let orient = |a: &[R; 2], b: &[R; 2], c: &[R; 2]| -> R {
+        (&b[0] - &a[0]) * (&c[1] - &a[1]) - (&b[1] - &a[1]) * (&c[0] - &a[0])
+    };
+    let inside = |p: &[R; 2], a: &[R; 2], b: &[R; 2], c: &[R; 2]| -> bool {
+        orient(a, b, p).is_positive() && orient(b, c, p).is_positive() && orient(c, a, p).is_positive()
+    };
+    let mut pts: Vec<[R; 2]> = lp.to_vec();
+    let mut tris = Vec::new();
+    while pts.len() > 3 {
+        let n = pts.len();
+        let mut found = false;
+        for i in 0..n {
+            let a = &pts[(i + n - 1) % n];
+            let b = &pts[i];
+            let c = &pts[(i + 1) % n];
+            if !orient(a, b, c).is_positive() {
+                continue;
+            }
+            let mut any = false;
+            for (j, p) in pts.iter().enumerate() {
+                if j == i || j == (i + n - 1) % n || j == (i + 1) % n {
+                    continue;
+                }
+                if inside(p, a, b, c) {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                continue;
+            }
+            tris.push((a.clone(), b.clone(), c.clone()));
+            pts.remove(i);
+            found = true;
+            break;
+        }
+        if !found {
+            break;
+        }
+    }
+    if pts.len() == 3 {
+        tris.push((pts[0].clone(), pts[1].clone(), pts[2].clone()));
+    }
+    tris
+}
+
+fn canon_dir(d: &V) -> Option<V> {
+    let mut den = BigInt::one();
+    for v in d.iter() {
+        den = den.lcm(v.denom());
+    }
+    let mut ints: Vec<BigInt> = d.iter().map(|v| v.numer() * (&den / v.denom())).collect();
+    let mut g = BigInt::zero();
+    for v in ints.iter() {
+        g = g.gcd(v);
+    }
+    if g.is_zero() {
+        return None;
+    }
+    for v in ints.iter_mut() {
+        *v /= &g;
+    }
+    for v in ints.iter() {
+        if !v.is_zero() {
+            if v.is_negative() {
+                for w in ints.iter_mut() {
+                    *w = -&*w;
+                }
+            }
+            break;
+        }
+    }
+    Some([
+        BigRational::from_integer(ints[0].clone()),
+        BigRational::from_integer(ints[1].clone()),
+        BigRational::from_integer(ints[2].clone()),
+    ])
+}
+
+// -- chamfer (edge quarter + corner facets, ported from brep.py) -------------
+
+fn parallelepiped(base: &V, e1: &V, e2: &V, e3: &V, source: &str) -> Solid {
+    let v0 = base.clone();
+    let v1 = add(base, e1);
+    let v2 = add(&add(base, e1), e2);
+    let v3 = add(base, e2);
+    let vs = [
+        v0.clone(), v1.clone(), v2.clone(), v3.clone(),
+        add(&v0, e3), add(&v1, e3), add(&v2, e3), add(&v3, e3),
+    ];
+    let faces: [([usize; 4], &str); 6] = [
+        ([0, 3, 2, 1], "b"), ([4, 5, 6, 7], "t"), ([0, 1, 5, 4], "f"),
+        ([2, 3, 7, 6], "k"), ([1, 2, 6, 5], "r"), ([3, 0, 4, 7], "l"),
+    ];
+    let s = Solid::new(
+        faces.iter().map(|(idx, nm)| Polygon::new(idx.iter().map(|&i| vs[i].clone()).collect(), format!("{}.{}", source, nm))).collect(),
+    );
+    if s.volume().is_positive() {
+        s
+    } else {
+        Solid { polys: s.polys.iter().map(|p| p.flipped()).collect() }
+    }
+}
+
+fn tetra(p0: &V, p1: &V, p2: &V, p3: &V, source: &str) -> Solid {
+    let s = Solid::new(vec![
+        Polygon::new(vec![p0.clone(), p1.clone(), p2.clone()], format!("{}.a", source)),
+        Polygon::new(vec![p0.clone(), p2.clone(), p3.clone()], format!("{}.b", source)),
+        Polygon::new(vec![p0.clone(), p3.clone(), p1.clone()], format!("{}.c", source)),
+        Polygon::new(vec![p1.clone(), p3.clone(), p2.clone()], format!("{}.d", source)),
+    ]);
+    if s.volume().is_positive() {
+        s
+    } else {
+        Solid { polys: s.polys.iter().map(|p| p.flipped()).collect() }
+    }
+}
+
+fn solve3(rows: &[V; 3], rhs: &[R; 3]) -> Option<V> {
+    let det = dot(&rows[0], &cross(&rows[1], &rows[2]));
+    if det.is_zero() {
+        return None;
+    }
+    let col = |i: usize| -> V { [rows[0][i].clone(), rows[1][i].clone(), rows[2][i].clone()] };
+    let r = [rhs[0].clone(), rhs[1].clone(), rhs[2].clone()];
+    let ax = dot(&r, &cross(&col(1), &col(2))) / &det;
+    let ay = dot(&col(0), &cross(&r, &col(2))) / &det;
+    let az = dot(&col(0), &cross(&col(1), &r)) / &det;
+    Some([ax, ay, az])
+}
+
+struct Edge {
+    point: V,
+    dir: V,
+    tmin: R,
+    tmax: R,
+    plane_a: Plane,
+    plane_b: Plane,
+}
+
+fn logical_edges(s: &Solid) -> Vec<Edge> {
+    // group boundary segments by carrier line; an edge = 2 distinct planes meet
+    let mut lines: BTreeMap<String, (Vec<[BigInt; 4]>, Vec<Plane>, R, R, V, V)> = BTreeMap::new();
+    for p in &s.polys {
+        let n = p.verts.len();
+        for i in 0..n {
+            let a = &p.verts[i];
+            let b = &p.verts[(i + 1) % n];
+            if let Some(cd) = canon_dir(&sub(b, a)) {
+                let mom = cross(a, &cd);
+                let key = format!(
+                    "{}/{},{}/{},{}/{}|{}/{},{}/{},{}/{}",
+                    cd[0].numer(), cd[0].denom(), cd[1].numer(), cd[1].denom(), cd[2].numer(), cd[2].denom(),
+                    mom[0].numer(), mom[0].denom(), mom[1].numer(), mom[1].denom(), mom[2].numer(), mom[2].denom()
+                );
+                let ta = dot(a, &cd);
+                let tb = dot(b, &cd);
+                let (lo, hi) = if ta < tb { (ta.clone(), tb.clone()) } else { (tb.clone(), ta.clone()) };
+                let e = lines.entry(key).or_insert_with(|| {
+                    (Vec::new(), Vec::new(), lo.clone(), hi.clone(), a.clone(), cd.clone())
+                });
+                let pk = p.plane.canonical();
+                if !e.0.contains(&pk) {
+                    e.0.push(pk);
+                    e.1.push(p.plane.clone());
+                }
+                if lo < e.2 {
+                    e.2 = lo;
+                }
+                if hi > e.3 {
+                    e.3 = hi;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (_, (_, planes, tmin, tmax, point, dir)) in lines {
+        if planes.len() == 2 {
+            out.push(Edge {
+                point,
+                dir,
+                tmin,
+                tmax,
+                plane_a: planes[0].clone(),
+                plane_b: planes[1].clone(),
+            });
+        }
+    }
+    out
+}
+
+fn unit_dir(cd: &V) -> Option<V> {
+    let nn = &cd[0] * &cd[0] + &cd[1] * &cd[1] + &cd[2] * &cd[2];
+    let num = nn.numer().clone();
+    let den = nn.denom().clone();
+    let rn = isqrt(&num);
+    let rd = isqrt(&den);
+    if &rn * &rn != num || &rd * &rd != den {
+        return None;
+    }
+    let root = BigRational::new(rn, rd);
+    Some([&cd[0] / &root, &cd[1] / &root, &cd[2] / &root])
+}
+
+fn chamfer(s: &Solid, dist: R) -> Result<Solid, String> {
+    let edges = logical_edges(s);
+    let (lo, hi) = s.bbox();
+    let extent = (&hi[0] - &lo[0]) + (&hi[1] - &lo[1]) + (&hi[2] - &lo[2]) + ri(1);
+    // edge planar cuts
+    let mut out = s.clone();
+    for e in &edges {
+        let pa = &e.plane_a;
+        let pb = &e.plane_b;
+        let na = pa.unit_normal();
+        let nb = pb.unit_normal();
+        if na.is_none() || nb.is_none() {
+            return Err("chamfer: non-rational face normal (K2)".into());
+        }
+        let u = &e.dir;
+        let p0 = &e.point;
+        let mut ca = cross(u, na.as_ref().unwrap());
+        if pb.side(&add(p0, &ca)) > 0 {
+            ca = neg(&ca);
+        }
+        let mut cb = cross(u, nb.as_ref().unwrap());
+        if pa.side(&add(p0, &cb)) > 0 {
+            cb = neg(&cb);
+        }
+        if pb.side(&add(p0, &ca)) >= 0 || pa.side(&add(p0, &cb)) >= 0 {
+            continue; // reflex
+        }
+        let qa = add(p0, &smul(&dist, &ca));
+        let qb = add(p0, &smul(&dist, &cb));
+        let span = sub(&qb, &qa);
+        if is_zero(&span) {
+            continue;
+        }
+        let mid = smul(&half(), &add(&qa, &qb));
+        let toward = sub(p0, &mid);
+        let e1 = smul(&(&extent / norm1(u)), u);
+        let e2 = smul(&(&extent / norm1(&span)), &span);
+        let e3 = smul(&ri(2), &toward);
+        let base = sub(&sub(&mid, &smul(&half(), &e1)), &smul(&half(), &e2));
+        let tool = parallelepiped(&base, &e1, &e2, &e3, "chamfer");
+        out = boolean_impl("cut", &out, &tool);
+    }
+    // corner facets (industrial semantics)
+    let mut at_vertex: BTreeMap<String, Vec<(V, Plane, Plane)>> = BTreeMap::new();
+    for e in &edges {
+        let nn = dot(&e.dir, &e.dir);
+        let t0 = dot(&e.point, &e.dir);
+        for (t_end, sign) in [(&e.tmin, 1i64), (&e.tmax, -1i64)] {
+            let v = add(&e.point, &smul(&((t_end - &t0) / &nn), &e.dir));
+            let key = format!(
+                "{}/{},{}/{},{}/{}",
+                v[0].numer(), v[0].denom(), v[1].numer(), v[1].denom(), v[2].numer(), v[2].denom()
+            );
+            at_vertex
+                .entry(key)
+                .or_default()
+                .push((smul(&ri(sign), &e.dir), e.plane_a.clone(), e.plane_b.clone()));
+        }
+    }
+    for (_, incident) in at_vertex {
+        if incident.len() != 3 {
+            continue;
+        }
+        let v = {
+            let cd = &incident[0].0;
+            let nn = dot(cd, cd);
+            // recover vertex from any edge: point + ((t_end - t0)/nn) already
+            // baked; but we stored dir*sign, not v. Recompute from key instead:
+            // easier: reconstruct as intersection later. We approximate v via
+            // the first incident edge endpoint captured through solve below.
+            let _ = nn;
+            // fall through: v is needed; recompute from the three chamfer planes.
+            None::<V>
+        };
+        let _ = v;
+        let units: Vec<Option<V>> = incident.iter().map(|(cd, _, _)| unit_dir(cd)).collect();
+        if units.iter().any(|u| u.is_none()) {
+            continue;
+        }
+        let u: Vec<V> = units.into_iter().map(|x| x.unwrap()).collect();
+        // recover the corner vertex: intersection of the three ORIGINAL face
+        // planes incident here (plane_a of each edge shares the corner)
+        // Use the three chamfer planes' apex approach from brep.py.
+        let m: Vec<V> = (0..3).map(|k| add(&u[(k + 1) % 3], &u[(k + 2) % 3])).collect();
+        // we need v; reconstruct from edge endpoints: the vertex is where the
+        // three edges meet — take it from the stored incident via the dir and
+        // the original edge. Simpler: solve original face planes.
+        // Gather the 3 distinct original planes around this corner:
+        let mut planes: Vec<Plane> = Vec::new();
+        for (_, pa, pb) in &incident {
+            for pl in [pa, pb] {
+                if !planes.iter().any(|q| q.coplanar_key() == pl.coplanar_key()) {
+                    planes.push(pl.clone());
+                }
+            }
+        }
+        if planes.len() != 3 {
+            continue;
+        }
+        let vrows = [planes[0].n.clone(), planes[1].n.clone(), planes[2].n.clone()];
+        let vrhs = [planes[0].d.clone(), planes[1].d.clone(), planes[2].d.clone()];
+        let vtx = match solve3(&vrows, &vrhs) {
+            Some(x) => x,
+            None => continue,
+        };
+        let rhs: Vec<R> = (0..3).map(|k| dot(&m[k], &add(&vtx, &smul(&dist, &u[(k + 1) % 3])))).collect();
+        let mrows = [m[0].clone(), m[1].clone(), m[2].clone()];
+        let mrhs = [rhs[0].clone(), rhs[1].clone(), rhs[2].clone()];
+        let apex = match solve3(&mrows, &mrhs) {
+            Some(x) => x,
+            None => continue,
+        };
+        // facet corner points: (chamfer_i, chamfer_j, face_k) solves
+        let mut pts: Vec<V> = Vec::new();
+        let mut ok = true;
+        for k in 0..3 {
+            let i = (k + 1) % 3;
+            let j = (k + 2) % 3;
+            let keys_i: Vec<[BigInt; 4]> = vec![incident[i].1.coplanar_key(), incident[i].2.coplanar_key()];
+            let shared = if keys_i.contains(&incident[j].1.coplanar_key()) {
+                Some(incident[j].1.clone())
+            } else if keys_i.contains(&incident[j].2.coplanar_key()) {
+                Some(incident[j].2.clone())
+            } else {
+                None
+            };
+            match shared {
+                Some(sh) => {
+                    let prows = [m[i].clone(), m[j].clone(), sh.n.clone()];
+                    let prhs = [rhs[i].clone(), rhs[j].clone(), sh.d.clone()];
+                    match solve3(&prows, &prhs) {
+                        Some(pt) => pts.push(pt),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let tool = tetra(&pts[0], &pts[1], &pts[2], &apex, "corner");
+        if tool.volume().is_zero() {
+            continue;
+        }
+        out = boolean_impl("cut", &out, &tool);
+    }
+    Ok(out)
+}
+
+// -- BSP boolean engine ------------------------------------------------------
 
 #[derive(Default)]
 struct Split {
@@ -189,13 +824,8 @@ struct Split {
     front: Vec<Polygon>,
     back: Vec<Polygon>,
 }
-
-/// Classify one polygon against a plane into coplanar-front/back and
-/// strict front/back (owned vectors — the caller routes them, avoiding
-/// the aliasing Python's in-place version relied on).
 fn split(plane: &Plane, poly: &Polygon) -> Split {
     let mut r = Split::default();
-    let (cof, cob, front, back) = (&mut r.cof, &mut r.cob, &mut r.front, &mut r.back);
     let sides: Vec<i32> = poly.verts.iter().map(|v| plane.side(v)).collect();
     let mut kind = 0;
     for &s in &sides {
@@ -204,13 +834,13 @@ fn split(plane: &Plane, poly: &Polygon) -> Split {
     match kind {
         0 => {
             if dot(&plane.n, &poly.plane.n).is_positive() {
-                cof.push(poly.clone());
+                r.cof.push(poly.clone());
             } else {
-                cob.push(poly.clone());
+                r.cob.push(poly.clone());
             }
         }
-        1 => front.push(poly.clone()),
-        2 => back.push(poly.clone()),
+        1 => r.front.push(poly.clone()),
+        2 => r.back.push(poly.clone()),
         _ => {
             let mut f: Vec<V> = Vec::new();
             let mut b: Vec<V> = Vec::new();
@@ -235,13 +865,13 @@ fn split(plane: &Plane, poly: &Polygon) -> Split {
             if f.len() >= 3 {
                 let p = Polygon::with_plane(f, poly.source.clone(), poly.plane.clone());
                 if !p.area2().is_zero() {
-                    front.push(p);
+                    r.front.push(p);
                 }
             }
             if b.len() >= 3 {
                 let p = Polygon::with_plane(b, poly.source.clone(), poly.plane.clone());
                 if !p.area2().is_zero() {
-                    back.push(p);
+                    r.back.push(p);
                 }
             }
         }
@@ -271,14 +901,12 @@ impl Node {
         let mut back = Vec::new();
         for p in &polys {
             let mut s = split(&plane, p);
-            self.polys.append(&mut s.cof); // both coplanar sides stay here
+            self.polys.append(&mut s.cof);
             self.polys.append(&mut s.cob);
             front.append(&mut s.front);
             back.append(&mut s.back);
         }
         if !front.is_empty() {
-            // reuse the existing child (build may be called again, as in
-            // na.build(nb.all_polygons())) — never overwrite it
             if self.front.is_none() {
                 self.front = Some(Box::new(Node::new()));
             }
@@ -315,8 +943,8 @@ impl Node {
         let mut back = Vec::new();
         for p in &polys {
             let mut s = split(&plane, p);
-            front.append(&mut s.cof); // coplanar-front routes to front
-            back.append(&mut s.cob); // coplanar-back routes to back
+            front.append(&mut s.cof);
+            back.append(&mut s.cob);
             front.append(&mut s.front);
             back.append(&mut s.back);
         }
@@ -352,14 +980,12 @@ impl Node {
         out
     }
 }
-
 fn node_of(s: &Solid) -> Node {
     let mut n = Node::new();
     n.build(s.polys.clone());
     n
 }
-
-fn boolean(op: &str, a: &Solid, b: &Solid) -> Solid {
+fn boolean_impl(op: &str, a: &Solid, b: &Solid) -> Solid {
     let mut na = node_of(a);
     let mut nb = node_of(b);
     match op {
@@ -397,33 +1023,114 @@ fn boolean(op: &str, a: &Solid, b: &Solid) -> Solid {
     }
 }
 
-// -- pyo3 facade: parse dims as "num/den" strings, return exact results ------
+// -- pyo3 facade: PySolid opaque handle --------------------------------------
 
 fn parse_r(s: &str) -> R {
     let parts: Vec<&str> = s.split('/').collect();
-    BigRational::new(parts[0].parse().unwrap(), parts[1].parse().unwrap())
+    if parts.len() == 2 {
+        BigRational::new(parts[0].parse().unwrap(), parts[1].parse().unwrap())
+    } else {
+        BigRational::from_integer(parts[0].parse().unwrap())
+    }
 }
 fn r_str(r: &R) -> String {
     format!("{}/{}", r.numer(), r.denom())
 }
 
-/// Build a box, translate the second by (tx,ty,tz), apply the boolean op,
-/// and return (signed_volume6_str, canonical_faces). All inputs "num/den".
+#[pyclass]
+struct PySolid {
+    inner: Solid,
+}
+
+#[pymethods]
+impl PySolid {
+    fn translate(&self, x: &str, y: &str, z: &str) -> PySolid {
+        PySolid { inner: self.inner.translated(&[parse_r(x), parse_r(y), parse_r(z)]) }
+    }
+    fn scale(&self, fx: &str, fy: &str, fz: &str) -> PySolid {
+        PySolid { inner: self.inner.scaled(parse_r(fx), parse_r(fy), parse_r(fz)) }
+    }
+    fn mirror(&self, axis: usize) -> PySolid {
+        PySolid { inner: self.inner.mirrored(axis) }
+    }
+    fn rotate_quarter(&self, axis: usize, quarters: i64) -> PySolid {
+        PySolid { inner: self.inner.rotated_quarter(axis, quarters) }
+    }
+    fn boolean(&self, op: &str, other: &PySolid) -> PySolid {
+        PySolid { inner: boolean_impl(op, &self.inner, &other.inner) }
+    }
+    fn chamfer(&self, dist: &str) -> PyResult<PySolid> {
+        chamfer(&self.inner, parse_r(dist))
+            .map(|s| PySolid { inner: s })
+            .map_err(PyValueError::new_err)
+    }
+    fn volume(&self) -> f64 {
+        self.inner.volume().to_f64().unwrap()
+    }
+    fn volume6_str(&self) -> String {
+        r_str(&self.inner.volume6())
+    }
+    fn canonical(&self) -> String {
+        self.inner.canonical()
+    }
+    fn watertight_ok(&self) -> bool {
+        self.inner.watertight_bad() == 0
+    }
+    fn logical_faces(&self) -> usize {
+        self.inner.logical_face_count()
+    }
+    fn bbox(&self) -> Vec<f64> {
+        let (lo, hi) = self.inner.bbox();
+        vec![
+            lo[0].to_f64().unwrap(), lo[1].to_f64().unwrap(), lo[2].to_f64().unwrap(),
+            hi[0].to_f64().unwrap(), hi[1].to_f64().unwrap(), hi[2].to_f64().unwrap(),
+        ]
+    }
+}
+
+#[pyfunction]
+fn make_box(dx: &str, dy: &str, dz: &str, prefix: &str) -> PySolid {
+    PySolid { inner: Solid::cube(parse_r(dx), parse_r(dy), parse_r(dz), prefix) }
+}
+
+#[pyfunction]
+fn make_prism(loop_flat: Vec<String>, h: &str, prefix: &str) -> PySolid {
+    // loop_flat = [x0,y0,x1,y1,...] as "n/d" strings
+    let mut lp: Vec<[R; 2]> = Vec::new();
+    let mut i = 0;
+    while i + 1 < loop_flat.len() {
+        lp.push([parse_r(&loop_flat[i]), parse_r(&loop_flat[i + 1])]);
+        i += 2;
+    }
+    PySolid { inner: Solid::prism(lp, parse_r(h), prefix) }
+}
+
+#[pyfunction]
+fn make_prismatoid(bottom: Vec<String>, z0: &str, top: Vec<String>, z1: &str, prefix: &str) -> PySolid {
+    let rd = |flat: &[String]| -> Vec<[R; 2]> {
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i + 1 < flat.len() {
+            v.push([parse_r(&flat[i]), parse_r(&flat[i + 1])]);
+            i += 2;
+        }
+        v
+    };
+    PySolid { inner: Solid::prismatoid(rd(&bottom), parse_r(z0), rd(&top), parse_r(z1), prefix) }
+}
+
+// legacy oracle helpers (kept for the original tests)
 #[pyfunction]
 fn box_boolean(
-    dx: &str, dy: &str, dz: &str,
-    ex: &str, ey: &str, ez: &str,
-    tx: &str, ty: &str, tz: &str,
-    op: &str,
+    dx: &str, dy: &str, dz: &str, ex: &str, ey: &str, ez: &str,
+    tx: &str, ty: &str, tz: &str, op: &str,
 ) -> (String, String) {
     let a = Solid::cube(parse_r(dx), parse_r(dy), parse_r(dz), "A");
     let b = Solid::cube(parse_r(ex), parse_r(ey), parse_r(ez), "B")
         .translated(&[parse_r(tx), parse_r(ty), parse_r(tz)]);
-    let out = boolean(op, &a, &b);
+    let out = boolean_impl(op, &a, &b);
     (r_str(&out.volume6()), out.canonical())
 }
-
-/// A single box's exact signed volume6 and canonical faces.
 #[pyfunction]
 fn box_form(dx: &str, dy: &str, dz: &str) -> (String, String) {
     let s = Solid::cube(parse_r(dx), parse_r(dy), parse_r(dz), "box");
@@ -432,6 +1139,10 @@ fn box_form(dx: &str, dy: &str, dz: &str) -> (String, String) {
 
 #[pymodule]
 fn forgekernel_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PySolid>()?;
+    m.add_function(wrap_pyfunction!(make_box, m)?)?;
+    m.add_function(wrap_pyfunction!(make_prism, m)?)?;
+    m.add_function(wrap_pyfunction!(make_prismatoid, m)?)?;
     m.add_function(wrap_pyfunction!(box_boolean, m)?)?;
     m.add_function(wrap_pyfunction!(box_form, m)?)?;
     Ok(())

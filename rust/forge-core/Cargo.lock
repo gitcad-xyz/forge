@@ -19,6 +19,7 @@ name = "forge-core"
 version = "0.0.1"
 dependencies = [
  "num-bigint",
+ "num-integer",
  "num-rational",
  "num-traits",
  "pyo3",
