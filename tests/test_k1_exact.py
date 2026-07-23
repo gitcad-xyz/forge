@@ -171,3 +171,57 @@ def test_blind_hole_clamps_to_material() -> None:
     # drilled from above, tool extends past the top: clamped to material
     out = base.cut(Cyl.make(2, 8).translated(10, 10, 6))
     assert out.volume() == PiVal(4000, -16)                # π·4·(10-6)
+
+
+# -- K2.1: coaxial quadric stacks + revolve, exact in Q[pi] --------------------
+
+def test_axis_stack_boss_exact() -> None:
+    from forgekernel.quadric import AxisStack, Cone, Cyl, PiVal, Sphere
+
+    s = AxisStack(0, 0, [Cyl.make(20, 8)])
+    s = s.fuse(Cone.make(10, 6, 12).translated(0, 0, 8))
+    s = s.fuse(Sphere.make(5).translated(0, 0, 22))
+    # cylinder 3200pi + frustum 784pi + spherical cap (sphere dominated by
+    # the cone on [17,20], proven by exact interval analysis) 392pi/3
+    assert s.volume() == PiVal(0, Fraction(12344, 3))
+
+
+def test_revolve_green_theorem_exact() -> None:
+    from forgekernel.quadric import PiVal, RevolveSolid
+
+    loop = [(5, 0), (15, 0), (15, 4), (8, 8), (8, 20), (5, 20)]
+    assert RevolveSolid(loop).volume() == PiVal(0, Fraction(5140, 3))
+    # washer: rectangle (2..4) x (0..5) -> pi (16-4) * 5
+    washer = RevolveSolid([(2, 0), (4, 0), (4, 5), (2, 5)])
+    assert washer.volume() == PiVal(0, 60)
+
+
+def test_sphere_and_cone_alone_exact() -> None:
+    from forgekernel.quadric import AxisStack, Cone, PiVal, Sphere
+
+    assert AxisStack(0, 0, [Sphere.make(3)]).volume() == PiVal(0, 36)
+    # full cone r=3 h=6: pi r^2 h / 3 = 18 pi
+    assert AxisStack(0, 0, [Cone.make(3, 0, 6)]).volume() == PiVal(0, 18)
+
+
+def test_irrational_crossover_refuses_honestly() -> None:
+    import pytest as _pytest
+
+    from forgekernel.quadric import AxisStack, Cyl, Sphere
+
+    # cyl r=2 vs sphere r=3 overlapping: 4 = 9 - z^2 -> z = sqrt(5),
+    # an irrational crossover strictly inside the overlap
+    s = AxisStack(0, 0, [Cyl.make(2, 6).translated(0, 0, -3)])
+    s = s.fuse(Sphere.make(3))
+    with _pytest.raises(ValueError, match="K2.2"):
+        s.volume()
+
+
+def test_coaxial_requirement_refuses() -> None:
+    import pytest as _pytest
+
+    from forgekernel.quadric import AxisStack, Cyl
+
+    s = AxisStack(0, 0, [Cyl.make(5, 5)])
+    with _pytest.raises(ValueError, match="non-coaxial"):
+        s.fuse(Cyl.make(5, 5).translated(20, 0, 0))

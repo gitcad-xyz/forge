@@ -190,3 +190,228 @@ class DrilledSolid:
                  "axis_dir": [0.0, 0.0, 1.0],
                  "axis_origin": [float(c.cx), float(c.cy), float(c.z0)]}
                 for c in self.bores]
+
+
+@dataclass(frozen=True)
+class Sphere:
+    """Solid sphere centered (cx, cy, cz)."""
+    cx: Fraction
+    cy: Fraction
+    cz: Fraction
+    r: Fraction
+
+    @classmethod
+    def make(cls, r) -> "Sphere":
+        r = F(r)
+        if r <= 0:
+            raise ValueError("sphere wants positive radius")
+        return cls(F(0), F(0), F(0), r)
+
+    def translated(self, x, y, z) -> "Sphere":
+        return Sphere(self.cx + F(x), self.cy + F(y), self.cz + F(z), self.r)
+
+
+@dataclass(frozen=True)
+class Cone:
+    """Right conical frustum, axis +z through (cx, cy), r1 at z0, r2 at z1."""
+    cx: Fraction
+    cy: Fraction
+    r1: Fraction
+    r2: Fraction
+    z0: Fraction
+    z1: Fraction
+
+    @classmethod
+    def make(cls, r1, r2, h) -> "Cone":
+        r1, r2, h = F(r1), F(r2), F(h)
+        if h <= 0 or r1 < 0 or r2 < 0 or (r1 == 0 and r2 == 0):
+            raise ValueError("cone wants positive height and a radius")
+        return cls(F(0), F(0), r1, r2, F(0), h)
+
+    def translated(self, x, y, z) -> "Cone":
+        return Cone(self.cx + F(x), self.cy + F(y), self.r1, self.r2,
+                    self.z0 + F(z), self.z1 + F(z))
+
+
+class _Quad:
+    """Exact quadratic q(z) = a z^2 + b z + c — the r^2 profile of every
+    K2 primitive (cylinder: constant; cone: squared linear; sphere:
+    R^2 - (z-c)^2)."""
+
+    __slots__ = ("a", "b", "c")
+
+    def __init__(self, a, b, c) -> None:
+        self.a, self.b, self.c = F(a), F(b), F(c)
+
+    def at(self, z: Fraction) -> Fraction:
+        return self.a * z * z + self.b * z + self.c
+
+    def integral(self, lo: Fraction, hi: Fraction) -> Fraction:
+        return (self.a * (hi ** 3 - lo ** 3) / 3
+                + self.b * (hi ** 2 - lo ** 2) / 2 + self.c * (hi - lo))
+
+    def z_integral(self, lo: Fraction, hi: Fraction) -> Fraction:
+        """Integral of z*q(z)."""
+        return (self.a * (hi ** 4 - lo ** 4) / 4
+                + self.b * (hi ** 3 - lo ** 3) / 3
+                + self.c * (hi ** 2 - lo ** 2) / 2)
+
+    def rational_roots_between(self, lo: Fraction, hi: Fraction,
+                               other: "_Quad") -> list[Fraction] | None:
+        """Roots of (self - other) strictly inside (lo, hi): the list when
+        every such root is rational, None when an IRRATIONAL crossover may
+        exist in range (the caller refuses — exactness is never faked)."""
+        a, b, c = self.a - other.a, self.b - other.b, self.c - other.c
+        if a == 0:
+            if b == 0:
+                return []
+            z = -c / b
+            return [z] if lo < z < hi else []
+        disc = b * b - 4 * a * c
+        if disc < 0:
+            return []
+        num, den = disc.numerator, disc.denominator
+        rn, rd = math.isqrt(num), math.isqrt(den)
+        if rn * rn != num or rd * rd != den:
+            # irrational roots: exact interval sign analysis decides if any
+            # lie in (lo, hi); vertex of the difference is at -b/2a
+            vz = -b / (2 * a)
+            s_lo = a * lo * lo + b * lo + c
+            s_hi = a * hi * hi + b * hi + c
+            crosses = (s_lo < 0) != (s_hi < 0)
+            if not crosses and lo < vz < hi:
+                s_v = a * vz * vz + b * vz + c
+                crosses = (s_v < 0) != (s_lo < 0) and s_v != 0
+            return None if crosses else []
+        sq = Fraction(rn, rd)
+        roots = [(-b - sq) / (2 * a), (-b + sq) / (2 * a)]
+        return [z for z in roots if lo < z < hi]
+
+
+def _segments_of(prim) -> list:
+    if isinstance(prim, Cyl):
+        return [(prim.z0, prim.z1, _Quad(0, 0, prim.r * prim.r))]
+    if isinstance(prim, Cone):
+        h = prim.z1 - prim.z0
+        k = (prim.r2 - prim.r1) / h
+        a = k * k
+        b = 2 * prim.r1 * k - 2 * k * k * prim.z0
+        c = (prim.r1 - k * prim.z0) ** 2
+        return [(prim.z0, prim.z1, _Quad(a, b, c))]
+    if isinstance(prim, Sphere):
+        return [(prim.cz - prim.r, prim.cz + prim.r,
+                 _Quad(-1, 2 * prim.cz, prim.r * prim.r - prim.cz * prim.cz))]
+    raise TypeError(f"not an axis primitive: {type(prim).__name__}")
+
+
+class AxisStack:
+    """Union of coaxial z-axis primitives — exact in the field of a+b*pi.
+
+    Concentric circles make the union area pi*max_i r_i(z)^2, and every
+    r^2 profile is a rational quadratic, so the union integrates exactly
+    piecewise. Profile crossovers must land on rational z; a possible
+    irrational crossover refuses honestly (K2.2 brings the algebraic
+    extension)."""
+
+    def __init__(self, cx, cy, prims: list) -> None:
+        self.cx, self.cy = F(cx), F(cy)
+        self.prims = list(prims)
+
+    def fuse(self, prim) -> "AxisStack":
+        if getattr(prim, "cx", None) != self.cx or \
+           getattr(prim, "cy", None) != self.cy:
+            raise ValueError("union of non-coaxial quadrics arrives at K2.2")
+        return AxisStack(self.cx, self.cy, self.prims + [prim])
+
+    def _pieces(self) -> list:
+        segs = [s for p in self.prims for s in _segments_of(p)]
+        cuts = {t for lo, hi, _ in segs for t in (lo, hi)}
+        for i, (lo1, hi1, q1) in enumerate(segs):
+            for lo2, hi2, q2 in segs[i + 1:]:
+                lo, hi = max(lo1, lo2), min(hi1, hi2)
+                if lo < hi:
+                    roots = q1.rational_roots_between(lo, hi, q2)
+                    if roots is None:
+                        raise ValueError(
+                            "irrational profile crossover arrives at K2.2 "
+                            "(algebraic extension)")
+                    cuts.update(roots)
+        ordered = sorted(cuts)
+        out = []
+        for lo, hi in zip(ordered, ordered[1:]):
+            mid = (lo + hi) / 2
+            live = [q for slo, shi, q in segs if slo <= lo and hi <= shi]
+            if not live:
+                continue
+            best = max(live, key=lambda q: q.at(mid))
+            out.append((lo, hi, best))
+        return out
+
+    def volume(self) -> PiVal:
+        return PiVal(0, sum((q.integral(lo, hi)
+                             for lo, hi, q in self._pieces()), F(0)))
+
+    def centroid_f(self) -> tuple[float, float, float]:
+        pieces = self._pieces()
+        v = sum((q.integral(lo, hi) for lo, hi, q in pieces), F(0))
+        zbar = sum((q.z_integral(lo, hi) for lo, hi, q in pieces), F(0)) / v
+        return (float(self.cx), float(self.cy), float(zbar))
+
+    def bbox(self):
+        pieces = self._pieces()
+        z0 = min(lo for lo, _, _ in pieces)
+        z1 = max(hi for _, hi, _ in pieces)
+        r2max = F(0)
+        for lo, hi, q in pieces:
+            cands = [q.at(lo), q.at(hi)]
+            if q.a != 0:
+                vz = -q.b / (2 * q.a)
+                if lo <= vz <= hi:
+                    cands.append(q.at(vz))
+            r2max = max(r2max, *cands)
+        r = math.sqrt(float(r2max))
+        return ((float(self.cx) - r, float(self.cy) - r, float(z0)),
+                (float(self.cx) + r, float(self.cy) + r, float(z1)))
+
+
+class RevolveSolid:
+    """A closed line-segment profile in the (r, z) half-plane revolved
+    360 degrees about the z axis. Green gives exact metrics:
+    V = pi * contour_integral(r^2 dz), each edge contributing
+    (z2-z1)(r1^2 + r1 r2 + r2^2)/3."""
+
+    def __init__(self, loop_rz: list) -> None:
+        self.loop = [(F(r), F(z)) for r, z in loop_rz]
+        if any(r < 0 for r, _ in self.loop):
+            raise ValueError("revolve profile must stay at r >= 0")
+        if self._v3() < 0:
+            self.loop = list(reversed(self.loop))
+
+    def _edges(self):
+        n = len(self.loop)
+        for i in range(n):
+            yield self.loop[i], self.loop[(i + 1) % n]
+
+    def _v3(self) -> Fraction:
+        acc = F(0)
+        for (r1, z1), (r2, z2) in self._edges():
+            acc += (z2 - z1) * (r1 * r1 + r1 * r2 + r2 * r2)
+        return acc
+
+    def volume(self) -> PiVal:
+        return PiVal(0, self._v3() / 3)
+
+    def centroid_f(self) -> tuple[float, float, float]:
+        num = F(0)
+        for (r1, z1), (r2, z2) in self._edges():
+            dz = z2 - z1
+            num += dz * (z1 * (3 * r1 * r1 + 2 * r1 * r2 + r2 * r2)
+                         + z2 * (r1 * r1 + 2 * r1 * r2 + 3 * r2 * r2)) / 12
+        v3 = self._v3()
+        return (0.0, 0.0, float(num / v3 * 3) if v3 else 0.0)
+
+    def bbox(self):
+        rmax = max(r for r, _ in self.loop)
+        zs = [z for _, z in self.loop]
+        return ((-float(rmax), -float(rmax), float(min(zs))),
+                (float(rmax), float(rmax), float(max(zs))))
