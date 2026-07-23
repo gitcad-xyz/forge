@@ -77,3 +77,10 @@ def shell(s: Solid, thickness) -> Solid:
     from forgekernel.brep import shell_box
 
     return shell_box(s, thickness)
+
+
+def fillet_box(a, b, c, r, origin=(0, 0, 0)):
+    """Rounded box (all edges+corners filleted r) — exact Q[pi] volume."""
+    from forgekernel.quadric import RoundedBox
+
+    return RoundedBox(a, b, c, r, origin)

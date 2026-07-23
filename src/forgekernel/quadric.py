@@ -548,3 +548,45 @@ def _sphere_solid(s: "Sphere", solid: "Solid") -> None:
             return                            # separated by this face plane
     raise ValueError(
         "sphere overlaps the solid — general quadric booleans arrive at K2.3")
+
+
+class RoundedBox:
+    """An axis-aligned box with ALL edges and corners filleted radius r —
+    the Minkowski sum of the inner core box (a-2r)x(b-2r)x(c-2r) with a
+    ball of radius r. Steiner's formula gives the volume EXACTLY in Q[pi]:
+
+        V = pqs + 2r(pq+qs+sp) + pi r^2 (p+q+s) + (4/3) pi r^3
+
+    (core box + face slabs + edge quarter-cylinders + 8 corner octants),
+    p=a-2r etc. Requires 2r <= min(a,b,c); tighter fillets need the general
+    blend engine (K5)."""
+
+    def __init__(self, a, b, c, r, origin=(0, 0, 0)) -> None:
+        self.a, self.b, self.c, self.r = F(a), F(b), F(c), F(r)
+        self.origin = tuple(F(v) for v in origin)
+        if 2 * self.r > min(self.a, self.b, self.c):
+            raise ValueError("fillet radius exceeds half the smallest dimension")
+
+    def _pqs(self):
+        r = self.r
+        return self.a - 2 * r, self.b - 2 * r, self.c - 2 * r
+
+    def volume(self) -> PiVal:
+        r = self.r
+        p, q, s = self._pqs()
+        rational = p * q * s + 2 * r * (p * q + q * s + s * p)
+        pi_part = r * r * (p + q + s) + Fraction(4, 3) * r ** 3
+        return PiVal(rational, pi_part)
+
+    def centroid_f(self) -> tuple:
+        ox, oy, oz = self.origin
+        return (float(ox + self.a / 2), float(oy + self.b / 2),
+                float(oz + self.c / 2))
+
+    def bbox(self):
+        ox, oy, oz = self.origin
+        return ((float(ox), float(oy), float(oz)),
+                (float(ox + self.a), float(oy + self.b), float(oz + self.c)))
+
+    def watertight_violations(self) -> list:
+        return []

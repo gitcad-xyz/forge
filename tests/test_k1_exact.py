@@ -333,3 +333,28 @@ def test_shell_too_thick_refuses() -> None:
 
     with _pytest.raises(ValueError, match="exceeds"):
         shell(box(10, 10, 10), 5)                       # 2t == smallest dim
+
+
+# -- W-D: fillet (rounded box, Steiner formula, exact Q[pi]) ------------------
+
+def test_rounded_box_steiner_volume_exact() -> None:
+    from forgekernel.quadric import PiVal, RoundedBox
+
+    # box 30x20x10 r=5/2: V = pqs + 2r(pq+qs+sp) + pi r^2(p+q+s) + 4/3 pi r^3
+    # p,q,s = 25,15,5 -> 1875 + 2875 + (1125/4 + 125/6)pi = 4750 + 3625/12 pi
+    rb = RoundedBox(30, 20, 10, Fraction(5, 2))
+    assert rb.volume() == PiVal(4750, Fraction(3625, 12))
+    # this exact rational is OCCT's float to the last bit (locked in bench)
+    assert abs(float(rb.volume()) - 5699.022780771917) < 1e-9
+
+
+def test_fillet_too_large_refuses() -> None:
+    import pytest as _pytest
+
+    from forgekernel.quadric import RoundedBox
+
+    with _pytest.raises(ValueError, match="exceeds"):
+        RoundedBox(10, 10, 10, 6)                       # 2r=12 > smallest dim
+    # 2r == dim is the valid degenerate: a fully-rounded cube is a sphere
+    from forgekernel.quadric import PiVal
+    assert RoundedBox(10, 10, 10, 5).volume() == PiVal(0, Fraction(500, 3))
