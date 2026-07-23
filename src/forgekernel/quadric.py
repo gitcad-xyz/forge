@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 from forgekernel.brep import Solid
-from forgekernel.exact import F
+from forgekernel.exact import F, dot
 
 
 class PiVal:
@@ -415,3 +415,136 @@ class RevolveSolid:
         zs = [z for _, z in self.loop]
         return ((-float(rmax), -float(rmax), float(min(zs))),
                 (float(rmax), float(rmax), float(max(zs))))
+
+
+def _member_volume(m):
+    if isinstance(m, (Sphere, Cone)):
+        return AxisStack(m.cx, m.cy, [m]).volume()
+    return m.volume()
+
+
+def _member_centroid(m):
+    if isinstance(m, (Sphere, Cone)):
+        return AxisStack(m.cx, m.cy, [m]).centroid_f()
+    if hasattr(m, "centroid_f"):
+        return m.centroid_f()
+    return tuple(float(x) for x in m.centroid())
+
+
+class DisjointUnion:
+    """Union of solids that meet at most tangentially — exact.
+
+    Tangent contact is measure-zero, so the union volume is EXACTLY the
+    sum of member volumes; the only real work is PROVING the members are
+    disjoint-or-tangent with exact predicates (no sqrt: squared distances
+    and squared-radius comparisons). Any genuine overlap refuses honestly
+    (K2.3 brings general quadric booleans)."""
+
+    def __init__(self, members: list) -> None:
+        self.members = list(members)
+        for i, a in enumerate(self.members):
+            for b in self.members[i + 1:]:
+                _classify_pair(a, b)          # raises on genuine overlap
+
+    def add(self, other) -> "DisjointUnion":
+        for m in self.members:
+            _classify_pair(m, other)
+        return DisjointUnion(self.members + [other])
+
+    def volume(self) -> "PiVal":
+        total = PiVal(0, 0)
+        for m in self.members:
+            v = _member_volume(m)
+            total = total + (v if isinstance(v, PiVal) else PiVal(v, 0))
+        return total
+
+    def centroid_f(self) -> tuple:
+        acc = [0.0, 0.0, 0.0]
+        vtot = 0.0
+        for m in self.members:
+            v = float(_member_volume(m))
+            c = _member_centroid(m)
+            for i in range(3):
+                acc[i] += v * c[i]
+            vtot += v
+        return (acc[0] / vtot, acc[1] / vtot, acc[2] / vtot)
+
+    def bbox(self):
+        boxes = [m.bbox() for m in self.members]
+        lo = tuple(min(float(b[0][i]) for b in boxes) for i in range(3))
+        hi = tuple(max(float(b[1][i]) for b in boxes) for i in range(3))
+        return (lo, hi)
+
+    def watertight_violations(self) -> list:
+        bad = []
+        for m in self.members:
+            if hasattr(m, "watertight_violations"):
+                bad += m.watertight_violations()
+        return bad
+
+
+def _zrange(prim):
+    """Exact z-extent of an axis primitive (None for general solids)."""
+    if isinstance(prim, Cyl):
+        return (prim.z0, prim.z1)
+    if isinstance(prim, Cone):
+        return (prim.z0, prim.z1)
+    if isinstance(prim, Sphere):
+        return (prim.cz - prim.r, prim.cz + prim.r)
+    return None
+
+
+def _classify_pair(a, b) -> None:
+    """Raise ValueError iff a and b genuinely overlap (positive-measure
+    intersection). Silent return = disjoint or tangent (both exact)."""
+    # cylinder / cylinder, parallel +z axes
+    if isinstance(a, Cyl) and isinstance(b, Cyl):
+        za, zb = (a.z0, a.z1), (b.z0, b.z1)
+        if za[1] <= zb[0] or zb[1] <= za[0]:
+            return                            # disjoint in z
+        d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2
+        outer = (a.r + b.r) ** 2
+        inner = (a.r - b.r) ** 2
+        if d2 >= outer or d2 <= inner:
+            return                            # externally/internally clear
+        raise ValueError(
+            "overlapping cylinders — general quadric booleans arrive at K2.3")
+    # sphere / planar Solid
+    if isinstance(a, Sphere) and isinstance(b, Solid):
+        _sphere_solid(a, b)
+        return
+    if isinstance(b, Sphere) and isinstance(a, Solid):
+        _sphere_solid(b, a)
+        return
+    # sphere / sphere
+    if isinstance(a, Sphere) and isinstance(b, Sphere):
+        d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2 + (a.cz - b.cz) ** 2
+        if d2 >= (a.r + b.r) ** 2 or d2 <= (a.r - b.r) ** 2:
+            return
+        raise ValueError(
+            "overlapping spheres — general quadric booleans arrive at K2.3")
+    raise ValueError(
+        f"disjoint-union of {type(a).__name__}+{type(b).__name__} arrives "
+        "at K2.3")
+
+
+def _sphere_solid(s: "Sphere", solid: "Solid") -> None:
+    """Disjoint/tangent iff the sphere center lies on the far side of (or
+    exactly on) some face plane by at least the radius — exact, sqrt-free:
+    for outward plane n·x = d, signed gap g = n·c − d; clear iff g > 0 and
+    g² ≥ r²·(n·n) (both sides squared, exact). Convex-solid sufficient
+    condition; a sphere separated from a convex solid is separated by one
+    of its face planes."""
+    c = (s.cx, s.cy, s.cz)
+    seen = set()
+    for p in solid.polys:
+        key = p.plane.canonical()
+        if key in seen:
+            continue
+        seen.add(key)
+        n, dpl = p.plane.n, p.plane.d
+        g = dot(n, c) - dpl
+        if g > 0 and g * g >= s.r * s.r * dot(n, n):
+            return                            # separated by this face plane
+    raise ValueError(
+        "sphere overlaps the solid — general quadric booleans arrive at K2.3")

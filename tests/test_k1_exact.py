@@ -1,3 +1,4 @@
+import math
 """K1 acceptance: exactness asserted with EXACT EQUALITY — the point of
 a rational kernel is that == is the right operator."""
 
@@ -225,3 +226,53 @@ def test_coaxial_requirement_refuses() -> None:
     s = AxisStack(0, 0, [Cyl.make(5, 5)])
     with _pytest.raises(ValueError, match="non-coaxial"):
         s.fuse(Cyl.make(5, 5).translated(20, 0, 0))
+
+
+# -- W-A: tangent-contact unions (measure-zero, exact) ------------------------
+
+def test_tangent_cylinders_sum_exactly() -> None:
+    from forgekernel.quadric import Cyl, DisjointUnion, PiVal
+
+    # r=10 each, centers 20 apart: d^2 = 400 = (r1+r2)^2 -> tangent
+    u = DisjointUnion([Cyl.make(10, 10), Cyl.make(10, 10).translated(20, 0, 0)])
+    assert u.volume() == PiVal(0, 2000)         # 2 * 100 * 10, no overlap term
+
+
+def test_sphere_tangent_to_box_face_exact() -> None:
+    from forgekernel.brep import Solid
+    from forgekernel.quadric import DisjointUnion, PiVal, Sphere
+
+    # box top at z=10, sphere r=5 centered z=15: gap 15-10 == 5 == r, tangent
+    u = DisjointUnion([Solid.box(30, 30, 10), Sphere.make(5).translated(15, 15, 15)])
+    assert u.volume() == PiVal(9000, Fraction(500, 3))
+    v = u.volume()
+    assert abs(float(v) - (9000 + 500 / 3 * math.pi)) < 1e-9
+
+
+def test_genuine_overlap_refuses() -> None:
+    import pytest as _pytest
+
+    from forgekernel.brep import Solid
+    from forgekernel.quadric import Cyl, DisjointUnion, Sphere
+
+    with _pytest.raises(ValueError, match="K2.3"):
+        DisjointUnion([Cyl.make(10, 10), Cyl.make(10, 10).translated(15, 0, 0)])
+    with _pytest.raises(ValueError, match="K2.3"):
+        DisjointUnion([Solid.box(30, 30, 10),
+                       Sphere.make(5).translated(15, 15, 8)])   # center inside
+
+
+def test_disjoint_in_z_passes_despite_close_axes() -> None:
+    from forgekernel.quadric import Cyl, DisjointUnion, PiVal
+
+    # axes 2 apart (would overlap) but z-ranges don't touch -> disjoint, exact
+    u = DisjointUnion([Cyl.make(10, 5), Cyl.make(10, 5).translated(2, 0, 10)])
+    assert u.volume() == PiVal(0, 1000)
+
+
+def test_internally_tangent_cylinders_exact() -> None:
+    from forgekernel.quadric import Cyl, DisjointUnion, PiVal
+
+    # r=10 and r=4, centers 6 apart: d^2 = 36 = (10-4)^2 internally tangent
+    u = DisjointUnion([Cyl.make(10, 8), Cyl.make(4, 8).translated(6, 0, 0)])
+    assert u.volume() == PiVal(0, (100 + 16) * 8)
