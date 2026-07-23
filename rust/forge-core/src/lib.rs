@@ -161,6 +161,28 @@ impl Polygon {
         }
         dot(&acc, &acc)
     }
+    /// Float-filtered degeneracy test (hot path in Solid::new): a clearly
+    /// non-zero float area normal proves non-degenerate without the exact
+    /// area2; only near-zero falls back to exact. Answer is always exact.
+    fn is_degenerate(&self) -> bool {
+        let f = |v: &V| [v[0].to_f64().unwrap_or(f64::NAN), v[1].to_f64().unwrap_or(f64::NAN), v[2].to_f64().unwrap_or(f64::NAN)];
+        let v0 = f(&self.verts[0]);
+        let mut acc = [0.0f64; 3];
+        for i in 1..self.verts.len() - 1 {
+            let a = f(&self.verts[i]);
+            let b = f(&self.verts[i + 1]);
+            let e1 = [a[0] - v0[0], a[1] - v0[1], a[2] - v0[2]];
+            let e2 = [b[0] - v0[0], b[1] - v0[1], b[2] - v0[2]];
+            acc[0] += e1[1] * e2[2] - e1[2] * e2[1];
+            acc[1] += e1[2] * e2[0] - e1[0] * e2[2];
+            acc[2] += e1[0] * e2[1] - e1[1] * e2[0];
+        }
+        let mag = acc[0].abs() + acc[1].abs() + acc[2].abs();
+        if mag.is_finite() && mag > 1e-7 {
+            return false; // clearly a real face
+        }
+        self.area2().is_zero() // ambiguous → exact
+    }
 }
 
 #[derive(Clone)]
@@ -170,7 +192,7 @@ struct Solid {
 impl Solid {
     fn new(polys: Vec<Polygon>) -> Solid {
         Solid {
-            polys: polys.into_iter().filter(|p| !p.area2().is_zero()).collect(),
+            polys: polys.into_iter().filter(|p| !p.is_degenerate()).collect(),
         }
     }
 
@@ -824,9 +846,41 @@ struct Split {
     front: Vec<Polygon>,
     back: Vec<Polygon>,
 }
+/// Float error-filtered plane side: decide the sign in f64 with a static
+/// forward-error bound (Shewchuk-style); fall back to the exact rational
+/// only when the float magnitude is within the bound of zero. The answer
+/// is ALWAYS the exact sign — the filter only skips slow exact arithmetic
+/// on the common, unambiguous case (the chamfer/deep-boolean hot path).
+fn side_filtered(plane: &Plane, pf: &[f64; 4], p: &V) -> i32 {
+    let px = p[0].to_f64().unwrap_or(f64::NAN);
+    let py = p[1].to_f64().unwrap_or(f64::NAN);
+    let pz = p[2].to_f64().unwrap_or(f64::NAN);
+    let t0 = pf[0] * px;
+    let t1 = pf[1] * py;
+    let t2 = pf[2] * pz;
+    let s = t0 + t1 + t2 - pf[3];
+    // conservative static bound: a few ulps of the summed magnitudes
+    let bound = 16.0 * f64::EPSILON * (t0.abs() + t1.abs() + t2.abs() + pf[3].abs() + 1.0);
+    if s.is_finite() {
+        if s > bound {
+            return 1;
+        }
+        if s < -bound {
+            return -1;
+        }
+    }
+    plane.side(p) // ambiguous or non-finite → exact fallback
+}
+
 fn split(plane: &Plane, poly: &Polygon) -> Split {
     let mut r = Split::default();
-    let sides: Vec<i32> = poly.verts.iter().map(|v| plane.side(v)).collect();
+    let pf = [
+        plane.n[0].to_f64().unwrap_or(f64::NAN),
+        plane.n[1].to_f64().unwrap_or(f64::NAN),
+        plane.n[2].to_f64().unwrap_or(f64::NAN),
+        plane.d.to_f64().unwrap_or(f64::NAN),
+    ];
+    let sides: Vec<i32> = poly.verts.iter().map(|v| side_filtered(plane, &pf, v)).collect();
     let mut kind = 0;
     for &s in &sides {
         kind |= if s > 0 { 1 } else if s < 0 { 2 } else { 0 };
