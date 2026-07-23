@@ -187,13 +187,14 @@ def _deboor4(p: int, U, pts, u):
                 lo = mid
         k = lo
     d = [list(pts[k - p + j]) for j in range(p + 1)]
+    dim = len(d[0])
     for r in range(1, p + 1):
         for j in range(p, r - 1, -1):
             i = k - p + j
             denom = U[i + p - r + 1] - U[i]
             a = F(0) if denom == 0 else (u - U[i]) / denom
             b = 1 - a
-            d[j] = [b * d[j - 1][c] + a * d[j][c] for c in range(4)]
+            d[j] = [b * d[j - 1][c] + a * d[j][c] for c in range(dim)]
     return tuple(d[p])
 
 
@@ -400,3 +401,54 @@ def bezier_patches(surface: "BSplineSurface"):
                    for i in range(p + 1)]
             patches.append((ub[a], ub[a + 1], vb[b], vb[b + 1], net))
     return patches
+
+
+# -- K6.0: second partials (polynomial surfaces; rational → K6.1) -------------
+
+def _hodo_list(p, U, pts):
+    """Hodograph as plain lists (degree p-1, knots U[1:-1])."""
+    D = []
+    for i in range(len(pts) - 1):
+        denom = U[i + p + 1] - U[i + 1]
+        s = F(0) if denom == 0 else F(p) / denom
+        D.append(tuple(s * (pts[i + 1][c] - pts[i][c])
+                       for c in range(len(pts[0]))))
+    return p - 1, U[1:-1], D
+
+
+def surface_partials2(surface: "BSplineSurface", u, v):
+    """(S, S_u, S_v, S_uu, S_uv, S_vv) — all exact ℚ³ for a POLYNOMIAL
+    surface (weights 1). Rational second partials arrive at K6.1."""
+    if any(w != F(1) for row in surface.w for w in row):
+        raise ValueError("second partials: polynomial surfaces only (K6.1)")
+    u, v = F(u), F(v)
+    p, q, U, V = surface.p, surface.q, surface.U, surface.V
+
+    def eval_curve(pp, UU, pts, t):
+        return _deboor4(pp, UU, pts, t) if pp >= 0 and pts else \
+            (F(0),) * len(surface.cp[0][0])
+
+    # rows evaluated in v, then u-curves (S, S_u, S_uu from u-hodographs)
+    rows_v = [tuple(x) for x in
+              [_deboor4(q, V, [tuple(pt) for pt in row], v)
+               for row in [[pt for pt in r] for r in surface.cp]]]
+    S = _deboor4(p, U, rows_v, u)
+    pu, Uu, Du = _hodo_list(p, U, rows_v)
+    S_u = eval_curve(pu, Uu, Du, u)
+    puu, Uuu, Duu = _hodo_list(pu, Uu, Du) if pu >= 1 else (-1, [], [])
+    S_uu = eval_curve(puu, Uuu, Duu, u)
+    # v-hodograph rows → S_v, S_vv; and u-hodograph of S_v rows → S_uv
+    rows_dv, rows_dvv = [], []
+    for r in surface.cp:
+        qv, Vv, Dv = _hodo_list(q, V, [tuple(pt) for pt in r])
+        rows_dv.append(eval_curve(qv, Vv, Dv, v))
+        if qv >= 1:
+            qvv, Vvv, Dvv = _hodo_list(qv, Vv, Dv)
+            rows_dvv.append(eval_curve(qvv, Vvv, Dvv, v))
+        else:
+            rows_dvv.append((F(0),) * 3)
+    S_v = _deboor4(p, U, rows_dv, u)
+    S_vv = _deboor4(p, U, rows_dvv, u)
+    puv, Uuv, Duv = _hodo_list(p, U, rows_dv)
+    S_uv = eval_curve(puv, Uuv, Duv, u)
+    return S, S_u, S_v, S_uu, S_uv, S_vv
