@@ -208,3 +208,119 @@ def read_step_geometry(text: str) -> dict:
     sf = StepFile(text)
     return {"curves": [sf.curve(e) for e in sf.bspline_curves()],
             "surfaces": [sf.surface(e) for e in sf.bspline_surfaces()]}
+
+
+# -- K3.6: planar-solid topology import (MANIFOLD_SOLID_BREP → Solid) ---------
+
+def _refs(text: str) -> list[int]:
+    return [int(m) for m in re.findall(r"#(\d+)", text)]
+
+
+def _newell(loop) -> tuple:
+    """Exact Newell normal of a 3D polygon (rational)."""
+    nx = ny = nz = F(0)
+    n = len(loop)
+    for i in range(n):
+        (x1, y1, z1), (x2, y2, z2) = loop[i], loop[(i + 1) % n]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    return (nx, ny, nz)
+
+
+class _Topo(StepFile):
+    """Topology walk for planar-faced solids: solid → shell → faces →
+    bounds → edge loops → vertices. Straight edges only; freeform faces
+    or inner bounds (holes) refuse with the stage name."""
+
+    def planar_solid_faces(self, solid_eid: int):
+        types, args = self.entities[solid_eid]
+        if "MANIFOLD_SOLID_BREP" not in types:
+            raise ValueError(f"#{solid_eid} is not a MANIFOLD_SOLID_BREP")
+        shell = _refs(_split_args(args)[1])[0]
+        _, sargs = self.entities[shell]
+        faces = []
+        for feid in _refs(_split_args(sargs)[1]):
+            ftypes, fargs = self.entities[feid]
+            if "ADVANCED_FACE" not in ftypes and "FACE_SURFACE" not in ftypes:
+                continue
+            fa = _split_args(fargs)
+            bounds = _refs(fa[1])
+            surf_eid = _refs(fa[2])[0]
+            same_sense = fa[3].strip() == ".T."
+            stypes, _ = self.entities[surf_eid]
+            if "PLANE" not in stypes:
+                raise ValueError(
+                    "import_step: freeform face topology (arrives at K3.7)")
+            if len(bounds) != 1:
+                raise ValueError(
+                    "import_step: face with inner bounds/holes (K3.7)")
+            btypes, bargs = self.entities[bounds[0]]
+            ba = _split_args(bargs)
+            loop_eid = _refs(ba[1])[0]
+            loop = self._vertex_loop(loop_eid)
+            # orient by GEOMETRY, not flag interpretation: the face's
+            # outward normal is the PLANE's axis direction (negated when
+            # same_sense = .F.); flip the loop until its exact Newell
+            # normal agrees. Robust to writer flag conventions.
+            n_srf = self._plane_normal(surf_eid)
+            if not same_sense:
+                n_srf = tuple(-c for c in n_srf)
+            nw = _newell(loop)
+            if sum(nw[c] * n_srf[c] for c in range(3)) < 0:
+                loop = list(reversed(loop))
+            faces.append(loop)
+        return faces
+
+    def _plane_normal(self, surf_eid: int):
+        """Exact axis direction of a PLANE's AXIS2_PLACEMENT_3D."""
+        _, sargs = self.entities[surf_eid]
+        place_eid = _refs(_split_args(sargs)[1])[0]
+        _, pargs = self.entities[place_eid]
+        pa = _split_args(pargs)          # (name, #origin, #axis, #ref_dir)
+        axis_eid = _refs(pa[2])[0]
+        _, dargs = self.entities[axis_eid]
+        return tuple(_num(c) for c in _parse_list(_split_args(dargs)[1]))
+
+    def _vertex_loop(self, loop_eid: int):
+        _, largs = self.entities[loop_eid]
+        pts = []
+        for oe in _refs(_parse_list(_split_args(largs)[1].strip()
+                                    if False else _split_args(largs)[1])[0]) \
+                if False else _refs(_split_args(largs)[1]):
+            otypes, oargs = self.entities[oe]
+            oa = _split_args(oargs)
+            edge_eid = _refs(oa[3])[0]
+            forward = oa[4].strip() == ".T."
+            _, eargs = self.entities[edge_eid]
+            ea = _split_args(eargs)
+            v1, v2 = _refs(ea[1])[0], _refs(ea[2])[0]
+            start = v1 if forward else v2
+            _, vargs = self.entities[start]
+            pts.append(self.point(_split_args(vargs)[1]))
+        return pts
+
+    def solids(self) -> list[int]:
+        return [e for e, (t, _) in sorted(self.entities.items())
+                if "MANIFOLD_SOLID_BREP" in t]
+
+
+def read_step_planar_solid(text: str):
+    """Import the first planar-faced solid in a STEP file as an exact
+    forge Solid (coordinates via lossless decimal→rational). Refuses
+    freeform faces and holes with their stage names."""
+    from forgekernel.brep import Polygon, Solid
+
+    topo = _Topo(text)
+    sids = topo.solids()
+    if not sids:
+        raise ValueError("import_step: no MANIFOLD_SOLID_BREP in file")
+    loops = topo.planar_solid_faces(sids[0])
+    polys = [Polygon([tuple(p) for p in loop], f"step.face{i}")
+             for i, loop in enumerate(loops)]
+    s = Solid(polys)
+    if s.volume() < 0:
+        s = Solid([p.flipped() for p in polys])
+    if s.volume() <= 0:
+        raise ValueError("import_step: could not orient the shell")
+    return s

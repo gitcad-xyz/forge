@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from fractions import Fraction
 
+import pytest
+
 from forgekernel.ssi import BezierPatch, refine_point, ssi, ssi_branches
 
 F = Fraction
@@ -153,3 +155,74 @@ def test_polyline_orders_points_monotonically() -> None:
     pl = polyline(pts)
     xs = [p[0] for p in pl]
     assert xs == sorted(xs) or xs == sorted(xs, reverse=True)
+
+
+# -- K3.6: rational patches + planar STEP topology import ---------------------
+
+def test_rational_patch_ssi_finds_the_arc() -> None:
+    from forgekernel.nurbs import BSplineSurface
+    from forgekernel.ssi import ssi_surfaces
+
+    # rational quadratic arc (weight 3/4 mid) ruled from z=-1/2 to 1/2;
+    # plane z=0 cuts it in exactly one branch (the arc at v=1/2)
+    arc = [(1, 0), (1, 1), (0, 1)]
+    net = [[(x, y, F(-1, 2)), (x, y, F(1, 2))] for (x, y) in arc]
+    wts = [[F(1), F(1)], [F(3, 4), F(3, 4)], [F(1), F(1)]]
+    s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 1, 1], [0, 0, 1, 1], wts)
+    plane = BSplineSurface(1, 1, [[(-1, -1, 0), (-1, 2, 0)],
+                                  [(2, -1, 0), (2, 2, 0)]],
+                           [0, 0, 3, 3], [0, 0, 3, 3])
+    r = ssi_surfaces(plane, s, depth=4)
+    assert r["branches"] == 1
+    assert r["uncertified"] == 0
+    for _, _, _, t in r["points"]:
+        assert abs(float(t) - 0.5) < 1e-9        # on the z=0 mid-line
+
+
+def test_rational_patch_requires_positive_weights() -> None:
+    from forgekernel.ssi import BezierPatch
+
+    with pytest.raises(ValueError, match="positive weights"):
+        BezierPatch([[(0, 0, 0, 1), (0, 1, 0, -1)],
+                     [(1, 0, 0, 1), (1, 1, 0, 1)]])
+
+
+def test_step_planar_solid_import_is_exact() -> None:
+    from forgekernel.stepio import read_step_planar_solid
+
+    # a hand-written unit-cube STEP (minimal topology)
+    pts = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0),
+           5: (0, 0, 1), 6: (1, 0, 1), 7: (1, 1, 1), 8: (0, 1, 1)}
+    lines = []
+    for i, (x, y, z) in pts.items():
+        lines.append(f"#{i} = CARTESIAN_POINT('',({x}.,{y}.,{z}.));")
+        lines.append(f"#{i + 10} = VERTEX_POINT('',#{i});")
+    # 6 faces as quads (outward windings); plane normals via axis dirs
+    faces = [((1, 4, 3, 2), (0, 0, -1)), ((5, 6, 7, 8), (0, 0, 1)),
+             ((1, 2, 6, 5), (0, -1, 0)), ((3, 4, 8, 7), (0, 1, 0)),
+             ((2, 3, 7, 6), (1, 0, 0)), ((1, 5, 8, 4), (-1, 0, 0))]
+    eid = 100
+    face_ids = []
+    for verts, nrm in faces:
+        oes = []
+        for a, b in zip(verts, verts[1:] + verts[:1]):
+            lines.append(f"#{eid} = EDGE_CURVE('',#{a + 10},#{b + 10},#{a},.T.);")
+            lines.append(f"#{eid + 1} = ORIENTED_EDGE('',*,*,#{eid},.T.);")
+            oes.append(f"#{eid + 1}")
+            eid += 2
+        lines.append(f"#{eid} = EDGE_LOOP('',({','.join(oes)}));")
+        loop = eid
+        eid += 1
+        lines.append(f"#{eid} = DIRECTION('',({nrm[0]}.,{nrm[1]}.,{nrm[2]}.));")
+        lines.append(f"#{eid + 1} = AXIS2_PLACEMENT_3D('',#1,#{eid},#{eid});")
+        lines.append(f"#{eid + 2} = PLANE('',#{eid + 1});")
+        lines.append(f"#{eid + 3} = FACE_OUTER_BOUND('',#{loop},.T.);")
+        lines.append(f"#{eid + 4} = ADVANCED_FACE('',(#{eid + 3}),#{eid + 2},.T.);")
+        face_ids.append(f"#{eid + 4}")
+        eid += 5
+    lines.append(f"#{eid} = CLOSED_SHELL('',({','.join(face_ids)}));")
+    lines.append(f"#{eid + 1} = MANIFOLD_SOLID_BREP('',#{eid});")
+    text = "DATA;\n" + "\n".join(lines) + "\nENDSEC;"
+    s = read_step_planar_solid(text)
+    assert s.volume() == 1                       # exact
+    assert not s.watertight_violations()

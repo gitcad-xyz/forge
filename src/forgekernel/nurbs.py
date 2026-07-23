@@ -356,14 +356,18 @@ def bezier_segments(curve: "BSplineCurve"):
 
 
 def bezier_patches(surface: "BSplineSurface"):
-    """Split a (polynomial) B-spline surface into exact Bézier patches:
-    [(u0, u1, v0, v1, net), ...] — insertion along u then along v."""
-    if any(w != F(1) for row in surface.w for w in row):
-        raise ValueError("bezier extraction: polynomial surfaces only (K3.6)")
+    """Split a B-spline surface into exact Bézier patches:
+    [(u0, u1, v0, v1, net), ...] — insertion along u then along v.
+
+    Polynomial surfaces yield 3-tuple cartesian nets; rational surfaces
+    yield homogeneous 4-tuple nets (wx, wy, wz, w) — knot insertion is
+    the same convex-combination recurrence in either space."""
+    rational = any(w != F(1) for row in surface.w for w in row)
     p, q = surface.p, surface.q
     # --- u direction: treat each v-column of the net as a u-curve
     U = list(surface.U)
-    cols = [[surface.cp[i][j] for i in range(surface.nu)]
+    src = surface.H if rational else surface.cp
+    cols = [[src[i][j] for i in range(surface.nu)]
             for j in range(surface.nv)]
     lo_u, hi_u = U[p], U[surface.nu]
     int_u = sorted({u for u in U if lo_u < u < hi_u})

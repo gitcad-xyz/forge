@@ -35,24 +35,44 @@ F = Fraction
 
 
 class BezierPatch:
-    """A polynomial Bézier patch: (p+1)×(q+1) exact rational control net
-    over a parameter box [u0,u1]×[v0,v1] of the original surface."""
+    """A Bézier patch: (p+1)×(q+1) exact rational control net over a
+    parameter box [u0,u1]×[v0,v1] of the original surface.
 
-    __slots__ = ("net", "u0", "u1", "v0", "v1")
+    Net entries are 3-tuples (polynomial) or homogeneous 4-tuples
+    (wx, wy, wz, w) for a rational patch. The convex-hull property that
+    bbox pruning relies on holds for rational patches with POSITIVE
+    weights over the *cartesian* control points — enforced here."""
+
+    __slots__ = ("net", "u0", "u1", "v0", "v1", "dim")
 
     def __init__(self, net, u0=F(0), u1=F(1), v0=F(0), v1=F(1)) -> None:
         self.net = [[tuple(F(c) for c in pt) for pt in row] for row in net]
+        self.dim = len(self.net[0][0])
+        if self.dim == 4:
+            for row in self.net:
+                for pt in row:
+                    if pt[3] <= 0:
+                        raise ValueError(
+                            "rational patch: convex-hull pruning needs "
+                            "positive weights (K3.7 for sign-varying)")
         self.u0, self.u1, self.v0, self.v1 = F(u0), F(u1), F(v0), F(v1)
 
     def bbox(self):
-        """Control-net box — contains the patch (convex hull property)."""
-        xs = [pt for row in self.net for pt in row]
+        """Cartesian control-net box — contains the patch (convex hull
+        property; for rational nets, over points x/w with w>0)."""
+        if self.dim == 3:
+            xs = [pt for row in self.net for pt in row]
+        else:
+            xs = [(pt[0] / pt[3], pt[1] / pt[3], pt[2] / pt[3])
+                  for row in self.net for pt in row]
         lo = tuple(min(p[c] for p in xs) for c in range(3))
         hi = tuple(max(p[c] for p in xs) for c in range(3))
         return lo, hi
 
     def _split_rows(self, rows):
-        """De Casteljau at 1/2 along a list of control rows; exact."""
+        """De Casteljau at 1/2 along a list of control rows; exact.
+        Dimension-agnostic: homogeneous 4-vectors subdivide identically."""
+        dim = self.dim
         left, right = [], []
         for row in rows:
             pts = [list(p) for p in row]
@@ -61,7 +81,7 @@ class BezierPatch:
             n = len(pts)
             for r in range(1, n):
                 for i in range(n - r):
-                    pts[i] = [(pts[i][c] + pts[i + 1][c]) / 2 for c in range(3)]
+                    pts[i] = [(pts[i][c] + pts[i + 1][c]) / 2 for c in range(dim)]
                 lo.append(tuple(pts[0]))
                 hi.append(tuple(pts[n - r - 1]))
             left.append(lo)
