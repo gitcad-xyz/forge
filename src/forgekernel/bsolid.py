@@ -205,3 +205,27 @@ def mass_properties(solid: "PatchSolid") -> dict:
     Izx = -(Izx_o - V * cz * cx)
     return {"volume": V, "centroid": (cx, cy, cz),
             "inertia": ((Ixx, Ixy, Izx), (Ixy, Iyy, Iyz), (Izx, Iyz, Izz))}
+
+
+# -- K7.0d: exact mass properties of a planar Solid (reuse the flux) ----------
+
+def solid_to_patches(solid):
+    """Convert a planar forge ``Solid`` to flat degenerate Bézier patches
+    (one per boundary triangle) so the exact flux machinery applies. A
+    triangle (v0,v1,v2) becomes the collapsed bilinear patch
+    [[v0,v0],[v1,v2]] — its S_u×S_v is the triangle's outward area
+    vector, exactly."""
+    patches = []
+    for poly in solid.polys:
+        vs = [tuple(F(c) for c in v) for v in poly.verts]
+        for i in range(1, len(vs) - 1):        # fan triangulation
+            a, b, c = vs[0], vs[i], vs[i + 1]
+            patches.append(bezier_surface([[a, a], [b, c]]))
+    return patches
+
+
+def polyhedron_mass_properties(solid) -> dict:
+    """Exact volume + centroid + inertia tensor of a planar ``Solid``,
+    every entry a Fraction — via the same divergence-theorem flux used
+    for freeform solids."""
+    return mass_properties(PatchSolid(solid_to_patches(solid)))
