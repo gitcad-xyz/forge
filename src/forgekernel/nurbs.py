@@ -304,3 +304,95 @@ def bezier_surface(control_net, weights=None) -> BSplineSurface:
     ku = [F(0)] * (p + 1) + [F(1)] * (p + 1)
     kv = [F(0)] * (q + 1) + [F(1)] * (q + 1)
     return BSplineSurface(p, q, control_net, ku, kv, weights)
+
+
+# -- K3.5: exact Bézier extraction (knot insertion to full multiplicity) ------
+
+def _insert_knot_once(p: int, U, pts, u):
+    """Boehm insertion of knot ``u`` into a (homogeneous or cartesian)
+    control sequence. Exact: convex combinations only. Returns (U', pts')."""
+    n = len(pts) - 1
+    # span k: U[k] <= u < U[k+1]
+    k = p
+    while k < n + 1 and not (U[k] <= u < U[k + 1]):
+        k += 1
+    if k == n + 1:
+        k = n
+    dim = len(pts[0])
+    out = [pts[0]]
+    for i in range(1, len(pts) + 1):
+        if i <= k - p:
+            out.append(pts[i] if i < len(pts) else pts[-1])
+        elif i <= k:
+            denom = U[i + p] - U[i]
+            a = F(0) if denom == 0 else (u - U[i]) / denom
+            out.append(tuple((1 - a) * pts[i - 1][c] + a * pts[i][c]
+                             for c in range(dim)))
+        else:
+            out.append(pts[i - 1])
+    newU = sorted(list(U) + [u])
+    return newU, out[:n + 2]
+
+
+def bezier_segments(curve: "BSplineCurve"):
+    """Split a (polynomial) B-spline curve into exact Bézier segments:
+    [(u0, u1, [P0..Pp]), ...]. Knot insertion to full multiplicity."""
+    if not curve.exact_weights or curve.rational:
+        raise ValueError("bezier extraction: polynomial curves only (K3.6)")
+    p = curve.p
+    U = list(curve.U)
+    pts = [tuple(pt) for pt in curve.cp]
+    # insert every interior knot up to multiplicity p
+    lo, hi = U[p], U[len(pts)]
+    interior = sorted({u for u in U if lo < u < hi})
+    for u in interior:
+        while U.count(u) < p:
+            U, pts = _insert_knot_once(p, U, pts, u)
+    breaks = [lo] + interior + [hi]
+    segs = []
+    for j in range(len(breaks) - 1):
+        segs.append((breaks[j], breaks[j + 1], pts[j * p: j * p + p + 1]))
+    return segs
+
+
+def bezier_patches(surface: "BSplineSurface"):
+    """Split a (polynomial) B-spline surface into exact Bézier patches:
+    [(u0, u1, v0, v1, net), ...] — insertion along u then along v."""
+    if any(w != F(1) for row in surface.w for w in row):
+        raise ValueError("bezier extraction: polynomial surfaces only (K3.6)")
+    p, q = surface.p, surface.q
+    # --- u direction: treat each v-column of the net as a u-curve
+    U = list(surface.U)
+    cols = [[surface.cp[i][j] for i in range(surface.nu)]
+            for j in range(surface.nv)]
+    lo_u, hi_u = U[p], U[surface.nu]
+    int_u = sorted({u for u in U if lo_u < u < hi_u})
+    for u in int_u:
+        while U.count(u) < p:
+            newU = None
+            for j in range(len(cols)):
+                nu2, cols[j] = _insert_knot_once(p, U, cols[j], u)
+                newU = nu2
+            U = newU
+    # --- v direction on the refined net
+    V = list(surface.V)
+    rows = [[cols[j][i] for j in range(len(cols))]
+            for i in range(len(cols[0]))]
+    lo_v, hi_v = V[q], V[surface.nv]
+    int_v = sorted({v for v in V if lo_v < v < hi_v})
+    for v in int_v:
+        while V.count(v) < q:
+            newV = None
+            for i in range(len(rows)):
+                nv2, rows[i] = _insert_knot_once(q, V, rows[i], v)
+                newV = nv2
+            V = newV
+    ub = [lo_u] + int_u + [hi_u]
+    vb = [lo_v] + int_v + [hi_v]
+    patches = []
+    for a in range(len(ub) - 1):
+        for b in range(len(vb) - 1):
+            net = [[rows[a * p + i][b * q + j] for j in range(q + 1)]
+                   for i in range(p + 1)]
+            patches.append((ub[a], ub[a + 1], vb[b], vb[b + 1], net))
+    return patches

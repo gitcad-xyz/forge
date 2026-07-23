@@ -255,3 +255,131 @@ def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
             bad += 1
     return {"branches": len(branches), "points": pts, "uncertified": bad,
             "empty_certified": False}
+
+
+# -- K3.5: SSI over B-spline surfaces + ordered polylines ---------------------
+
+def _cluster(keys):
+    """Union-find over parameter boxes (closed-touch adjacency)."""
+    parent = list(range(len(keys)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def touch(k1, k2):
+        return (k1[0] <= k2[1] and k2[0] <= k1[1]
+                and k1[2] <= k2[3] and k2[2] <= k1[3])
+
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            if touch(keys[i], keys[j]):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+    groups = {}
+    for i, k in enumerate(keys):
+        groups.setdefault(find(i), []).append(k)
+    return list(groups.values())
+
+
+def ssi_surfaces(A, B, depth: int = 4):
+    """SSI between two (polynomial) B-spline surfaces: exact Bézier
+    extraction, pairwise subdivision detection, branch clustering in the
+    ORIGINAL parameter squares (branches crossing patch boundaries stay
+    one branch), certified points in global parameters."""
+    from forgekernel.nurbs import bezier_patches
+
+    pa = [BezierPatch(net, u0, u1, v0, v1)
+          for u0, u1, v0, v1, net in bezier_patches(A)]
+    pb = [BezierPatch(net, u0, u1, v0, v1)
+          for u0, u1, v0, v1, net in bezier_patches(B)]
+    all_pairs = []
+    for a in pa:
+        ba = a.bbox()
+        for b in pb:
+            if not _boxes_overlap(ba, b.bbox()):
+                continue                        # proven disjoint
+            _, pairs = ssi_branches(a, b, depth)
+            all_pairs.extend(pairs)
+    if not all_pairs:
+        return {"branches": 0, "points": [], "uncertified": 0,
+                "empty_certified": True}
+    cells = {}
+    for a, b in all_pairs:
+        cells.setdefault((a.u0, a.u1, a.v0, a.v1), (a, b))
+    branches = _cluster(list(cells))
+    pts, bad = [], 0
+    for key, (a, b) in cells.items():
+        um, vm = (a.u0 + a.u1) / 2, (a.v0 + a.v1) / 2
+        sm, tm = (b.u0 + b.u1) / 2, (b.v0 + b.v1) / 2
+        # local params inside the leaf patches are recovered by refine on
+        # the ORIGINAL patch nets: find the top patches containing these
+        # cells — the leaves carry global boxes, so evaluate via A directly
+        u, v, s, t, ok, _ = _refine_global(A, B, um, vm, sm, tm)
+        if ok:
+            pts.append((u, v, s, t))
+        else:
+            bad += 1
+    return {"branches": len(branches), "points": pts, "uncertified": bad,
+            "empty_certified": False}
+
+
+def _refine_global(A, B, u, v, s, t, iters: int = 12):
+    """refine_point against full B-spline surfaces (global parameters)."""
+    uf, vf, sf, tf = (float(x) for x in (u, v, s, t))
+    (au0, au1), (av0, av1) = A.domain()
+    (bu0, bu1), (bv0, bv1) = B.domain()
+    for _ in range(iters):
+        ur = F(uf).limit_denominator(10 ** 12)
+        vr = F(vf).limit_denominator(10 ** 12)
+        sr = F(sf).limit_denominator(10 ** 12)
+        tr = F(tf).limit_denominator(10 ** 12)
+        Sa, Au, Av = A.partials(ur, vr)
+        Sb, Bu, Bv = B.partials(sr, tr)
+        r = [float(Sa[c] - Sb[c]) for c in range(3)]
+        if max(abs(x) for x in r) < 1e-14:
+            break
+        J = [[float(Au[c]), float(Av[c]), -float(Bu[c]), -float(Bv[c])]
+             for c in range(3)]
+        JJT = [[sum(J[i][k] * J[j][k] for k in range(4)) for j in range(3)]
+               for i in range(3)]
+        y = _solve3f(JJT, [-x for x in r])
+        if y is None:
+            break
+        step = [sum(J[i][k] * y[i] for i in range(3)) for k in range(4)]
+        uf = min(au1, max(au0, uf + step[0]))
+        vf = min(av1, max(av0, vf + step[1]))
+        sf = min(bu1, max(bu0, sf + step[2]))
+        tf = min(bv1, max(bv0, tf + step[3]))
+    ur = F(uf).limit_denominator(10 ** 12)
+    vr = F(vf).limit_denominator(10 ** 12)
+    sr = F(sf).limit_denominator(10 ** 12)
+    tr = F(tf).limit_denominator(10 ** 12)
+    pa_ = A.eval(ur, vr)
+    pb_ = B.eval(sr, tr)
+    res2 = sum((pa_[c] - pb_[c]) ** 2 for c in range(3))
+    return ur, vr, sr, tr, res2 < F(1, 10 ** 20), res2
+
+
+def polyline(points_xyz):
+    """Order 3D points into a polyline by greedy nearest-neighbour
+    chaining from an extreme point (float; a render/report artifact —
+    the certified objects are the points themselves)."""
+    if not points_xyz:
+        return []
+    pts = [tuple(float(c) for c in p) for p in points_xyz]
+    start = max(range(len(pts)),
+                key=lambda i: sum((pts[i][c] - pts[0][c]) ** 2 for c in range(3)))
+    todo = set(range(len(pts)))
+    order = [start]
+    todo.discard(start)
+    while todo:
+        last = pts[order[-1]]
+        nxt = min(todo, key=lambda i: sum((pts[i][c] - last[c]) ** 2
+                                          for c in range(3)))
+        order.append(nxt)
+        todo.discard(nxt)
+    return [pts[i] for i in order]

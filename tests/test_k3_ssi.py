@@ -97,3 +97,59 @@ def test_subdivision_is_exact() -> None:
     # midpoint of the split boundary is the exact curve point
     assert left.net[-1][0] == right.net[0][0]
     assert all(isinstance(c, Fraction) for c in left.net[-1][0])
+
+
+# -- K3.5: Bézier extraction + SSI over B-splines + polylines -----------------
+
+def test_bezier_extraction_is_exact() -> None:
+    from forgekernel.nurbs import BSplineCurve, BSplineSurface, \
+        bezier_patches, bezier_segments
+    from forgekernel.ssi import _dc1, _eval_patch
+
+    c = BSplineCurve(2, [(0, 0, 0), (1, 2, 0), (3, 2, 0), (4, 0, 0)],
+                     [0, 0, 0, 1, 2, 2, 2])
+    segs = bezier_segments(c)
+    assert len(segs) == 2
+    for u0, u1, pts in segs:
+        for k in range(5):
+            t = F(k, 4)
+            assert _dc1(pts, t) == c.eval(u0 + t * (u1 - u0))   # bit-equal
+
+    net = [[(x, y, F(x * y, 3)) for y in range(3)] for x in range(4)]
+    s = BSplineSurface(2, 2, net, [0, 0, 0, 1, 2, 2, 2], [0, 0, 0, 1, 1, 1])
+    patches = bezier_patches(s)
+    assert len(patches) == 2
+    for u0, u1, v0, v1, pn in patches:
+        for a in range(3):
+            for b in range(3):
+                tu, tv = F(a, 2), F(b, 2)
+                assert _eval_patch(pn, tu, tv) == \
+                    s.eval(u0 + tu * (u1 - u0), v0 + tv * (v1 - v0))
+
+
+def test_ssi_branch_crosses_patch_boundary_unsplit() -> None:
+    from forgekernel.nurbs import BSplineSurface
+    from forgekernel.ssi import ssi_surfaces
+
+    plane = BSplineSurface(1, 1, [[(0, 0, 0), (0, 1, 0)],
+                                  [(2, 0, 0), (2, 1, 0)]], [0, 0, 2, 2], [0, 0, 1, 1])
+    # z = v − 1/2 on a B-spline with interior u-knot at 1: ONE line at
+    # v=1/2 running along u THROUGH the Bézier patch boundary — the
+    # clustering must not split it into two branches at the seam.
+    net = [[(x, 0, F(-1, 2)), (x, 1, F(1, 2))] for x in range(4)]
+    s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 2, 2, 2], [0, 0, 1, 1])
+    r = ssi_surfaces(plane, s, depth=4)
+    assert r["branches"] == 1
+    assert r["uncertified"] == 0
+    # every certified point sits at y = 1/2 in space
+    for u, v, _, _ in r["points"]:
+        assert abs(float(plane.eval(u, v)[1]) - 0.5) < 1e-9
+
+
+def test_polyline_orders_points_monotonically() -> None:
+    from forgekernel.ssi import polyline
+
+    pts = [(0.5, 0, 0), (0.1, 0, 0), (0.9, 0, 0), (0.3, 0, 0), (0.7, 0, 0)]
+    pl = polyline(pts)
+    xs = [p[0] for p in pl]
+    assert xs == sorted(xs) or xs == sorted(xs, reverse=True)
