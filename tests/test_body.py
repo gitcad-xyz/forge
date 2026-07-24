@@ -220,3 +220,199 @@ def test_a_whole_sphere_still_bounds_its_bbox() -> None:
 def test_a_singular_scale_is_refused() -> None:
     with pytest.raises(ValueError, match="zero scale factor"):
         B.Affine.scaling(0, 1, 1)
+
+
+_A, _a = 40 * 20, math.pi * 16
+_BOSS = 2700 + 96 * math.pi
+
+CENTROIDS = [
+    ("box", lambda: Solid.box(20, 20, 10), (10, 10, 5)),
+    # the trap: a planar cone's centroid is ¾ of the face's, but a cylindrical
+    # band's is NOT — decomposing the wall the same way puts this at z=3
+    ("cylinder", lambda: Cyl(0, 0, 5, 0, 12), (0, 0, 6)),
+    ("sphere off origin", lambda: Sphere(1, 2, 3, 6), (1, 2, 3)),
+    ("L-prism", lambda: prism(L_PRISM, 5), (3.875, 3.875, 2.5)),
+    # a hole pulls the centre of mass toward the remaining material
+    ("plate, off-centre bore",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(30, 10, 4, 0, 5)]),
+     ((_A * 20 - _a * 30) / (_A - _a), 10, 2.5)),
+    ("boss", lambda: DisjointUnion([Solid.box(30, 30, 3), Cyl(15, 15, 4, 3, 9)]),
+     (15, 15, (2700 * 1.5 + 96 * math.pi * 6) / _BOSS)),
+]
+
+
+@pytest.mark.parametrize("label,build,want", CENTROIDS,
+                         ids=[c[0] for c in CENTROIDS])
+def test_centre_of_mass_matches_the_analytic_value(label, build, want) -> None:
+    got = B.centroid(B.to_body(build()))
+    assert got == pytest.approx(want, abs=1e-9)
+
+
+def test_a_centroid_is_not_the_bbox_centre() -> None:
+    """The regression this replaces: mass_props reported the bbox centre and
+    flagged it with a key no caller read. On an L-bracket that is wrong by a
+    fifth of the part, presented as fact."""
+    body = B.to_body(prism(L_PRISM, 5))
+    lo, hi = B.bbox(body)
+    mid = tuple((lo[i] + hi[i]) / 2 for i in range(3))
+    got = B.centroid(body)
+    assert abs(got[0] - mid[0]) > 1.0 and abs(got[1] - mid[1]) > 1.0
+
+
+def test_a_centroid_rides_along_with_a_rigid_transform() -> None:
+    body = B.to_body(DrilledSolid(Solid.box(40, 20, 5), [Cyl(30, 10, 4, 0, 5)]))
+    c = B.centroid(body)
+    moved = B.Affine.translation(3, -7, 11)
+    assert B.centroid(body.transformed(moved)) == pytest.approx(
+        (c[0] + 3, c[1] - 7, c[2] + 11), abs=1e-9)
+    assert B.centroid(body.transformed(B.Affine.mirror("x"))) == pytest.approx(
+        (-c[0], c[1], c[2]), abs=1e-9)
+    assert B.centroid(body.transformed(B.Affine.scaling(2, 2, 2))) == \
+        pytest.approx(tuple(2 * x for x in c), abs=1e-9)
+
+
+def test_a_capped_faces_centroid_accounts_for_its_holes() -> None:
+    """faces_info weighted only the outer loop, so a drilled plate's cap
+    reported the plate centre no matter where the bore was."""
+    body = B.to_body(DrilledSolid(Solid.box(40, 20, 5), [Cyl(30, 10, 4, 0, 5)]))
+    cap = [f for f in B.faces_info(body)
+           if f["surface"] == "plane" and abs(f["plane"][2]) > 0.9][0]
+    assert cap["area"] == pytest.approx(_A - _a)
+    assert cap["centroid"][0] == pytest.approx((_A * 20 - _a * 30) / (_A - _a))
+
+
+def _slot_face():
+    """A slot outline in z=0: two straight flanks and two 180° arc ends. The
+    loop MIXES arcs and lines, so it is neither a polygon nor a whole circle.
+    """
+    from fractions import Fraction as Q
+
+    def P(x, y):
+        return (Q(x), Q(y), Q(0))
+
+    up, dn = (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0))
+    right = B.Circle(P(10, 0), up, dn, Q(3))
+    left = B.Circle(P(0, 0), up, dn, Q(3))
+    edges = (
+        B.Edge(B.Line(P(0, -3), (Q(10), Q(0), Q(0))), P(0, -3), P(10, -3)),
+        B.Edge(right, P(10, -3), P(10, 3)),
+        B.Edge(B.Line(P(10, 3), (Q(-10), Q(0), Q(0))), P(10, 3), P(0, 3)),
+        B.Edge(left, P(0, 3), P(0, -3)),
+    )
+    return B.Face(B.Plane(up, Q(0)), (B.Loop(edges),), True)
+
+
+def test_a_loop_mixing_arcs_and_lines_refuses_rather_than_chord_them() -> None:
+    """Walking a loop's v0 vertices turns every arc into a chord. For this
+    slot that silently drops both semicircular ends — 9π mm² of 60+9π, a 32%
+    under-report presented as an exact value."""
+    with pytest.raises(ValueError, match="mixing arcs and lines"):
+        B.volume(B.Body((_slot_face(),)))
+
+
+def test_the_display_mesh_still_follows_the_arcs() -> None:
+    """Refusing the EXACT area does not mean refusing to draw it — meshing is
+    a display property where floats are legal (ADR-0019)."""
+    mesh = B.tessellate(B.Body((_slot_face(),)), 0.002)
+    area = 0.0
+    for a, b, c in mesh["triangles"]:
+        va, vb, vc = (mesh["vertices"][i] for i in (a, b, c))
+        e1 = [vb[k] - va[k] for k in range(3)]
+        e2 = [vc[k] - va[k] for k in range(3)]
+        cr = (e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+              e1[0] * e2[1] - e1[1] * e2[0])
+        area += 0.5 * math.sqrt(sum(x * x for x in cr))
+    # chording both ends would give exactly the 10x6 rectangle, 60
+    assert area > 88.0
+    assert area == pytest.approx(60 + 9 * math.pi, rel=1e-3)
+
+
+def test_bbox_covers_an_arcs_bulge_past_its_endpoints() -> None:
+    lo, hi = B.bbox(B.Body((_slot_face(),)))
+    assert (lo[0], hi[0]) == pytest.approx((-3.0, 13.0))
+    assert (lo[1], hi[1]) == pytest.approx((-3.0, 3.0))
+
+
+def test_a_circle_split_into_three_arcs_is_still_one_circle() -> None:
+    """Only two-way splits were recognised; a third intersection turned the
+    bore into a 3-point 'polygon' of zero area."""
+    from fractions import Fraction as Q
+
+    c = B.Circle((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(5))
+    pts = [(Q(5), Q(0), Q(0)), (Q(3), Q(4), Q(0)), (Q(-5), Q(0), Q(0))]
+    loop = B.Loop(tuple(B.Edge(c, pts[i], pts[(i + 1) % 3]) for i in range(3)))
+    assert B._loop_is_circle(loop) == c
+    assert not B._loop_has_arcs(loop)
+
+
+def _non_manifold(mesh) -> int:
+    ec: dict = defaultdict(int)
+    for a, b, c in mesh["triangles"]:
+        for e in ((a, b), (b, c), (c, a)):
+            ec[tuple(sorted(e))] += 1
+    return sum(1 for n in ec.values() if n != 2)
+
+
+WHOLE_FACES = [
+    # a Solid's polys are BSP working units, not faces: a box arrives as 12
+    # triangles, an L-prism's caps ear-clipped into 4 each
+    ("box", lambda: Solid.box(20, 20, 10), 6, 12),
+    ("L-prism", lambda: prism(L_PRISM, 5), 8, 18),
+    ("drilled plate", lambda: DrilledSolid(Solid.box(40, 20, 5),
+                                           [Cyl(20, 10, 4, 0, 5)]), 7, 14),
+    # the ear-clip diagonal runs through the bore centre, so the hole belongs
+    # to NEITHER triangle — merging is what makes the question answerable
+    ("bore on the ear-clip seam",
+     lambda: DrilledSolid(prism([(0, 0), (20, 0), (20, 20), (0, 20)], 10), [])
+     .cut(Cyl(10, 10, 2, -1, 11)), 7, 14),
+    # a notch across the top: 8-gon section extruded, 8 walls + 2 caps
+    ("notched plate",
+     lambda: boolean("cut", Solid.box(40, 20, 10),
+                     translate(Solid.box(10, 20, 10), 15, 0, 6)), 10, None),
+]
+
+
+@pytest.mark.parametrize("label,build,nfaces,nedges", WHOLE_FACES,
+                         ids=[w[0] for w in WHOLE_FACES])
+def test_coplanar_fragments_merge_into_whole_faces(label, build, nfaces,
+                                                   nedges) -> None:
+    """One canonical Face per PLANAR REGION, not per BSP fragment. Fragments
+    are not merely verbose — they make "which face carries this feature?"
+    unanswerable, and a bore centred on an ear-clip diagonal lies inside
+    neither triangle."""
+    body = B.to_body(build())
+    assert len(body.faces) == nfaces
+    if nedges is not None:
+        assert len(B.edges_info(body)) == nedges
+
+
+@pytest.mark.parametrize("label,build,nfaces,nedges", WHOLE_FACES,
+                         ids=[w[0] for w in WHOLE_FACES])
+def test_merged_faces_still_mesh_watertight(label, build, nfaces,
+                                            nedges) -> None:
+    assert _non_manifold(B.tessellate(B.to_body(build()), 0.05)) == 0
+
+
+def test_a_boolean_t_junction_is_split_not_left_to_tear_the_mesh() -> None:
+    """A cut leaves one face's long edge facing two short ones. Volume never
+    notices; the mesh does — the seam is used once from the long side and
+    twice from the short, so an STL of a notched plate leaks."""
+    notched = boolean("cut", Solid.box(40, 20, 10),
+                      translate(Solid.box(10, 20, 10), 15, 0, 6))
+    body = B.to_body(notched)
+    assert _non_manifold(B.tessellate(body, 0.05)) == 0
+    assert B.volume(body) == PiVal(40 * 20 * 10 - 10 * 20 * 4, 0)
+
+
+def test_an_unmergeable_group_falls_back_to_its_fragments() -> None:
+    """Two coplanar squares touching at a single corner leave that vertex with
+    two ways out — the boundary is ambiguous, so keep honest fragments rather
+    than guess a loop."""
+    from fractions import Fraction as Q
+
+    def sq(x, y):
+        return [(Q(x), Q(y), Q(0)), (Q(x + 1), Q(y), Q(0)),
+                (Q(x + 1), Q(y + 1), Q(0)), (Q(x), Q(y + 1), Q(0))]
+
+    pl = B.Plane((Q(0), Q(0), Q(1)), Q(0))
+    assert B._merge_coplanar(pl, [sq(0, 0), sq(1, 1)]) is None

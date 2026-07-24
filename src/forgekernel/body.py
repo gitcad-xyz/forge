@@ -250,13 +250,50 @@ def _plane_point(pl: Plane) -> Vec:
 # total is exact — no sampling, no facets.
 
 def _loop_is_circle(loop: Loop):
-    if len(loop.edges) == 1 and isinstance(loop.edges[0].curve, Circle):
-        return loop.edges[0].curve
-    if (len(loop.edges) == 2
-            and all(isinstance(e.curve, Circle) for e in loop.edges)
-            and loop.edges[0].curve == loop.edges[1].curve):
-        return loop.edges[0].curve          # split into two half-circles
+    """The whole circle a loop traces, or None.
+
+    A loop is closed by construction, so any number of arcs that all lie on
+    the SAME circle and chain end to end must cover it exactly once — two
+    halves from a boolean split, three from a triple intersection.
+    """
+    es = loop.edges
+    if not es or not all(isinstance(e.curve, Circle) for e in es):
+        return None
+    if len(es) == 1 or all(e.curve == es[0].curve for e in es):
+        return es[0].curve
     return None
+
+
+def _loop_has_arcs(loop: Loop) -> bool:
+    """A loop with curved edges that is NOT one whole circle — a slot end, a
+    D-profile. Treating its vertices as a polygon quietly turns every arc into
+    a chord, so the exact paths refuse instead."""
+    return (any(isinstance(e.curve, Circle) for e in loop.edges)
+            and _loop_is_circle(loop) is None)
+
+
+def _arc_pts(c: Circle, v0, v1, deflection: float):
+    """Display sampling of one arc, from v0 round to v1 about the circle's
+    normal. Floats are legal here — this is meshing (ADR-0019)."""
+    r = float(c.r)
+    u = _unit(tuple(float(x) for x in c.ref))
+    w = _unit(_cross_f(tuple(float(x) for x in c.n), u))
+    cc = tuple(float(x) for x in c.c)
+
+    def ang(p):
+        q = [float(p[i]) - cc[i] for i in range(3)]
+        return math.atan2(sum(q[i] * w[i] for i in range(3)),
+                          sum(q[i] * u[i] for i in range(3)))
+
+    a0, a1 = ang(v0), ang(v1)
+    while a1 <= a0:
+        a1 += 2 * math.pi
+    step = (2 * math.acos(max(-1.0, 1 - deflection / r))
+            if r > deflection else math.pi / 12)
+    n = max(2, int(math.ceil((a1 - a0) / max(step, 1e-6))))
+    return [tuple(cc[i] + r * (math.cos(a0 + (a1 - a0) * k / n) * u[i]
+                               + math.sin(a0 + (a1 - a0) * k / n) * w[i])
+                  for i in range(3)) for k in range(n)]
 
 
 def _planar_loop_area2(loop: Loop, n: Vec):
@@ -334,6 +371,11 @@ def _face_volume_term(face: Face):
         for i, lp in enumerate(face.loops):
             circ = _loop_is_circle(lp)
             if circ is None:
+                if _loop_has_arcs(lp):
+                    raise ValueError(
+                        "planar loop mixing arcs and lines (a slot end, a "
+                        "D-profile) — its area is not in ℚ[π] with the chord "
+                        "treatment, so refuse rather than under-report (K3.7)")
                 a2 = _planar_loop_area2(lp, s.n)
                 rat += s.d * (a2 if i == 0 else -abs(a2)) / (6 * nn)
                 ln2 = _rational_sqrt(nn)
@@ -388,6 +430,74 @@ def _band_height(face: Face, cyl: Cylinder) -> Fraction:
     return (max(ts) - min(ts)) / ln
 
 
+def centroid(body: Body):
+    """Centre of mass, by the same per-face decomposition the volume uses.
+
+    Every face spans a cone back to the origin. That cone's volume is
+    ``(1/3)∮ x·n̂ dA`` — which is exactly what :func:`volume` sums — and its
+    first moment is ``(1/4)∮ x (x·n̂) dA``, closed-form per surface type. Both
+    decompositions are over the SAME cones, so the terms may be summed
+    together; mixing in a per-face form from a different decomposition (the
+    tempting "a planar cone's centroid is ¾ of the face's") silently puts a
+    cylinder's contribution in the wrong place — a Ø10×12 cylinder comes back
+    with its centre of mass at z=3 instead of z=6.
+
+    A centre of mass is a RATIO of ℚ[π] quantities and so leaves the field
+    (ADR-0019); floats are the honest boundary here, exactly as forge's other
+    ``centroid_f`` do. The volume it divides by stays exact.
+    """
+    m = [0.0, 0.0, 0.0]
+    for f in body.faces:
+        s = f.surface
+        sgn = 1.0 if f.sense else -1.0
+        if isinstance(s, Plane):
+            nf = _unit(tuple(float(x) for x in s.n))
+            acc, area = [0.0, 0.0, 0.0], 0.0
+            for i, lp in enumerate(f.loops):
+                circ = _loop_is_circle(lp)
+                if circ is not None:
+                    a = math.pi * float(circ.r) ** 2
+                    c = tuple(float(x) for x in circ.c)
+                else:
+                    vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
+                    a, c = _poly_area_centroid_f(vs, nf)
+                    a = abs(a)
+                w = a if i == 0 else -a
+                area += w
+                for k in range(3):
+                    acc[k] += c[k] * w
+            # x·n̂ is the constant plane offset, so ∮x(x·n̂)dA = h·∫x dA
+            h = sum(nf[k] * float(x) for k, x in enumerate(_plane_point(s)))
+            for k in range(3):
+                m[k] += sgn * 0.25 * h * acc[k]
+        elif isinstance(s, Cylinder):
+            h = float(_band_height(f, s))
+            d = _unit(tuple(float(x) for x in s.d))
+            q = tuple(float(x) for x in s.p)
+            ts = [sum((float(e.curve.c[k]) - q[k]) * d[k] for k in range(3))
+                  for lp in f.loops for e in lp.edges
+                  if isinstance(e.curve, Circle)]
+            t = (min(ts) + max(ts)) / 2
+            mid = tuple(q[k] + t * d[k] for k in range(3))       # axis midpoint
+            md = sum(mid[k] * d[k] for k in range(3))
+            r2h = math.pi * float(s.r) ** 2 * h
+            for k in range(3):
+                perp = mid[k] - md * d[k]
+                m[k] += sgn * 0.25 * r2h * (2 * mid[k] + perp)
+        elif isinstance(s, SphereS):
+            v = 4 / 3 * math.pi * float(s.r) ** 3
+            for k in range(3):
+                m[k] += sgn * v * float(s.c[k])
+        else:
+            raise ValueError(
+                f"centroid of a {type(s).__name__} face is not implemented "
+                "yet — arrives with K3.7")
+    v = float(volume(body))
+    if v == 0:
+        raise ValueError("centroid of a zero-volume body is undefined")
+    return tuple(x / v for x in m)
+
+
 def bbox(body: Body):
     """Float bbox of the body (a bound, not a topological decision)."""
     lo = [math.inf] * 3
@@ -412,6 +522,17 @@ def bbox(body: Body):
                     hi[i] = max(hi[i], float(c[i]) + ext)
                 continue
             for e in lp.edges:
+                if isinstance(e.curve, Circle):
+                    # an arc bulges past its endpoints; its whole circle is a
+                    # sound (if loose) bound, and a bound is all this promises
+                    c, r = e.curve.c, float(e.curve.r)
+                    nn = math.sqrt(float(dot(e.curve.n, e.curve.n))) or 1.0
+                    for i in range(3):
+                        ext = r * math.sqrt(
+                            max(0.0, 1 - (float(e.curve.n[i]) / nn) ** 2))
+                        lo[i] = min(lo[i], float(c[i]) - ext)
+                        hi[i] = max(hi[i], float(c[i]) + ext)
+                    continue
                 for v in (e.v0, e.v1):
                     for i in range(3):
                         lo[i] = min(lo[i], float(v[i]))
@@ -482,8 +603,15 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     pts, _ = circle_pts(circ)
                     rings.append([to2(p) for p in pts])
                 else:
-                    rings.append([to2(tuple(float(x) for x in e.v0))
-                                  for e in lp.edges])
+                    ring = []
+                    for e in lp.edges:
+                        # a slot end is an ARC — walking v0 alone chords it
+                        if isinstance(e.curve, Circle):
+                            ring.extend(_arc_pts(e.curve, e.v0, e.v1,
+                                                 deflection))
+                        else:
+                            ring.append(tuple(float(x) for x in e.v0))
+                    rings.append([to2(p) for p in ring])
             if not rings:
                 continue
             pts2, t2 = triangulate(rings[0], rings[1:])
@@ -602,22 +730,27 @@ def faces_info(body: Body) -> list[dict]:
         s = f.surface
         if isinstance(s, Plane):
             nf = _unit(tuple(float(x) for x in s.n))
-            pts, area = [], 0.0
+            # a hole subtracts from the area AND pulls the centroid: weighting
+            # only the outer loop put a drilled plate's cap centroid at the
+            # plate centre no matter where the bore was
+            acc, area, outer = [0.0, 0.0, 0.0], 0.0, None
             for i, lp in enumerate(f.loops):
                 circ = _loop_is_circle(lp)
                 if circ is not None:
                     a = math.pi * float(circ.r) ** 2
-                    area += a if i == 0 else -a
-                    if i == 0:
-                        pts.append((tuple(float(x) for x in circ.c), a))
+                    c = tuple(float(x) for x in circ.c)
                 else:
                     vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
                     a, c = _poly_area_centroid_f(vs, nf)
-                    area += a if i == 0 else -abs(a)
-                    if i == 0:
-                        pts.append((c, abs(a)))
-            tot = sum(w for _, w in pts) or 1.0
-            cen = [sum(p[i] * w for p, w in pts) / tot for i in range(3)]
+                    a = abs(a)
+                w = a if i == 0 else -a
+                area += w
+                for k in range(3):
+                    acc[k] += c[k] * w
+                if i == 0:
+                    outer = c
+            cen = ([acc[k] / area for k in range(3)] if area
+                   else list(outer or (0.0, 0.0, 0.0)))
             out.append({"surface": "plane", "plane": list(nf),
                         "centroid": cen, "area": abs(area)})
         elif isinstance(s, Cylinder):
@@ -642,15 +775,178 @@ def faces_info(body: Body) -> list[dict]:
 
 # -- converters: every representation becomes a Body -------------------------
 
+def _ring_face(pl: Plane, ring, holes=()) -> Face:
+    def loop(vs):
+        return Loop(tuple(Edge(Line(vs[i], sub(vs[(i + 1) % len(vs)], vs[i])),
+                               vs[i], vs[(i + 1) % len(vs)])
+                          for i in range(len(vs))))
+    return Face(pl, (loop(ring),) + tuple(loop(h) for h in holes), True)
+
+
+def _split_t_junctions(polys):
+    """Insert every vertex that lies in the INTERIOR of another polygon's edge.
+
+    A boolean leaves one face's long edge facing two short ones — a T-junction.
+    It is invisible to volume (the geometry is identical) but it tears the
+    mesh: the long edge is used once and each short edge once, so the shared
+    seam is non-manifold and an STL of a slotted plate leaks. Splitting is
+    exact — collinear is ``cross == 0``, between is ``0 < t < 1`` — and it is
+    also what lets coplanar fragments cancel and merge at all.
+
+    Zero-length edges are dropped: a degenerate edge has no interior, and
+    leaving it in would make the same vertex appear twice in a ring.
+    """
+    verts = sorted({v for vs in polys for v in vs})
+    out = []
+    for vs in polys:
+        ring = []
+        for i in range(len(vs)):
+            a, b = vs[i], vs[(i + 1) % len(vs)]
+            ring.append(a)
+            ab = sub(b, a)
+            if ab == (F(0), F(0), F(0)):
+                continue
+            lo = tuple(min(a[k], b[k]) for k in range(3))
+            hi = tuple(max(a[k], b[k]) for k in range(3))
+            den = dot(ab, ab)
+            hits = []
+            for p in verts:
+                if p == a or p == b:
+                    continue
+                if any(p[k] < lo[k] or p[k] > hi[k] for k in range(3)):
+                    continue
+                if cross(sub(p, a), ab) != (F(0), F(0), F(0)):
+                    continue
+                t = dot(sub(p, a), ab) / den
+                if 0 < t < 1:
+                    hits.append((t, p))
+            ring.extend(p for _, p in sorted(hits))
+        out.append(ring)                    # index-aligned with the input
+    return out
+
+
+def _ring_area2(ring, n):
+    acc = (F(0), F(0), F(0))
+    for i in range(len(ring)):
+        c = cross(ring[i], ring[(i + 1) % len(ring)])
+        acc = (acc[0] + c[0], acc[1] + c[1], acc[2] + c[2])
+    return dot(acc, n)
+
+
+def _ring_contains(ring, p, k):
+    """Even-odd, projected off the plane's dominant axis k. Exact."""
+    i, j = (k + 1) % 3, (k + 2) % 3
+    inside = False
+    for a in range(len(ring)):
+        b = (a + 1) % len(ring)
+        y1, y2 = ring[a][j], ring[b][j]
+        if (y1 > p[j]) != (y2 > p[j]):
+            x = ring[a][i] + (p[j] - y1) * (ring[b][i] - ring[a][i]) / (y2 - y1)
+            if p[i] < x:
+                inside = not inside
+    return inside
+
+
+def _plane_key(pl: Plane):
+    """Identify a plane by GEOMETRY, not by the normal's arbitrary length.
+
+    A ``Solid``'s plane normal is the raw cross product, so its magnitude is
+    twice the polygon's area — ear-clipping one L-shaped cap into unequal
+    triangles gives every fragment a DIFFERENT n for the same plane. Scaling
+    n and d together by a positive rational leaves the plane and its facing
+    untouched, and stays exact, so divide through by the leading component.
+    """
+    lead = next((x for x in pl.n if x != 0), None)
+    if lead is None:
+        return (pl.n, pl.d)
+    s = abs(lead)
+    return (tuple(x / s for x in pl.n), pl.d / s)
+
+
+def _merge_coplanar(pl: Plane, polys):
+    """Fuse coplanar polygons into whole faces by directed-edge cancellation.
+
+    Returns None — meaning "keep the fragments" — whenever the merge is not
+    provably area-preserving. A T-junction leaves an open chain, coplanar
+    faces touching at a point leave a vertex with two ways out; in both cases
+    a guessed loop would be worse than honest fragments.
+    """
+    if len(polys) == 1:
+        return [_ring_face(pl, polys[0])]
+
+    live: dict = {}
+    for vs in polys:
+        for i in range(len(vs)):
+            a, b = vs[i], vs[(i + 1) % len(vs)]
+            if live.get((b, a)):
+                live[(b, a)] -= 1
+                if not live[(b, a)]:
+                    del live[(b, a)]
+            else:
+                live[(a, b)] = live.get((a, b), 0) + 1
+    if not live:
+        return None
+
+    nxt: dict = {}
+    for (a, b), count in live.items():
+        if count != 1 or a in nxt:
+            return None                     # fan-out: the boundary is ambiguous
+        nxt[a] = b
+
+    rings, unused = [], set(nxt)
+    while unused:
+        start = next(iter(unused))
+        chain, v = [], start
+        while v in unused:
+            unused.discard(v)
+            chain.append(v)
+            v = nxt[v]
+        if v != start or len(chain) < 3:
+            return None                     # open chain: T-junction
+        rings.append(chain)
+
+    want = sum(_ring_area2(vs, pl.n) for vs in polys)
+    areas = [_ring_area2(r, pl.n) for r in rings]
+    if sum(areas) != want or any(a == 0 for a in areas):
+        return None                         # not area-preserving: bail
+
+    k = max(range(3), key=lambda i: abs(pl.n[i]))
+    outers = [(a, r) for a, r in zip(areas, rings) if a > 0]
+    holes = [r for a, r in zip(areas, rings) if a < 0]
+    if not outers:
+        return None
+    assigned: dict = {id(r): [] for _, r in outers}
+    for h in holes:
+        owner = min((o for o in outers if _ring_contains(o[1], h[0], k)),
+                    key=lambda o: o[0], default=None)
+        if owner is None:
+            return None
+        assigned[id(owner[1])].append(h)
+    return [_ring_face(pl, r, assigned[id(r)]) for _, r in outers]
+
+
 def from_solid(solid) -> Body:
-    """A planar forge ``Solid`` — each polygon becomes a planar face."""
+    """A planar forge ``Solid`` — planar faces, with coplanar polygons MERGED.
+
+    A ``Solid``'s polygons are the BSP's working units, not its faces: a prism
+    cap arrives ear-clipped into triangles and a boolean leaves a face split
+    along the cut. One canonical ``Face`` per fragment is not merely verbose,
+    it is WRONG for anything that asks *which face carries this feature*. A
+    Ø4 bore at the centre of a square cap straddles the ear-clip diagonal, so
+    it lies inside NEITHER fragment — the caps kept no hole at all and the
+    mesh came back with 48 non-manifold edges around an unclosed bore.
+    """
+    planes = [Plane(tuple(p.plane.n), p.plane.d) for p in solid.polys]
+    rings = _split_t_junctions([[tuple(v) for v in p.verts] for p in solid.polys])
+    groups: dict = {}
+    for pl, ring in zip(planes, rings):
+        if len(ring) >= 3:
+            groups.setdefault(_plane_key(pl), (pl, []))[1].append(ring)
     faces = []
-    for p in solid.polys:
-        vs = [tuple(v) for v in p.verts]
-        edges = tuple(Edge(Line(vs[i], sub(vs[(i + 1) % len(vs)], vs[i])),
-                           vs[i], vs[(i + 1) % len(vs)])
-                      for i in range(len(vs)))
-        faces.append(Face(Plane(p.plane.n, p.plane.d), (Loop(edges),), True))
+    for pl, polys in groups.values():
+        merged = _merge_coplanar(pl, polys)
+        faces.extend(merged if merged is not None
+                     else [_ring_face(pl, vs) for vs in polys])
     return Body(tuple(faces))
 
 
