@@ -74,6 +74,19 @@ def _poly_mul(a, b):
     return out
 
 
+def _poly_add(a, b):
+    out = [F(0)] * max(len(a), len(b))
+    for i, ai in enumerate(a):
+        out[i] += ai
+    for j, bj in enumerate(b):
+        out[j] += bj
+    return out
+
+
+def _poly_sub(a, b):
+    return _poly_add(a, [-c for c in b])
+
+
 def _poly_deriv(a):
     return [a[i] * i for i in range(1, len(a))] or [F(0)]
 
@@ -109,33 +122,52 @@ class LoftSolid:
         Mz = natural_spline_M(zs)
         return xs, ys, zs, Mx, My, Mz
 
-    def volume(self) -> Fraction:
+    def _moments(self):
+        """Signed volume and the three first moments (∫x dV, ∫y dV, ∫z dV),
+        all exact ℚ. Volume ``V = ∫ A(v) z'(v) dv`` with A the shoelace
+        cross-section area; the moments add the polygon area-moments
+        ``Qx = ∫∫ x dA`` and ``Qy = ∫∫ y dA`` (exact for a polygon) and the
+        ``z·A`` integrand. The section-loop orientation cancels in every
+        centroid ratio because A, Qx, Qy all carry the same signed factor."""
         xs, ys, zs, Mx, My, Mz = self._splines()
-        total = F(0)
+        Vs = Ix = Iy = Iz = F(0)
         for seg in range(self.n - 1):
-            # per-vertex cubic polys on this segment
             xpoly = [_seg_cubic(xs[j][seg], xs[j][seg + 1],
                                 Mx[j][seg], Mx[j][seg + 1]) for j in range(self.m)]
             ypoly = [_seg_cubic(ys[j][seg], ys[j][seg + 1],
                                 My[j][seg], My[j][seg + 1]) for j in range(self.m)]
             zpoly = _seg_cubic(zs[seg], zs[seg + 1], Mz[seg], Mz[seg + 1])
-            # shoelace area A(s) = ½ Σ (x_j y_{j+1} − x_{j+1} y_j)
-            area = [F(0)]
+            zprime = _poly_deriv(zpoly)
+            area = [F(0)]           # A(s) = ½ Σ cross_j
+            qx = [F(0)]             # ∫∫ x dA = ⅙ Σ (x_j+x_k)·cross_j
+            qy = [F(0)]             # ∫∫ y dA = ⅙ Σ (y_j+y_k)·cross_j
             for j in range(self.m):
                 k = (j + 1) % self.m
-                term = [c for c in _poly_mul(xpoly[j], ypoly[k])]
-                term2 = _poly_mul(xpoly[k], ypoly[j])
-                for i, c in enumerate(term):
-                    while len(area) <= i:
-                        area.append(F(0))
-                    area[i] += c / 2
-                for i, c in enumerate(term2):
-                    while len(area) <= i:
-                        area.append(F(0))
-                    area[i] -= c / 2
-            zprime = _poly_deriv(zpoly)
-            total += _poly_integ01(_poly_mul(area, zprime))
-        return abs(total)
+                cross = _poly_sub(_poly_mul(xpoly[j], ypoly[k]),
+                                  _poly_mul(xpoly[k], ypoly[j]))
+                area = _poly_add(area, cross)
+                qx = _poly_add(qx, _poly_mul(_poly_add(xpoly[j], xpoly[k]), cross))
+                qy = _poly_add(qy, _poly_mul(_poly_add(ypoly[j], ypoly[k]), cross))
+            area = [c / 2 for c in area]
+            qx = [c / 6 for c in qx]
+            qy = [c / 6 for c in qy]
+            Vs += _poly_integ01(_poly_mul(area, zprime))
+            Ix += _poly_integ01(_poly_mul(qx, zprime))
+            Iy += _poly_integ01(_poly_mul(qy, zprime))
+            Iz += _poly_integ01(_poly_mul(_poly_mul(zpoly, area), zprime))
+        return Vs, Ix, Iy, Iz
+
+    def volume(self) -> Fraction:
+        return abs(self._moments()[0])
+
+    def centroid(self):
+        """Exact centroid in ℚ³ — the true first-moment centroid, not the
+        bbox centre. Signed volume and moments share orientation, so the
+        ratio is orientation-independent."""
+        Vs, Ix, Iy, Iz = self._moments()
+        if Vs == 0:
+            raise ValueError("loft: degenerate (zero signed volume)")
+        return (Ix / Vs, Iy / Vs, Iz / Vs)
 
     def bbox_f(self):
         lo = [float("inf")] * 3
@@ -148,5 +180,6 @@ class LoftSolid:
         return tuple(lo), tuple(hi)
 
     def centroid_f(self):
-        (x0, y0, z0), (x1, y1, z1) = self.bbox_f()
-        return ((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2)
+        """Float centroid, derived from the exact :meth:`centroid` (not the
+        bbox centre — that is only correct for a symmetric loft)."""
+        return tuple(float(c) for c in self.centroid())

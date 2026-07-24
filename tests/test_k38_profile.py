@@ -69,3 +69,25 @@ def test_splineprism_guards() -> None:
     pr = SplinePrism([0, 0], sq, 2, base_z=5)
     (_, _, z0), (_, _, z1) = pr.bbox_f()
     assert (z0, z1) == (5.0, 7.0)
+
+
+def test_splineprism_centroid_is_exact_polygon_centroid() -> None:
+    # right triangle (0,0)-(6,0)-(0,3): area centroid exactly (2,1); z at h/2
+    tri = [{"kind": "line", "to": [6, 0]}, {"kind": "line", "to": [0, 3]}]
+    pr = SplinePrism([0, 0], tri, 5)
+    assert pr.centroid() == (F(2), F(1), F(5, 2))
+    assert all(isinstance(c, Fraction) for c in pr.centroid())
+
+
+def test_splineprism_centroid_beats_bbox_for_asymmetric_bezier() -> None:
+    # a curved profile that is NOT vertically centred in its bbox — the true
+    # area centroid (y = 51/22) differs sharply from the bbox centre (y=3.5),
+    # which is exactly the approximation the old centroid_f returned.
+    prof = [{"kind": "line", "to": [10, 0]},
+            {"kind": "spline", "to": [0, 0], "ctrl": [[12, 7], [-2, 7]]}]
+    pr = SplinePrism([0, 0], prof, 5)
+    cx, cy, cz = pr.centroid()
+    assert cx == F(5) and cz == F(5, 2)          # x symmetric, z mid-height
+    assert cy == F(51, 22)                        # exact area centroid ≈ 2.318
+    (x0, y0, _), (x1, y1, _) = pr.bbox_f()
+    assert cy != F(y0 + y1) / 2                    # ≠ bbox centre (3.5)

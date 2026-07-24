@@ -67,9 +67,10 @@ def segments_to_beziers(start, segments):
     return beziers
 
 
-def exact_area(start, segments) -> Fraction:
+def exact_signed_area(start, segments) -> Fraction:
     """Signed area of the closed profile via Green's theorem — exact ℚ.
-    Returns the absolute area (a positive Fraction)."""
+    CCW positive. Keep the sign when pairing with the area moments so the
+    orientation cancels in the centroid ratio."""
     beziers = segments_to_beziers(start, segments)
     total = F(0)
     for bez in beziers:
@@ -88,7 +89,33 @@ def exact_area(start, segments) -> Fraction:
                 dx, dy = _bezier2(dctrl, t)
                 seg_int += w * (x * dy - y * dx) / 2
             total += seg_int
-    return abs(total)
+    return total
+
+
+def exact_area(start, segments) -> Fraction:
+    """Absolute enclosed area (a positive Fraction), exact ℚ."""
+    return abs(exact_signed_area(start, segments))
+
+
+def exact_moments(start, segments):
+    """First area moments (Qx = ∫∫ x dA, Qy = ∫∫ y dA) of the closed profile
+    via Green's theorem — exact ℚ. Qx = ∮ ½x² dy and Qy = −∮ ½y² dx; the
+    integrand ``x²·y'`` has degree ≤ 3p−1 over a degree-p Bézier, so 3p
+    interpolatory nodes integrate it exactly. Signs follow the loop
+    orientation (pair with :func:`exact_signed_area`)."""
+    beziers = segments_to_beziers(start, segments)
+    qx = qy = F(0)
+    for bez in beziers:
+        dctrl = _bezier2_d(bez)
+        p = len(bez) - 1
+        nn = _nodes(3 * p)
+        ww = _lagrange_weights(nn)
+        for w, t in zip(ww, nn):
+            x, y = _bezier2(bez, t)
+            dx, dy = _bezier2(dctrl, t)
+            qx += w * (x * x) / 2 * dy
+            qy += w * (-(y * y)) / 2 * dx
+    return qx, qy
 
 
 def _boundary_is_simple(start, segments, samples: int = 16) -> bool:
@@ -165,9 +192,19 @@ class SplinePrism:
         return ((min(xs), min(ys), min(z0, z1)),
                 (max(xs), max(ys), max(z0, z1)))
 
+    def centroid(self):
+        """Exact centroid in ℚ³. The profile's area centroid (Green's-theorem
+        first moments ÷ signed area) in x, y; the extrusion mid-height in z.
+        Orientation cancels because moments and area share the signed factor."""
+        a = exact_signed_area(self.start, self.segments)
+        qx, qy = exact_moments(self.start, self.segments)
+        return (qx / a, qy / a, self.z0 + self.h / 2)
+
     def centroid_f(self):
-        (x0, y0, z0), (x1, y1, z1) = self.bbox_f()
-        return ((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2)
+        """Float centroid derived from the exact :meth:`centroid` — the
+        profile's true area centroid, not the bbox centre (which is wrong
+        for an asymmetric profile)."""
+        return tuple(float(c) for c in self.centroid())
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         beziers = segments_to_beziers(self.start, self.segments)
