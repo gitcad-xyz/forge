@@ -77,6 +77,45 @@ def test_certified_residual_is_exact_rational() -> None:
     assert res2 < F(1, 10 ** 20)
 
 
+def test_ssi_fuzz_certified_points_lie_on_both_graphs() -> None:
+    """Validation gauntlet — fuzz SSI over random bilinear GRAPH patches
+    z=f(x,y) over [0,1]². Every certified point must lie on BOTH graphs
+    (spatial residual ~0); because a graph's eval(x,y) returns (x,y,·), that
+    forces the two parameter pairs to agree (u=s, v=t). A decidable
+    correctness net for the SSI core that ssi_curves now builds on.
+    Deterministic (seeded) so a failure reproduces exactly."""
+    import random
+
+    from forgekernel.ssi import _eval_patch
+
+    rng = random.Random(20260724)
+
+    def graph(z):     # bilinear graph, corner heights z = [z00, z01, z10, z11]
+        return BezierPatch([[(0, 0, z[0]), (0, 1, z[1])],
+                            [(1, 0, z[2]), (1, 1, z[3])]])
+
+    hits = empties = 0
+    for _ in range(40):
+        A = graph([F(rng.randint(-3, 3)) for _ in range(4)])
+        B = graph([F(rng.randint(-3, 3)) for _ in range(4)])
+        r = ssi(A, B, depth=4)
+        # SSI is symmetric: swapping operands finds the same branch count
+        assert ssi(B, A, depth=4)["branches"] == r["branches"]
+        if r["empty_certified"]:
+            empties += 1
+        if r["points"]:
+            hits += 1
+        for u, v, s, t in r["points"]:
+            pa, pb = _eval_patch(A.net, u, v), _eval_patch(B.net, s, t)
+            assert (pa[0], pa[1]) == (u, v)       # graph eval is exact in x,y
+            assert (pb[0], pb[1]) == (s, t)
+            d2 = sum((pa[c] - pb[c]) ** 2 for c in range(3))
+            assert d2 < F(1, 10 ** 18)            # points coincide in space
+            assert abs(float(u) - float(s)) < 1e-6 and abs(float(v) - float(t)) < 1e-6
+    # the fuzz actually drives both the hit path and the certified-empty path
+    assert hits >= 5 and empties >= 3
+
+
 def test_resolution_semantics_merge_not_miss() -> None:
     # two lines 1/10 apart: z=(u-1/2)^2 - 1/400 → zeros at 1/2 ± 1/20.
     # At depth 3 (cell 1/8) they merge into one reported branch; at depth
