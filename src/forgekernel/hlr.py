@@ -183,12 +183,18 @@ def _circle(cx, cy, r, z, segs):
             for k in range(segs + 1)]
 
 
+def _circle_segs(r, deflection):
+    """Facet count for a circle of radius ``r`` at chord error ``deflection``."""
+    if r <= deflection:
+        return 24
+    return max(24, int(math.ceil(math.pi / math.acos(max(-1.0, 1.0 - deflection / r)))))
+
+
 def _cyl_edges(c, view, deflection):
     """A z-axis cylinder's drawing edges: the two rim circles plus, when the
     view is not down the axis, the two silhouette generators."""
     cx, cy, r, z0, z1 = _cyl_tuple(c)
-    segs = max(24, int(math.ceil(math.pi / math.acos(max(-1.0, 1.0 - deflection / r))))
-               if r > deflection else 24)
+    segs = _circle_segs(r, deflection)
     out = [_circle(cx, cy, r, z0, segs), _circle(cx, cy, r, z1, segs)]
     lx, ly = view.look[0], view.look[1]           # axis is +z; silhouette needs
     m = math.hypot(lx, ly)                         # the in-plane look component
@@ -297,3 +303,221 @@ def hidden_line(solid, direction, xdir, *, deflection=0.05):
         visible += [p for p in v if len(p) >= 2]
         hidden += [p for p in h if len(p) >= 2]
     return {"visible": visible, "hidden": hidden}
+
+
+# -- section curves (plane ∩ solid boundary) ----------------------------------
+#
+# A section view cuts the solid with a plane and draws the intersection of that
+# plane with the solid's *surface* — the closed loops the section engine chains
+# and hatches. Like HLR this is a display computation (floats legal); the plane
+# and the solid it cuts are exact. The plane is ``{P : dot(P, direction)=offset}``
+# (``direction`` is the view/look axis, so the section lies flat in the sheet).
+
+def _plane_from(direction, offset):
+    """Cut plane as a unit normal + signed distance ``dot(P, n) = d``."""
+    raw = _f3(direction)
+    scale = math.sqrt(_dot(raw, raw)) or 1.0
+    return _norm(raw), float(offset) / scale
+
+
+def _det3(m):
+    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+
+def _two_plane_point(n1, d1, n2, d2, u):
+    """A point on the line where planes (n1,d1) and (n2,d2) meet; ``u=n1×n2``."""
+    m = [list(n1), list(n2), list(u)]
+    det = _det3(m)
+    if abs(det) < 1e-16:
+        return (0.0, 0.0, 0.0)
+    rhs = (d1, d2, 0.0)
+    out = []
+    for j in range(3):
+        mj = [row[:] for row in m]
+        for i in range(3):
+            mj[i][j] = rhs[i]
+        out.append(_det3(mj) / det)
+    return tuple(out)
+
+
+def _line_in_convex(p0, u, poly, fn):
+    """λ-interval of ``p0+λu`` inside a convex planar polygon (normal ``fn``),
+    found by the two boundary crossings — winding-agnostic."""
+    lambdas = []
+    m = len(poly)
+    for i in range(m):
+        a, b = poly[i], poly[(i + 1) % m]
+        e = _sub(b, a)
+        en = _cross(fn, e)
+        denom = _dot(u, en)
+        if abs(denom) < 1e-15:
+            continue
+        lam = _dot(_sub(a, p0), en) / denom
+        pt = _add(p0, _mul(u, lam))
+        ee = _dot(e, e) or 1.0
+        s = _dot(_sub(pt, a), e) / ee
+        if -1e-9 <= s <= 1 + 1e-9:
+            lambdas.append(lam)
+    if len(lambdas) < 2:
+        return None
+    return (min(lambdas), max(lambdas))
+
+
+def _circle_lambdas(p0, u, c3, r):
+    """λ-interval where ``p0+λu`` lies inside the circle (centre ``c3``, radius
+    ``r``, both in the line's plane), or None."""
+    w = _sub(p0, c3)
+    a = _dot(u, u)
+    b = 2.0 * _dot(w, u)
+    c = _dot(w, w) - r * r
+    disc = b * b - 4 * a * c
+    if disc <= 1e-12 or a < 1e-16:
+        return None
+    sq = math.sqrt(disc)
+    return ((-b - sq) / (2 * a), (-b + sq) / (2 * a))
+
+
+def _subtract(intervals, lo, hi):
+    out = []
+    for a, b in intervals:
+        if hi <= a or lo >= b:
+            out.append((a, b))
+            continue
+        if a < lo:
+            out.append((a, lo))
+        if hi < b:
+            out.append((hi, b))
+    return out
+
+
+def _planar_face_section(poly, fn, nc, dc, bores):
+    """Segments of the cut plane across one planar face, with any bore disks
+    that open onto the face subtracted (so through-holes stay clear)."""
+    u = _cross(nc, fn)
+    if _dot(u, u) < 1e-16:
+        return []                        # face parallel to the cut plane
+    df = _dot(fn, poly[0])
+    p0 = _two_plane_point(nc, dc, fn, df, u)
+    span = _line_in_convex(p0, u, poly, fn)
+    if span is None:
+        return []
+    intervals = [span]
+    nfu = _norm(fn)
+    if abs(nfu[2]) > 0.99:               # a z-cap face — bores open onto it
+        zf = float(poly[0][2])
+        for cx, cy, r, z0, z1 in bores:
+            if abs(zf - z0) < 1e-6 or abs(zf - z1) < 1e-6:
+                hit = _circle_lambdas(p0, u, (cx, cy, zf), r)
+                if hit:
+                    intervals = _subtract(intervals, hit[0], hit[1])
+    segs = []
+    for a, b in intervals:
+        if b - a > 1e-9:
+            segs.append((_add(p0, _mul(u, a)), _add(p0, _mul(u, b))))
+    return segs
+
+
+def _cyl_wall_section(c, nc, dc, deflection):
+    """Segments where the cut plane crosses a z-cylinder's wall. Two vertical
+    generators when the plane is parallel to the axis; a sampled ellipse/circle
+    otherwise."""
+    cx, cy, r, z0, z1 = _cyl_tuple(c)
+    nx, ny, nz = nc
+    a0 = nx * cx + ny * cy
+    if abs(nz) < 1e-9:                    # plane parallel to the axis
+        mag = r * math.hypot(nx, ny)
+        if mag < 1e-12:
+            return []
+        cth = (dc - a0) / mag
+        if cth < -1 - 1e-9 or cth > 1 + 1e-9:
+            return []
+        phi = math.atan2(ny, nx)
+        ac = math.acos(max(-1.0, min(1.0, cth)))
+        out = []
+        for th in {phi + ac, phi - ac}:
+            x, y = cx + r * math.cos(th), cy + r * math.sin(th)
+            out.append(((x, y, z0), (x, y, z1)))
+        return out
+    segs = _circle_segs(r, deflection)   # plane crosses the axis: sample θ
+    prev = None
+    out = []
+    for k in range(segs + 1):
+        th = 2 * math.pi * k / segs
+        x, y = cx + r * math.cos(th), cy + r * math.sin(th)
+        z = (dc - nx * x - ny * y) / nz
+        cur = (x, y, z) if z0 - 1e-9 <= z <= z1 + 1e-9 else None
+        if prev is not None and cur is not None:
+            out.append((prev, cur))
+        prev = cur
+    return out
+
+
+def _cyl_cap_sections(c, nc, dc):
+    cx, cy, r, z0, z1 = _cyl_tuple(c)
+    out = []
+    for zc in (z0, z1):
+        fn = (0.0, 0.0, 1.0)
+        u = _cross(nc, fn)
+        if _dot(u, u) < 1e-16:
+            continue
+        p0 = _two_plane_point(nc, dc, fn, zc, u)
+        hit = _circle_lambdas(p0, u, (cx, cy, zc), r)
+        if hit:
+            out.append((_add(p0, _mul(u, hit[0])), _add(p0, _mul(u, hit[1]))))
+    return out
+
+
+def _mesh_section(solid, nc, dc):
+    try:
+        mesh = solid.tessellate()
+    except Exception:                    # noqa: BLE001
+        return []
+    verts = [tuple(float(x) for x in v) for v in mesh["vertices"]]
+    out = []
+    for tri in mesh["triangles"]:
+        pts = [verts[i] for i in tri]
+        hits = []
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            pa, pb = pts[a], pts[b]
+            da, db = _dot(pa, nc) - dc, _dot(pb, nc) - dc
+            if (da <= 0 < db) or (db <= 0 < da):
+                t = da / (da - db)
+                hits.append(_add(pa, _mul(_sub(pb, pa), t)))
+        if len(hits) == 2:
+            out.append((hits[0], hits[1]))
+    return out
+
+
+def _section_segments(solid, nc, dc, deflection):
+    name = type(solid).__name__
+    if name == "Solid":
+        return [s for poly, fn in _solid_polys_n(solid)
+                for s in _planar_face_section(poly, fn, nc, dc, [])]
+    if name == "DrilledSolid":
+        bores = [_cyl_tuple(x) for x in solid.bores]
+        out = [s for poly, fn in _solid_polys_n(solid.base)
+               for s in _planar_face_section(poly, fn, nc, dc, bores)]
+        for x in solid.bores:
+            out += _cyl_wall_section(x, nc, dc, deflection)
+        return out
+    if name == "Cyl":
+        return (_cyl_wall_section(solid, nc, dc, deflection)
+                + _cyl_cap_sections(solid, nc, dc))
+    if name == "DisjointUnion":
+        out = []
+        for m in solid.members:
+            out += _section_segments(m, nc, dc, deflection)
+        return out
+    return _mesh_section(solid, nc, dc)
+
+
+def section_polys(solid, direction, xdir, offset, *, deflection=0.05):
+    """Cut ``solid`` with the plane ``dot(P, direction)=offset`` and return the
+    section curves as 2D segments ``[[(x,y),(x,y)], …]`` in the same sheet frame
+    ``hidden_line`` uses, so a section view overlays its projection exactly."""
+    view = _View(direction, xdir)
+    nc, dc = _plane_from(direction, offset)
+    return [[view.xy(a), view.xy(b)]
+            for a, b in _section_segments(solid, nc, dc, deflection)]
