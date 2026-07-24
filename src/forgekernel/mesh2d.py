@@ -30,9 +30,19 @@ class _Node:
         self.steiner = False
 
 
-def triangulate(outer: list[Pt], holes: list[list[Pt]] = ()) -> tuple[list[Pt], list[tuple[int, int, int]]]:
+def triangulate(outer: list[Pt], holes: list[list[Pt]] = (), *,
+                keep_collinear: bool = False):
     """Triangulate ``outer`` minus ``holes``; returns ``(points, triangles)``
-    with triangle indices into points."""
+    with triangle indices into points.
+
+    ``keep_collinear`` preserves ring vertices that sit mid-edge. Dropping
+    them is right for a lone polygon and WRONG for a face of a solid: they are
+    T-junction seams shared with a neighbouring face, and earcut drops them on
+    one face while a hole bridge happens to keep them on the other — so the
+    two faces meet along mismatched edges and the shell cracks. A plate with a
+    square through-hole came out with 12 unpaired edges: the mesh volume is
+    right, so nothing downstream notices until the STL fails to print.
+    """
     pts: list[Pt] = list(outer)
     hole_indices = []
     for h in holes:
@@ -41,16 +51,32 @@ def triangulate(outer: list[Pt], holes: list[list[Pt]] = ()) -> tuple[list[Pt], 
 
     flat = [c for p in pts for c in p]
     tris: list[int] = []
-    outer_node = _linked_list(flat, 0, len(outer) * 2, 2, True)
+    outer_node = _linked_list(flat, 0, len(outer) * 2, 2, True, keep_collinear)
     if outer_node is None or outer_node.next is outer_node.prev:
         return pts, []
     if hole_indices:
-        outer_node = _eliminate_holes(flat, hole_indices, outer_node, 2)
+        outer_node = _eliminate_holes(flat, hole_indices, outer_node, 2,
+                                      keep_collinear)
     _earcut_linked(outer_node, tris, 2)
     return pts, [(tris[i], tris[i + 1], tris[i + 2]) for i in range(0, len(tris), 3)]
 
 
-def _linked_list(data, start, end, dim, clockwise):
+def _mark_collinear_steiner(last):
+    """Flag every mid-edge vertex so _filter_points keeps it. Exact-duplicate
+    vertices are deliberately left removable — earcut needs those gone."""
+    if last is None:
+        return
+    p = last
+    while True:
+        if (not _equals(p, p.next) and not _equals(p, p.prev)
+                and _area(p.prev, p, p.next) == 0):
+            p.steiner = True
+        p = p.next
+        if p is last:
+            break
+
+
+def _linked_list(data, start, end, dim, clockwise, keep_collinear=False):
     last = None
     if clockwise == (_signed_area(data, start, end, dim) > 0):
         for i in range(start, end, dim):
@@ -61,6 +87,8 @@ def _linked_list(data, start, end, dim, clockwise):
     if last is not None and _equals(last, last.next):
         _remove_node(last)
         last = last.next
+    if keep_collinear:
+        _mark_collinear_steiner(last)
     return last
 
 
@@ -160,11 +188,11 @@ def _split_earcut(start, triangles, dim):
             break
 
 
-def _eliminate_holes(data, hole_indices, outer_node, dim):
+def _eliminate_holes(data, hole_indices, outer_node, dim, keep_collinear=False):
     queue = []
     for i, start in enumerate(hole_indices):
         end = hole_indices[i + 1] * dim if i + 1 < len(hole_indices) else len(data)
-        lst = _linked_list(data, start * dim, end, dim, False)
+        lst = _linked_list(data, start * dim, end, dim, False, keep_collinear)
         if lst is lst.next:
             lst.steiner = True
         queue.append(_left_most(lst))

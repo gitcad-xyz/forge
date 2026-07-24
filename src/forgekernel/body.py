@@ -259,9 +259,11 @@ def _loop_is_circle(loop: Loop):
     es = loop.edges
     if not es or not all(isinstance(e.curve, Circle) for e in es):
         return None
-    if len(es) == 1 or all(e.curve == es[0].curve for e in es):
-        return es[0].curve
-    return None
+    if len(es) == 1:
+        # a LONE edge is only the whole circle when it closes on itself; a
+        # single proper arc reported a quarter-disc's area as the full πr²
+        return es[0].curve if es[0].v0 == es[0].v1 else None
+    return es[0].curve if all(e.curve == es[0].curve for e in es) else None
 
 
 def _loop_has_arcs(loop: Loop) -> bool:
@@ -272,9 +274,34 @@ def _loop_has_arcs(loop: Loop) -> bool:
             and _loop_is_circle(loop) is None)
 
 
+def _refuse_arc_loop(loop: Loop) -> None:
+    """Every measurement path must decline the same loops.
+
+    ``_face_volume_term`` refused a mixed arc/line loop while ``faces_info``
+    and ``centroid`` walked its vertices as a polygon — two paths, two answers
+    for one face: a quarter disc measured 0.5 against a true πr²/4 = 0.785,
+    and reported it as fact.
+    """
+    if _loop_has_arcs(loop):
+        raise ValueError(
+            "planar loop mixing arcs and lines (a slot end, a D-profile) — "
+            "chording it under-reports the area, so refuse (K3.7)")
+
+
 def _arc_pts(c: Circle, v0, v1, deflection: float):
     """Display sampling of one arc, from v0 round to v1 about the circle's
-    normal. Floats are legal here — this is meshing (ADR-0019)."""
+    normal. Floats are legal here — this is meshing (ADR-0019).
+
+    CONTRACT: an ``Edge`` on a ``Circle`` runs COUNTER-CLOCKWISE about
+    ``curve.n``, from v0 to v1. An edge written the other way round is not an
+    error anyone detects — it silently means the COMPLEMENTARY arc, so a
+    quarter disc written backwards meshes as the other three quarters. A face
+    that needs the reverse sweep must carry a circle with ``-n``.
+    """
+    if dot(c.ref, c.n) != 0:
+        raise ValueError(
+            "circle reference direction is not perpendicular to its normal — "
+            "the sampled points would not lie on the circle at all")
     r = float(c.r)
     u = _unit(tuple(float(x) for x in c.ref))
     w = _unit(_cross_f(tuple(float(x) for x in c.n), u))
@@ -430,6 +457,68 @@ def _band_height(face: Face, cyl: Cylinder) -> Fraction:
     return (max(ts) - min(ts)) / ln
 
 
+def _stitch_cracks(verts, tris, rounds: int = 40):
+    """Split any triangle edge that another vertex lies on. Returns triangles.
+
+    Exact T-junction splitting at the FACE level is necessary but not
+    sufficient: two faces that share a seam are triangulated independently, in
+    their own 2D frames, and the mesher is free to route the seam differently
+    on each side. The result is a hairline crack — the volume is right, so
+    nothing notices until an STL will not print.
+
+    This is the mesh-level counterpart, and it is deliberately the LAST word:
+    whatever the mesher decided, an edge with a vertex sitting on it gets
+    split. Floats and a tolerance are legal here — meshing is a display
+    property (ADR-0019) and no topology decision rides on it.
+    """
+    for _ in range(rounds):
+        use: dict = {}
+        for t in tris:
+            for e in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+                use[tuple(sorted(e))] = use.get(tuple(sorted(e)), 0) + 1
+        open_edges = {e for e, n in use.items() if n != 2}
+        if not open_edges:
+            break
+        # only vertices touching an open edge can heal one
+        live = sorted({i for e in open_edges for i in e})
+        out, healed = [], False
+        for t in tris:
+            best = None
+            for k in range(3):
+                ia, ib = t[k], t[(k + 1) % 3]
+                if tuple(sorted((ia, ib))) not in open_edges:
+                    continue
+                a, b = verts[ia], verts[ib]
+                ab = [b[i] - a[i] for i in range(3)]
+                den = sum(x * x for x in ab)
+                if den == 0:
+                    continue
+                for iv in live:
+                    if iv in t:
+                        continue
+                    p = verts[iv]
+                    s = sum((p[i] - a[i]) * ab[i] for i in range(3)) / den
+                    if not 1e-9 < s < 1 - 1e-9:
+                        continue
+                    d2 = sum((p[i] - a[i] - s * ab[i]) ** 2 for i in range(3))
+                    if d2 <= 1e-18 * den:
+                        best = (k, iv)
+                        break
+                if best:
+                    break
+            if best is None:
+                out.append(t)
+                continue
+            k, iv = best
+            x, y, z = t[k], t[(k + 1) % 3], t[(k + 2) % 3]
+            out.extend(([x, iv, z], [iv, y, z]))
+            healed = True
+        tris = out
+        if not healed:
+            break
+    return tris
+
+
 def centroid(body: Body):
     """Centre of mass, by the same per-face decomposition the volume uses.
 
@@ -459,6 +548,7 @@ def centroid(body: Body):
                     a = math.pi * float(circ.r) ** 2
                     c = tuple(float(x) for x in circ.c)
                 else:
+                    _refuse_arc_loop(lp)
                     vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
                     a, c = _poly_area_centroid_f(vs, nf)
                     a = abs(a)
@@ -564,6 +654,8 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
         n = ((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
              (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
              (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if n == (0.0, 0.0, 0.0):
+            return                       # a collinear sliver carries no area
         if sum(n[i] * outward[i] for i in range(3)) < 0:
             ib, ic = ic, ib
         tris.append([ia, ib, ic])
@@ -614,7 +706,11 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     rings.append([to2(p) for p in ring])
             if not rings:
                 continue
-            pts2, t2 = triangulate(rings[0], rings[1:])
+            # keep_collinear: the mid-edge vertices in these rings are
+            # T-junction seams shared with a neighbouring face. Splitting them
+            # exactly (_split_t_junctions) buys nothing if the mesher then
+            # drops them on one side and keeps them on the other.
+            pts2, t2 = triangulate(rings[0], rings[1:], keep_collinear=True)
             for a, b, c in t2:
                 tri(to3(pts2[a]), to3(pts2[b]), to3(pts2[c]), out)
         elif isinstance(s, Cylinder):
@@ -651,7 +747,7 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     out = _unit(mid) if face.sense else tuple(-x for x in _unit(mid))
                     tri(q[0], q[1], q[2], out)
                     tri(q[0], q[2], q[3], out)
-    return {"vertices": verts, "triangles": tris}
+    return {"vertices": verts, "triangles": _stitch_cracks(verts, tris)}
 
 
 def _unit(v):
@@ -740,6 +836,7 @@ def faces_info(body: Body) -> list[dict]:
                     a = math.pi * float(circ.r) ** 2
                     c = tuple(float(x) for x in circ.c)
                 else:
+                    _refuse_arc_loop(lp)
                     vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
                     a, c = _poly_area_centroid_f(vs, nf)
                     a = abs(a)
@@ -783,6 +880,20 @@ def _ring_face(pl: Plane, ring, holes=()) -> Face:
     return Face(pl, (loop(ring),) + tuple(loop(h) for h in holes), True)
 
 
+def _line_key(a, d):
+    """Exact identity of the LINE through a with direction d.
+
+    Direction canonicalised by its leading component (signed, so d and −d
+    agree), position by the Plücker moment a × d̂ — which is the same for
+    every point on the line, since (a + t·d̂) × d̂ = a × d̂. Two collinear
+    edges therefore land in one bucket no matter where they start or which
+    way they run.
+    """
+    lead = next(x for x in d if x != 0)
+    u = tuple(x / lead for x in d)
+    return (u, cross(a, u))
+
+
 def _split_t_junctions(polys):
     """Insert every vertex that lies in the INTERIOR of another polygon's edge.
 
@@ -796,26 +907,38 @@ def _split_t_junctions(polys):
     Zero-length edges are dropped: a degenerate edge has no interior, and
     leaving it in would make the same vertex appear twice in a ring.
     """
-    verts = sorted({v for vs in polys for v in vs})
+    # Bucket endpoints by their edge's CARRIER LINE. A vertex can only split
+    # an edge it is collinear with, and a T-junction vertex is always an
+    # endpoint of some OTHER edge on that same line — the face on the split
+    # side carries both halves. So the candidate set is the bucket, not the
+    # whole vertex set. Scanning every vertex for every edge cost 7.1 s on a
+    # 966-polygon part (0.010 s before the split existed) and grew as the
+    # square, which is minutes for a mesh-scale solid.
+    on_line: dict = {}
+    for vs in polys:
+        n = len(vs)
+        for i in range(n):
+            a, b = vs[i], vs[(i + 1) % n]
+            d = sub(b, a)
+            if d == (F(0), F(0), F(0)):
+                continue
+            on_line.setdefault(_line_key(a, d), set()).update((a, b))
+
     out = []
     for vs in polys:
         ring = []
-        for i in range(len(vs)):
-            a, b = vs[i], vs[(i + 1) % len(vs)]
-            ring.append(a)
+        n = len(vs)
+        for i in range(n):
+            a, b = vs[i], vs[(i + 1) % n]
             ab = sub(b, a)
             if ab == (F(0), F(0), F(0)):
-                continue
-            lo = tuple(min(a[k], b[k]) for k in range(3))
-            hi = tuple(max(a[k], b[k]) for k in range(3))
+                continue        # a degenerate edge has no interior AND no
+                # start: appending `a` first would leave the vertex in twice
+            ring.append(a)
             den = dot(ab, ab)
             hits = []
-            for p in verts:
+            for p in on_line[_line_key(a, ab)]:
                 if p == a or p == b:
-                    continue
-                if any(p[k] < lo[k] or p[k] > hi[k] for k in range(3)):
-                    continue
-                if cross(sub(p, a), ab) != (F(0), F(0), F(0)):
                     continue
                 t = dot(sub(p, a), ab) / den
                 if 0 < t < 1:
@@ -859,7 +982,7 @@ def _plane_key(pl: Plane):
     lead = next((x for x in pl.n if x != 0), None)
     if lead is None:
         return (pl.n, pl.d)
-    s = abs(lead)
+    s = abs(lead)                # exact over ℚ and ℚ[√d] alike (SurdVal.__abs__)
     return (tuple(x / s for x in pl.n), pl.d / s)
 
 
@@ -905,10 +1028,19 @@ def _merge_coplanar(pl: Plane, polys):
             return None                     # open chain: T-junction
         rings.append(chain)
 
-    want = sum(_ring_area2(vs, pl.n) for vs in polys)
+    # NOT an area check. Signed doubled area is a sum over DIRECTED edges, and
+    # cancellation removes each interior pair exactly (cross(a,b)+cross(b,a)=0)
+    # while chaining consumes every survivor once — so comparing the ring areas
+    # against the fragment areas is an identity that can never fail. It was
+    # instrumented over ~3800 merges and fired zero times. Area preservation
+    # rests instead on the PRECONDITION that the fragments tile the plane
+    # without overlap, which a BSP solid's polygons satisfy by construction;
+    # overlapping coplanar input is not detected here and would merge to a
+    # region larger than its union. The structural guards above (fan-out at a
+    # shared vertex, an open chain from a T-junction) are what actually fire.
     areas = [_ring_area2(r, pl.n) for r in rings]
-    if sum(areas) != want or any(a == 0 for a in areas):
-        return None                         # not area-preserving: bail
+    if any(a == 0 for a in areas):
+        return None                         # a degenerate ring: bail
 
     k = max(range(3), key=lambda i: abs(pl.n[i]))
     outers = [(a, r) for a, r in zip(areas, rings) if a > 0]

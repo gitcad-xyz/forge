@@ -248,6 +248,29 @@ def test_centre_of_mass_matches_the_analytic_value(label, build, want) -> None:
     assert got == pytest.approx(want, abs=1e-9)
 
 
+COAXIAL = [
+    ("counterbore", lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 2, 0, 10)).cut(Cyl(15, 15, 4, 7, 10))),
+    ("widening from below", lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 5, 0, 4)).cut(Cyl(15, 15, 2, 0, 10))),
+    ("three-step stack", lambda: DrilledSolid(Solid.box(40, 40, 12), [])
+     .cut(Cyl(20, 20, 2, 0, 12)).cut(Cyl(20, 20, 4, 6, 12))
+     .cut(Cyl(20, 20, 6, 10, 12))),
+    ("independent bores", lambda: DrilledSolid(
+        Solid.box(60, 30, 5), [Cyl(15, 15, 3, 0, 5), Cyl(45, 15, 3, 0, 5)])),
+]
+
+
+@pytest.mark.parametrize("label,build", COAXIAL, ids=[c[0] for c in COAXIAL])
+def test_the_two_centroid_paths_agree_on_a_coaxial_stack(label, build) -> None:
+    """DrilledSolid.centroid_f looped over raw bores while volume() unioned
+    them by z-band, so a counterbore's pilot hole came off twice where the two
+    overlap. The reported mass-properties dict was internally inconsistent:
+    a wrong centre of mass attached to an exact mass."""
+    d = build()
+    assert d.centroid_f() == pytest.approx(B.centroid(B.to_body(d)), abs=1e-9)
+
+
 def test_a_centroid_is_not_the_bbox_centre() -> None:
     """The regression this replaces: mass_props reported the bbox centre and
     flagged it with a key no caller read. On an L-bracket that is wrong by a
@@ -333,6 +356,39 @@ def test_bbox_covers_an_arcs_bulge_past_its_endpoints() -> None:
     assert (lo[1], hi[1]) == pytest.approx((-3.0, 3.0))
 
 
+def test_a_lone_arc_is_not_mistaken_for_a_whole_circle() -> None:
+    """The single-edge shortcut never checked that the edge CLOSES. A quarter
+    arc therefore reported the full πr², so a quarter disc of area 0.785
+    measured 3.14 — four times too big, as an exact value."""
+    from fractions import Fraction as Q
+
+    c = B.Circle((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(1))
+    quarter = B.Loop((B.Edge(c, (Q(1), Q(0), Q(0)), (Q(0), Q(1), Q(0))),))
+    assert B._loop_is_circle(quarter) is None
+    whole = B.Loop((B.Edge(c, (Q(1), Q(0), Q(0)), (Q(1), Q(0), Q(0))),))
+    assert B._loop_is_circle(whole) == c
+
+
+def test_faces_info_declines_the_same_loops_the_exact_path_declines() -> None:
+    """Two measurement paths must not give two answers for one face: the exact
+    volume refused a mixed arc/line loop while faces_info walked its vertices
+    as a polygon and reported 0.5 for a quarter disc of true 0.785."""
+    body = B.Body((_slot_face(),))
+    with pytest.raises(ValueError, match="mixing arcs and lines"):
+        B.faces_info(body)
+    with pytest.raises(ValueError, match="mixing arcs and lines"):
+        B.centroid(body)
+
+
+def test_a_circle_whose_ref_is_not_perpendicular_is_refused() -> None:
+    from fractions import Fraction as Q
+
+    bad = B.Circle((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)),
+                   (Q(1), Q(0), Q(1)), Q(1))
+    with pytest.raises(ValueError, match="perpendicular"):
+        B._arc_pts(bad, (Q(1), Q(0), Q(0)), (Q(0), Q(1), Q(0)), 0.1)
+
+
 def test_a_circle_split_into_three_arcs_is_still_one_circle() -> None:
     """Only two-way splits were recognised; a third intersection turned the
     bore into a 3-point 'polygon' of zero area."""
@@ -402,6 +458,92 @@ def test_a_boolean_t_junction_is_split_not_left_to_tear_the_mesh() -> None:
     body = B.to_body(notched)
     assert _non_manifold(B.tessellate(body, 0.05)) == 0
     assert B.volume(body) == PiVal(40 * 20 * 10 - 10 * 20 * 4, 0)
+
+
+ROTATIONS = [(0, 0, 1), (1, 0, 0), (0, 1, 0)]
+
+
+@pytest.mark.parametrize("axis", ROTATIONS, ids=["z", "x", "y"])
+@pytest.mark.parametrize("deg", [30, 45, 60, 90, 180, 270])
+def test_a_rotated_solid_converts_at_all(axis, deg) -> None:
+    """``abs()`` on a plane normal killed to_body for EVERY rotated solid.
+    Rotation is the one thing 0.9.x shipped exact-angle support for, and a
+    rotated coordinate is a SurdVal — which had no ``__abs__``, so this died
+    with a bare TypeError rather than any honest refusal. Three separate call
+    sites shared the single missing method."""
+    from forgekernel.kernel import rotate
+
+    body = B.to_body(rotate(Solid.box(10, 6, 4), axis, deg))
+    assert len(body.faces) == 6
+    assert B.volume(body) == PiVal(240, 0)
+
+
+def test_abs_is_defined_over_the_surd_field() -> None:
+    from forgekernel.surd import SurdVal
+
+    s = SurdVal(-1, -1, 2)                      # −1 − √2 < 0
+    assert abs(s) == -s and abs(-s) == -s
+    assert abs(SurdVal(3, 0, 2)) == SurdVal(3, 0, 2)
+
+
+def _perforated(k):
+    from fractions import Fraction as Q
+    s = Solid.box(Q(10 * k), Q(10 * k), Q(4))
+    for i in range(k):
+        for j in range(k):
+            s = boolean("cut", s, translate(Solid.box(Q(4), Q(4), Q(20)),
+                                            Q(10 * i + 3), Q(10 * j + 3), Q(-2)))
+    return s
+
+
+def test_conversion_stays_near_linear_in_the_polygon_count() -> None:
+    """Scanning every vertex for every edge made the T-junction split
+    O(polys x edges x verts) in Fractions — 7.1 s on a 966-polygon part
+    against 0.010 s before the split existed, growing as the square. Bucketing
+    by the edge's carrier line makes the candidate set the bucket."""
+    import time
+
+    small, big = _perforated(3), _perforated(8)
+    t0 = time.perf_counter()
+    B.to_body(small)
+    dt_small = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    B.to_body(big)
+    dt_big = time.perf_counter() - t0
+    growth = len(big.polys) / len(small.polys)
+    # quadratic would be growth**2 (~29x); allow generous slack for noise
+    assert dt_big < max(0.05, dt_small * growth * 3)
+
+
+WATERTIGHT = [
+    ("square through-hole",
+     lambda: boolean("cut", Solid.box(10, 10, 2),
+                     translate(Solid.box(4, 4, 6), 3, 3, -2))),
+    ("blind square pocket",
+     lambda: boolean("cut", Solid.box(20, 10, 4),
+                     translate(Solid.box(4, 4, 20), 8, 3, -5))),
+    ("5x5 perforated plate", lambda: _perforated(5)),
+    ("notched plate",
+     lambda: boolean("cut", Solid.box(40, 20, 10),
+                     translate(Solid.box(10, 20, 10), 15, 0, 6))),
+]
+
+
+@pytest.mark.parametrize("label,build", WATERTIGHT, ids=[w[0] for w in WATERTIGHT])
+@pytest.mark.parametrize("turn", [None, 45], ids=["upright", "rot45"])
+def test_the_display_mesh_is_watertight_and_orientation_independent(
+        label, build, turn) -> None:
+    """Splitting T-junctions exactly at the FACE level is necessary but not
+    sufficient: adjacent faces are triangulated independently in their own 2D
+    frames, so the mesher can route the seam differently on each side. The
+    volume stays right, which is why it went unnoticed — a hairline crack that
+    only shows up when the STL will not print. It was also orientation
+    DEPENDENT: 0 upright, 6 after a 45 degree turn, because a float
+    collinearity test broke the tie differently per face."""
+    body = B.to_body(build())
+    if turn:
+        body = body.transformed(B.Affine.rotation((1, 0, 0), turn))
+    assert _non_manifold(B.tessellate(body, 0.2)) == 0
 
 
 def test_an_unmergeable_group_falls_back_to_its_fragments() -> None:

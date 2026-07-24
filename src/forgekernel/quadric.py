@@ -208,17 +208,34 @@ class DrilledSolid:
 
     def centroid_f(self) -> tuple[float, float, float]:
         """Centroid, floated at the boundary (the exact value is a ratio
-        of ℚ[π] numbers — outside the field, so floats are honest here)."""
+        of ℚ[π] numbers — outside the field, so floats are honest here).
+
+        Removes the SAME z-band decomposition ``_bore_union_volume`` uses.
+        Looping over raw ``self.bores`` double-subtracted wherever coaxial
+        bores overlap — a counterbore's pilot hole lies entirely inside the
+        wider bore's z-range, so their shared length came off twice. Volume
+        was already right, which made the reported mass-properties dict
+        internally inconsistent: the wrong centre of mass for an exact mass.
+        """
         bv = float(self.base.volume())
         c = self.base.centroid()
         acc = [bv * float(c[0]), bv * float(c[1]), bv * float(c[2])]
         vol = bv
+        groups: dict = {}
         for cyl in self.bores:
-            v = float(cyl.volume())
-            cc = cyl.centroid_f()
-            for i in range(3):
-                acc[i] -= v * cc[i]
-            vol -= v
+            groups.setdefault((cyl.cx, cyl.cy), []).append(cyl)
+        for (cx, cy), cyls in groups.items():
+            cuts = sorted({t for b in cyls for t in (b.z0, b.z1)})
+            for lo, hi in zip(cuts, cuts[1:]):
+                rs = [b.r for b in cyls if b.z0 <= lo and hi <= b.z1]
+                if not rs:
+                    continue
+                rmax = max(rs)
+                v = math.pi * float(rmax) ** 2 * float(hi - lo)
+                mid = (float(cx), float(cy), float(lo + hi) / 2)
+                for i in range(3):
+                    acc[i] -= v * mid[i]
+                vol -= v
         return (acc[0] / vol, acc[1] / vol, acc[2] / vol)
 
     def bbox(self):

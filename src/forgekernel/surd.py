@@ -95,6 +95,17 @@ class SurdVal:
     def __neg__(self) -> "SurdVal":
         return SurdVal(-self.a, -self.b, self.d)
 
+    def __abs__(self) -> "SurdVal":
+        """``abs()`` over ℚ[√d] — exact, via the sign predicate.
+
+        Without it every ``abs()`` in the kernel is a landmine that only goes
+        off once a solid has been ROTATED: an exact 30/45/90° turn puts surds
+        in the coordinates, and three separate call sites then died with a
+        bare ``TypeError`` rather than any honest refusal. An ordered field
+        that can compare but cannot take a magnitude is a half-built type.
+        """
+        return -self if self._sign() < 0 else self
+
     def __truediv__(self, o) -> "SurdVal":
         if isinstance(o, (int, Fraction)):
             r = F(o)
