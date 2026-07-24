@@ -50,7 +50,7 @@ push/PR (build + `twine check`; the Rust matrix builds Linux/macOS/Windows).
 
 ## Downstream
 
-`gitcad-mech[fast]` depends on `forgekernel[rust]`, which pulls the compiled
-`forgekernel_rs` wheel — so `pip install gitcad[fast]` delivers the native
-kernel. Publish `forgekernel` / `forgekernel_rs` **before** the matching gitcad
-release so that extra resolves.
+`gitcad-mech` depends on `forgekernel_rs` **by default** (via a
+`platform_machine` marker), so `pip install gitcad` delivers the native kernel on
+mainstream architectures. Publish `forgekernel` / `forgekernel_rs` **before** the
+matching gitcad release so that dependency resolves.
