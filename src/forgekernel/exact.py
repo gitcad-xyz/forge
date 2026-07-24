@@ -87,24 +87,17 @@ class Plane:
         return Plane(neg(self.n), -self.d)
 
     def canonical(self) -> tuple:
-        """Hashable canonical form: normal scaled to coprime integers with a
-        sign convention — coplanarity comparisons become tuple equality."""
-        nums = [self.n[0], self.n[1], self.n[2], self.d]
-        den = 1
-        for v in nums:
-            den = den * v.denominator // gcd(den, v.denominator)
-        ints = [int(v * den) for v in nums]
-        g = 0
-        for v in ints:
-            g = gcd(g, abs(v))
-        if g:
-            ints = [v // g for v in ints]
-        for v in ints[:3]:
+        """Hashable canonical form: (normal, d) divided through by the normal's
+        first nonzero component, so any scalar multiple ±λ·(n, d) maps to the
+        same tuple — coplanarity becomes tuple equality. Works over ℚ and over
+        ℚ[√d] (an exactly-rotated solid carries surd face normals)."""
+        nums = (self.n[0], self.n[1], self.n[2], self.d)
+        lead = None
+        for v in nums[:3]:
             if v != 0:
-                if v < 0:
-                    ints = [-w for w in ints]
+                lead = v
                 break
-        return tuple(ints)
+        return tuple(v / lead for v in nums)
 
     def coplanar_key(self) -> tuple:
         """Canonical form ignoring orientation (for adjacency grouping)."""

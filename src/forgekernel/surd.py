@@ -89,11 +89,62 @@ class SurdVal:
 
     __rmul__ = __mul__
 
+    def __neg__(self) -> "SurdVal":
+        return SurdVal(-self.a, -self.b, self.d)
+
+    def __truediv__(self, o) -> "SurdVal":
+        if isinstance(o, (int, Fraction)):
+            r = F(o)
+            return SurdVal(self.a / r, self.b / r, self.d)
+        o = self._co(o)
+        if o.b == 0:                             # divide by a rational
+            return SurdVal(self.a / o.a, self.b / o.a, self.d)
+        # divide by (c+e√d) via the conjugate: ·(c−e√d)/(c²−e²d)
+        denom = o.a * o.a - o.b * o.b * o.d      # rational, nonzero
+        num = self * SurdVal(o.a, -o.b, o.d)
+        return SurdVal(num.a / denom, num.b / denom, num.d)
+
+    def __rtruediv__(self, o) -> "SurdVal":
+        return self._co(o) / self
+
+    def _sign(self) -> int:
+        """Exact sign of a + b√d (d ≥ 1, √d > 0) — decides comparisons."""
+        if self.b == 0:
+            return (self.a > 0) - (self.a < 0)
+        if self.a == 0:
+            return (self.b > 0) - (self.b < 0)
+        sa = (self.a > 0) - (self.a < 0)
+        sb = (self.b > 0) - (self.b < 0)
+        if sa == sb:                             # both terms same sign
+            return sa
+        # opposite signs: compare magnitudes a² vs b²·d (squaring is monotone)
+        da, db = self.a * self.a, self.b * self.b * self.d
+        if da == db:
+            return 0
+        return sa if da > db else sb
+
+    def __lt__(self, o) -> bool:
+        return (self - self._co(o))._sign() < 0
+
+    def __le__(self, o) -> bool:
+        return (self - self._co(o))._sign() <= 0
+
+    def __gt__(self, o) -> bool:
+        return (self - self._co(o))._sign() > 0
+
+    def __ge__(self, o) -> bool:
+        return (self - self._co(o))._sign() >= 0
+
     def __eq__(self, o: object) -> bool:
         o = self._co(o)
         if self.b == 0 and o.b == 0:
             return self.a == o.a
         return self.a == o.a and self.b == o.b and self.d == o.d
+
+    def __hash__(self) -> int:
+        if self.b == 0:                          # a pure rational hashes as itself
+            return hash(self.a)
+        return hash((self.a, self.b, self.d))
 
     def __float__(self) -> float:
         return float(self.a) + float(self.b) * math.sqrt(self.d)

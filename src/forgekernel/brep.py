@@ -188,25 +188,21 @@ class Solid:
         moment) and closure requires the SIGNED interval coverage on every
         line to cancel exactly. Zero everywhere == closed surface."""
         from collections import defaultdict
-        from math import gcd as _gcd
 
         def canon_dir(d: Vec) -> Vec | None:
-            den = 1
+            # Canonical (scale- and sign-invariant) representative of a
+            # direction: divide through by the first nonzero component so any
+            # scalar multiple ±λ·d maps to the same tuple. Works whether the
+            # components are rational (ℚ) or quadratic surds (ℚ[√d]) — an
+            # exactly-rotated solid carries √d edge directions.
+            lead = None
             for v in d:
-                den = den * v.denominator // _gcd(den, v.denominator)
-            ints = [int(v * den) for v in d]
-            g = 0
-            for v in ints:
-                g = _gcd(g, abs(v))
-            if g == 0:
-                return None
-            ints = [v // g for v in ints]
-            for v in ints:
                 if v != 0:
-                    if v < 0:
-                        ints = [-w for w in ints]
+                    lead = v
                     break
-            return (F(ints[0]), F(ints[1]), F(ints[2]))
+            if lead is None:
+                return None
+            return tuple(v / lead for v in d)
 
         lines: dict = defaultdict(list)
         for p in self.polys:
@@ -298,24 +294,16 @@ def _ear_clip(loop: list[tuple]) -> list[tuple]:
 
 
 def _canon_dir(d: Vec):
-    from math import gcd as _g
-
-    den = 1
+    # Scale- and sign-invariant direction key: divide by the first nonzero
+    # component. Rational (ℚ) or quadratic-surd (ℚ[√d], from exact rotation).
+    lead = None
     for v in d:
-        den = den * v.denominator // _g(den, v.denominator)
-    ints = [int(v * den) for v in d]
-    g = 0
-    for v in ints:
-        g = _g(g, abs(v))
-    if g == 0:
-        return None
-    ints = [v // g for v in ints]
-    for v in ints:
         if v != 0:
-            if v < 0:
-                ints = [-w for w in ints]
+            lead = v
             break
-    return (F(ints[0]), F(ints[1]), F(ints[2]))
+    if lead is None:
+        return None
+    return tuple(v / lead for v in d)
 
 
 def logical_edges(solid: Solid) -> list[dict]:
