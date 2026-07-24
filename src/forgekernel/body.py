@@ -180,6 +180,10 @@ class Affine:
     @classmethod
     def scaling(cls, fx, fy, fz):
         fx, fy, fz = F(fx), F(fy), F(fz)
+        if fx == 0 or fy == 0 or fz == 0:
+            raise ValueError(
+                "a zero scale factor collapses the solid — not an invertible "
+                "transform")
         uniform = abs(fx) if (abs(fx) == abs(fy) == abs(fz)) else None
         neg = (fx < 0) + (fy < 0) + (fz < 0)
         return cls(((fx, 0, 0), (0, fy, 0), (0, 0, fz)),
@@ -389,6 +393,12 @@ def bbox(body: Body):
     lo = [math.inf] * 3
     hi = [-math.inf] * 3
     for f in body.faces:
+        if isinstance(f.surface, SphereS):      # a whole sphere carries no loops
+            c, r = f.surface.c, float(f.surface.r)
+            for i in range(3):
+                lo[i] = min(lo[i], float(c[i]) - r)
+                hi[i] = max(hi[i], float(c[i]) + r)
+            continue
         for lp in f.loops:
             circ = _loop_is_circle(lp)
             if circ is not None:
@@ -697,33 +707,70 @@ def from_drilled(d) -> Body:
     body = from_solid(d.base)
     (_, _, bz0), (_, _, bz1) = d.base.bbox()
     faces = list(body.faces)
+    from collections import defaultdict
+
     from forgekernel.quadric import Cyl as _C
 
+    # Coaxial bores (a counterbore stack) are ONE stepped void, not several
+    # independent ones: emitting a hole per bore double-subtracts their overlap
+    # on the shared cap and leaves the inner wall running through the wider
+    # bore's empty space. Merge them into z-bands carrying the OUTERMOST radius,
+    # exactly as the section and tessellation paths do.
+    groups: dict = defaultdict(list)
     for c in d.bores:
         c = _C(F(c.cx), F(c.cy), F(c.r), F(c.z0), F(c.z1))
         z0, z1 = max(c.z0, F(bz0)), min(c.z1, F(bz1))
-        if z1 <= z0:
+        if z1 > z0:
+            groups[(c.cx, c.cy)].append(_C(c.cx, c.cy, c.r, z0, z1))
+
+    cap_faces = [i for i, f in enumerate(faces)
+                 if isinstance(f.surface, Plane)
+                 and f.surface.n[0] == 0 and f.surface.n[1] == 0]
+    for (cx, cy), cyls in groups.items():
+        zs = sorted({z for c in cyls for z in (c.z0, c.z1)})
+        bands = []
+        for za, zb in zip(zs, zs[1:]):
+            zmid = (za + zb) / 2
+            rs = [c.r for c in cyls if c.z0 <= zmid <= c.z1]
+            if rs:
+                bands.append((za, zb, max(rs)))
+        if not bands:
             continue
-        for i, f in enumerate(faces):
-            s = f.surface
-            if not isinstance(s, Plane) or s.n[0] != 0 or s.n[1] != 0:
-                continue
+        zlo, zhi = bands[0][0], bands[-1][1]
+        # cap holes: only on a fragment this stack actually passes through
+        for i in cap_faces:
+            f = faces[i]
             zc = f.loops[0].edges[0].v0[2]
-            if zc not in (z0, z1):
+            r = (bands[-1][2] if zc == zhi else
+                 bands[0][2] if zc == zlo else None)
+            if r is None or not _face_contains_xy(f, cx, cy):
                 continue
-            if not _face_contains_xy(f, c.cx, c.cy):
-                continue            # a coplanar fragment the bore never reaches
-            circ = _circle_at(c.cx, c.cy, zc, c.r)
-            v = (c.cx + c.r, c.cy, zc)
-            faces[i] = Face(s, f.loops + (Loop((Edge(circ, v, v),)),), f.sense)
-        lo, hi = _circle_at(c.cx, c.cy, z0, c.r), _circle_at(c.cx, c.cy, z1, c.r)
-        a, b = (c.cx + c.r, c.cy, z0), (c.cx + c.r, c.cy, z1)
-        faces.append(Face(Cylinder((c.cx, c.cy, z0), (F(0), F(0), F(1)), c.r),
-                          (Loop((Edge(lo, a, a), Edge(hi, b, b))),), False))
-        if z0 > bz0:
-            faces.append(_disk_face(c.cx, c.cy, z0, c.r, True))
-        if z1 < bz1:
-            faces.append(_disk_face(c.cx, c.cy, z1, c.r, False))
+            circ = _circle_at(cx, cy, zc, r)
+            v = (cx + r, cy, zc)
+            faces[i] = Face(f.surface, f.loops + (Loop((Edge(circ, v, v),)),),
+                            f.sense)
+        for za, zb, r in bands:                       # one wall per band
+            lo_c, hi_c = _circle_at(cx, cy, za, r), _circle_at(cx, cy, zb, r)
+            a, b = (cx + r, cy, za), (cx + r, cy, zb)
+            faces.append(Face(Cylinder((cx, cy, za), (F(0), F(0), F(1)), r),
+                              (Loop((Edge(lo_c, a, a), Edge(hi_c, b, b))),),
+                              False))
+        for (za, zb, r0), (zb2, zc, r1) in zip(bands, bands[1:]):
+            if r0 == r1:
+                continue                              # no step: no shoulder
+            rin, rout = min(r0, r1), max(r0, r1)
+            # the exposed ring faces INTO the wider bore
+            up = r1 > r0
+            outer = _circle_at(cx, cy, zb, rout)
+            inner = _circle_at(cx, cy, zb, rin)
+            vo, vi = (cx + rout, cy, zb), (cx + rin, cy, zb)
+            faces.append(Face(Plane((F(0), F(0), F(1)), zb),
+                              (Loop((Edge(outer, vo, vo),)),
+                               Loop((Edge(inner, vi, vi),))), up))
+        if zlo > F(bz0):                              # blind at the bottom
+            faces.append(_disk_face(cx, cy, zlo, bands[0][2], True))
+        if zhi < F(bz1):                              # blind at the top
+            faces.append(_disk_face(cx, cy, zhi, bands[-1][2], False))
     return Body(tuple(faces))
 
 

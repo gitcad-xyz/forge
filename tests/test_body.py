@@ -187,3 +187,36 @@ def test_a_bore_only_holes_the_cap_fragment_it_reaches(label, build) -> None:
     representation's own exact volume."""
     d = build()
     assert B.volume(B.to_body(d)) == d.volume()
+
+
+STACKS = [
+    ("counterbore", lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 2, 0, 10)).cut(Cyl(15, 15, 4, 7, 10))),
+    ("widening from below", lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 5, 0, 4)).cut(Cyl(15, 15, 2, 0, 10))),
+    ("three-step stack", lambda: DrilledSolid(Solid.box(40, 40, 12), [])
+     .cut(Cyl(20, 20, 2, 0, 12)).cut(Cyl(20, 20, 4, 6, 12))
+     .cut(Cyl(20, 20, 6, 10, 12))),
+]
+
+
+@pytest.mark.parametrize("label,build", STACKS, ids=[s[0] for s in STACKS])
+def test_coaxial_bores_are_one_stepped_void(label, build) -> None:
+    """A counterbore stack is ONE void, not several. Emitting a hole per bore
+    double-subtracted their overlap on the shared cap and left the inner wall
+    running through the wider bore's empty space."""
+    d = build()
+    assert B.volume(B.to_body(d)) == d.volume()
+
+
+def test_a_whole_sphere_still_bounds_its_bbox() -> None:
+    """A SphereS face carries no loops, and bbox walked loops only — so a
+    sphere contributed nothing and the bounds came back inf/-inf."""
+    lo, hi = B.bbox(B.to_body(Sphere(0, 0, 0, 6)))
+    assert lo == pytest.approx((-6.0, -6.0, -6.0))
+    assert hi == pytest.approx((6.0, 6.0, 6.0))
+
+
+def test_a_singular_scale_is_refused() -> None:
+    with pytest.raises(ValueError, match="zero scale factor"):
+        B.Affine.scaling(0, 1, 1)
