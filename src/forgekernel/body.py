@@ -38,10 +38,14 @@ class Plane:
     d: Fraction
 
     def transformed(self, m):
-        # planes map by the inverse-transpose; for the rigid/mirror/uniform-scale
-        # maps we admit, transforming a point and the normal directly is exact.
+        # A plane's normal transforms by the INVERSE-TRANSPOSE, not by the map
+        # itself. Rigid maps make the two agree and a uniform scale makes them
+        # parallel (all a plane needs), but under a NON-UNIFORM scale they
+        # diverge: a slanted face would keep a normal no longer perpendicular to
+        # it. m.normal() applies the cofactor matrix = det.M^-T — exact in Q, and
+        # a parallel normal suffices because d rescales with it.
         p = m.point(_plane_point(self))
-        n = m.direction(self.n)
+        n = m.normal(self.n)
         return Plane(n, dot(n, p))
 
 
@@ -203,6 +207,23 @@ class Affine:
         r = self.rows
         return tuple(r[i][0] * v[0] + r[i][1] * v[1] + r[i][2] * v[2]
                      for i in range(3))
+
+    def normal(self, v):
+        """Map a SURFACE NORMAL — by the cofactor matrix (det.M^-T), so it stays
+        perpendicular to the transformed surface even under a non-uniform scale.
+        Exact: cofactors are products of matrix entries, no division."""
+        r = self.rows
+        c = [[r[(i + 1) % 3][(j + 1) % 3] * r[(i + 2) % 3][(j + 2) % 3]
+              - r[(i + 1) % 3][(j + 2) % 3] * r[(i + 2) % 3][(j + 1) % 3]
+              for j in range(3)] for i in range(3)]
+        out = tuple(c[i][0] * v[0] + c[i][1] * v[1] + c[i][2] * v[2]
+                    for i in range(3))
+        # The cofactor matrix is det·M⁻ᵀ, so an ORIENTATION-REVERSING map (a
+        # mirror, det < 0) would hand back an inward-pointing normal. Divide the
+        # sign of det back out: |det|·M⁻ᵀ keeps the normal outward, and any
+        # positive multiple of M⁻ᵀ is an equally valid plane normal.
+        det = sum(self.rows[0][j] * c[0][j] for j in range(3))
+        return tuple(-x for x in out) if det < 0 else out
 
     def scale_len(self, r):
         if self.uniform is None:

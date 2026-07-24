@@ -125,3 +125,27 @@ def test_a_sphere_reports_its_analytic_surface() -> None:
     faces = B.faces_info(B.to_body(Sphere(0, 0, 0, 6)))
     assert len(faces) == 1 and faces[0]["surface"] == "sphere"
     assert faces[0]["area"] == pytest.approx(4 * math.pi * 36)
+
+
+def test_plane_normals_survive_a_non_uniform_scale() -> None:
+    """A plane's normal transforms by the INVERSE-TRANSPOSE. Applying the map
+    directly leaves a SLANTED face with a normal that is no longer
+    perpendicular to it — the volume can still come out right (the errors
+    cancel over a closed body) while faces_info and mesh orientation are wrong,
+    so the volume alone is not a sufficient check."""
+    tri = prism([(0, 0), (10, 0), (0, 6)], 4)          # slanted lateral face
+    for factors, want in (((2, 3, 1), 720), ((1, 3, 5), 1800), ((2, 2, 2), 960)):
+        body = B.to_body(tri).transformed(B.Affine.scaling(*factors))
+        assert float(B.volume(body)) == pytest.approx(want)
+        for face in body.faces:
+            vs = [tuple(float(x) for x in e.v0) for e in face.loops[0].edges]
+            a = [vs[1][i] - vs[0][i] for i in range(3)]
+            c = [vs[2][i] - vs[0][i] for i in range(3)]
+            true = (a[1] * c[2] - a[2] * c[1], a[2] * c[0] - a[0] * c[2],
+                    a[0] * c[1] - a[1] * c[0])
+            stored = tuple(float(x) for x in face.surface.n)
+            cr = (true[1] * stored[2] - true[2] * stored[1],
+                  true[2] * stored[0] - true[0] * stored[2],
+                  true[0] * stored[1] - true[1] * stored[0])
+            assert math.sqrt(sum(x * x for x in cr)) < 1e-9 * max(
+                1.0, math.sqrt(sum(x * x for x in true))), "normal not perpendicular"
