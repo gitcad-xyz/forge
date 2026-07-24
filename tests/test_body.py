@@ -94,3 +94,34 @@ def test_bbox_of_a_curved_body_bounds_the_curve_not_its_vertices() -> None:
 def test_unknown_representation_refuses_with_its_stage() -> None:
     with pytest.raises(ValueError, match="no canonical-B-rep converter"):
         B.to_body(object())
+
+
+def test_entity_descriptors_are_analytic_for_every_representation() -> None:
+    """Edge/face selection works on curved solids once they are in canonical
+    form: a bore reports an exact radius and axis, not a facet count."""
+    plate = DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])
+    body = B.to_body(plate)
+
+    edges = B.edges_info(body)
+    circles = [e for e in edges if e["curve"] == "circle"]
+    assert len(edges) == 14                       # 12 box edges + 2 bore rims
+    assert len(circles) == 2
+    assert all(c["radius"] == pytest.approx(4.0) for c in circles)
+    assert all(c["length"] == pytest.approx(2 * math.pi * 4) for c in circles)
+    assert all(abs(c["axis"][2]) == pytest.approx(1.0) for c in circles)
+
+    faces = B.faces_info(body)
+    bore = [f for f in faces if f["surface"] == "cylinder"]
+    assert len(bore) == 1
+    assert bore[0]["radius"] == pytest.approx(4.0)
+    assert bore[0]["area"] == pytest.approx(2 * math.pi * 4 * 5)
+    caps = [f for f in faces if f["surface"] == "plane"
+            and abs(f["plane"][2]) == pytest.approx(1.0)]
+    # each cap is the plate minus the hole
+    assert all(f["area"] == pytest.approx(40 * 20 - math.pi * 16) for f in caps)
+
+
+def test_a_sphere_reports_its_analytic_surface() -> None:
+    faces = B.faces_info(B.to_body(Sphere(0, 0, 0, 6)))
+    assert len(faces) == 1 and faces[0]["surface"] == "sphere"
+    assert faces[0]["area"] == pytest.approx(4 * math.pi * 36)

@@ -498,6 +498,104 @@ def _perp_f(n):
     return _unit(tuple(a[i] - d * n[i] for i in range(3)))
 
 
+def edges_info(body: Body) -> list[dict]:
+    """Descriptors for every distinct edge — the selection surface that
+    fillet/chamfer targeting and dimension anchoring read. ONE implementation
+    covering every representation, because they all become a Body."""
+    out, seen = [], set()
+    for f in body.faces:
+        for lp in f.loops:
+            for e in lp.edges:
+                if isinstance(e.curve, Circle):
+                    c = e.curve
+                    key = ("circle", tuple(float(x) for x in c.c),
+                           tuple(float(x) for x in c.n), float(c.r))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"curve": "circle", "radius": float(c.r),
+                                "centroid": [float(x) for x in c.c],
+                                "length": 2 * math.pi * float(c.r),
+                                "axis": list(_unit(tuple(float(y) for y in c.n)))})
+                else:
+                    a = tuple(float(x) for x in e.v0)
+                    b = tuple(float(x) for x in e.v1)
+                    key = ("line",) + tuple(sorted((a, b)))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    d = tuple(b[i] - a[i] for i in range(3))
+                    out.append({"curve": "line", "point": list(a), "dir": list(d),
+                                "centroid": [(a[i] + b[i]) / 2 for i in range(3)],
+                                "length": math.sqrt(sum(x * x for x in d))})
+    return out
+
+
+def _poly_area_centroid_f(vs, n):
+    """Signed area (about n) and area centroid of a 3D planar polygon."""
+    acc, area = [0.0, 0.0, 0.0], 0.0
+    v0 = vs[0]
+    for i in range(1, len(vs) - 1):
+        a = [vs[i][k] - v0[k] for k in range(3)]
+        b = [vs[i + 1][k] - v0[k] for k in range(3)]
+        cr = _cross_f(a, b)
+        ta = 0.5 * sum(cr[k] * n[k] for k in range(3))
+        tc = [(v0[k] + vs[i][k] + vs[i + 1][k]) / 3 for k in range(3)]
+        for k in range(3):
+            acc[k] += tc[k] * ta
+        area += ta
+    if area == 0:
+        m = len(vs)
+        return 0.0, tuple(sum(v[k] for v in vs) / m for k in range(3))
+    return area, tuple(acc[k] / area for k in range(3))
+
+
+def faces_info(body: Body) -> list[dict]:
+    """Descriptors for every face — surface kind plus the ANALYTIC parameters a
+    caller needs (a bore reports its radius and axis, never a facet count)."""
+    out = []
+    for f in body.faces:
+        s = f.surface
+        if isinstance(s, Plane):
+            nf = _unit(tuple(float(x) for x in s.n))
+            pts, area = [], 0.0
+            for i, lp in enumerate(f.loops):
+                circ = _loop_is_circle(lp)
+                if circ is not None:
+                    a = math.pi * float(circ.r) ** 2
+                    area += a if i == 0 else -a
+                    if i == 0:
+                        pts.append((tuple(float(x) for x in circ.c), a))
+                else:
+                    vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
+                    a, c = _poly_area_centroid_f(vs, nf)
+                    area += a if i == 0 else -abs(a)
+                    if i == 0:
+                        pts.append((c, abs(a)))
+            tot = sum(w for _, w in pts) or 1.0
+            cen = [sum(p[i] * w for p, w in pts) / tot for i in range(3)]
+            out.append({"surface": "plane", "plane": list(nf),
+                        "centroid": cen, "area": abs(area)})
+        elif isinstance(s, Cylinder):
+            try:
+                h = float(_band_height(f, s))
+            except ValueError:
+                h = 0.0
+            axis = _unit(tuple(float(x) for x in s.d))
+            base = tuple(float(x) for x in s.p)
+            out.append({"surface": "cylinder", "radius": float(s.r),
+                        "axis_dir": list(axis), "axis_origin": list(base),
+                        "area": 2 * math.pi * float(s.r) * h,
+                        "centroid": [base[i] + axis[i] * h / 2 for i in range(3)]})
+        elif isinstance(s, SphereS):
+            out.append({"surface": "sphere", "radius": float(s.r),
+                        "centroid": [float(x) for x in s.c],
+                        "area": 4 * math.pi * float(s.r) ** 2})
+        else:
+            out.append({"surface": type(s).__name__.lower()})
+    return out
+
+
 # -- converters: every representation becomes a Body -------------------------
 
 def from_solid(solid) -> Body:
