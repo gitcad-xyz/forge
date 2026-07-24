@@ -616,16 +616,22 @@ class AxisStack:
 
 class RevolveSolid:
     """A closed line-segment profile in the (r, z) half-plane revolved
-    360 degrees about the z axis. Green gives exact metrics:
-    V = pi * contour_integral(r^2 dz), each edge contributing
-    (z2-z1)(r1^2 + r1 r2 + r2^2)/3."""
+    360 degrees about a z-parallel axis through ``(cx, cy)``. Green gives
+    exact metrics: V = pi * contour_integral(r^2 dz), each edge contributing
+    (z2-z1)(r1^2 + r1 r2 + r2^2)/3. The profile need not touch r = 0 — an
+    annular loop is a tube (a bored cylinder), still exact."""
 
-    def __init__(self, loop_rz: list) -> None:
+    def __init__(self, loop_rz: list, cx=0, cy=0) -> None:
         self.loop = [(F(r), F(z)) for r, z in loop_rz]
+        self.cx, self.cy = F(cx), F(cy)
         if any(r < 0 for r, _ in self.loop):
             raise ValueError("revolve profile must stay at r >= 0")
         if self._v3() < 0:
             self.loop = list(reversed(self.loop))
+
+    def translated(self, x, y, z) -> "RevolveSolid":
+        return RevolveSolid([(r, zz + F(z)) for r, zz in self.loop],
+                            self.cx + F(x), self.cy + F(y))
 
     def _edges(self):
         n = len(self.loop)
@@ -648,18 +654,53 @@ class RevolveSolid:
             num += dz * (z1 * (3 * r1 * r1 + 2 * r1 * r2 + r2 * r2)
                          + z2 * (r1 * r1 + 2 * r1 * r2 + 3 * r2 * r2)) / 12
         v3 = self._v3()
-        return (0.0, 0.0, float(num / v3 * 3) if v3 else 0.0)
+        return (float(self.cx), float(self.cy),
+                float(num / v3 * 3) if v3 else 0.0)
 
     def bbox(self):
         rmax = max(r for r, _ in self.loop)
         zs = [z for _, z in self.loop]
-        return ((-float(rmax), -float(rmax), float(min(zs))),
-                (float(rmax), float(rmax), float(max(zs))))
+        cx, cy = float(self.cx), float(self.cy)
+        return ((cx - float(rmax), cy - float(rmax), float(min(zs))),
+                (cx + float(rmax), cy + float(rmax), float(max(zs))))
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         from forgekernel.tess import lathe
 
-        return lathe([(float(r), float(z)) for r, z in self.loop], deflection)
+        return lathe([(float(r), float(z)) for r, z in self.loop], deflection,
+                     float(self.cx), float(self.cy))
+
+
+def bore_cyl(cyl: "Cyl", bore: "Cyl") -> object:
+    """Cut a COAXIAL bore out of a z-cylinder, exactly.
+
+    A cylinder minus a coaxial cylindrical bore is still a solid of
+    revolution, so the result is a ``RevolveSolid`` whose (r, z) profile is
+    the cylinder's rectangle minus the bore's — exact in ℚ, with the volume
+    following in ℚ[π] from Green's theorem. Returns ``cyl`` unchanged when
+    the bore misses it in z. Raises ValueError for the cases that are not a
+    single revolved region (a bore floating strictly inside — a closed
+    cavity — or one that consumes the whole cylinder)."""
+    if bore.cx != cyl.cx or bore.cy != cyl.cy:
+        raise ValueError("bore is not coaxial with the cylinder — K2.3")
+    if bore.r >= cyl.r:
+        raise ValueError("bore is not narrower than the cylinder — K2.3")
+    z0, z1 = cyl.z0, cyl.z1
+    b0, b1 = max(bore.z0, z0), min(bore.z1, z1)
+    if b1 <= b0:
+        return cyl                              # bore misses in z: unchanged
+    R, rb = cyl.r, bore.r
+    if b0 <= z0 and b1 >= z1:                   # through bore -> annulus
+        loop = [(rb, z0), (R, z0), (R, z1), (rb, z1)]
+    elif b0 <= z0:                              # blind from the bottom
+        loop = [(rb, z0), (R, z0), (R, z1), (0, z1), (0, b1), (rb, b1)]
+    elif b1 >= z1:                              # blind from the top
+        loop = [(0, z0), (R, z0), (R, z1), (rb, z1), (rb, b0), (0, b0)]
+    else:
+        raise ValueError(
+            "bore floats strictly inside the cylinder (a closed cavity) — "
+            "general quadric booleans arrive at K2.3")
+    return RevolveSolid(loop, cyl.cx, cyl.cy)
 
 
 def _member_volume(m):
@@ -695,6 +736,59 @@ class DisjointUnion:
         for m in self.members:
             _classify_pair(m, other)
         return DisjointUnion(self.members + [other])
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """Display mesh = the members' meshes merged. Valid as one mesh
+        because the members are disjoint (at most tangent), so the shells
+        never interpenetrate."""
+        verts: list = []
+        tris: list = []
+        for m in self.members:
+            if not hasattr(m, "tessellate"):    # bare Sphere/Cone: via a stack
+                m = AxisStack(m.cx, m.cy, [m])
+            try:
+                sub = m.tessellate(deflection)
+            except TypeError:                   # planar Solid: meshes exactly
+                sub = m.tessellate()
+            off = len(verts)
+            verts.extend(sub["vertices"])
+            tris.extend([a + off, b + off, c + off] for a, b, c in sub["triangles"])
+        return {"vertices": verts, "triangles": tris}
+
+    @classmethod
+    def _unchecked(cls, members: list) -> "DisjointUnion":
+        """Build without re-running the pairwise predicates — for members
+        derived from an already-validated union by an operation that can only
+        SHRINK them (see ``cut``)."""
+        u = cls.__new__(cls)
+        u.members = list(members)
+        return u
+
+    def cut(self, tool) -> "DisjointUnion":
+        """Subtract ``tool`` from every member: (A ∪ B) ∖ C = (A∖C) ∪ (B∖C).
+        Members that the tool misses come back unchanged. Disjointness is
+        preserved because cutting only shrinks a member — (A∖C) ∩ (B∖C) ⊆
+        A ∩ B, already proven measure-zero — so the result needs no
+        re-validation (and its members may now be other exact types)."""
+        from forgekernel.brep import Solid
+
+        out = []
+        for m in self.members:
+            if isinstance(m, Cyl) and isinstance(tool, Cyl):
+                out.append(bore_cyl(m, tool))
+            elif isinstance(m, (Solid, DrilledSolid)) and isinstance(tool, Cyl):
+                base = DrilledSolid(m, []) if isinstance(m, Solid) else m
+                try:
+                    out.append(base.cut(tool))
+                except ValueError as exc:
+                    if "misses the solid in z" not in str(exc):
+                        raise
+                    out.append(m)               # tool misses this member
+            else:
+                raise ValueError(
+                    f"cut of {type(m).__name__} by {type(tool).__name__} in a "
+                    "disjoint union arrives at K2.3")
+        return DisjointUnion._unchecked(out)
 
     def volume(self) -> "PiVal":
         total = PiVal(0, 0)
@@ -761,6 +855,13 @@ def _classify_pair(a, b) -> None:
     if isinstance(b, Sphere) and isinstance(a, Solid):
         _sphere_solid(b, a)
         return
+    # z-cylinder / planar Solid (a mounting boss standing on a face)
+    if isinstance(a, Cyl) and isinstance(b, Solid):
+        _cyl_solid(a, b)
+        return
+    if isinstance(b, Cyl) and isinstance(a, Solid):
+        _cyl_solid(b, a)
+        return
     # sphere / sphere
     if isinstance(a, Sphere) and isinstance(b, Sphere):
         d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2 + (a.cz - b.cz) ** 2
@@ -773,6 +874,28 @@ def _classify_pair(a, b) -> None:
         "at K2.3")
 
 
+def _require_convex(solid: "Solid", what: str) -> None:
+    """Raise unless every vertex is on the inward side of every face plane.
+
+    The separating-plane predicates below are sound ONLY for a convex solid: a
+    convex body is the intersection of its face half-spaces, so "outside one
+    face plane" implies "outside the solid". For a non-convex solid that
+    implication fails — a bore sitting inside an L-bracket's arm is outside the
+    plane of the other arm's face — and accepting it would silently double-count
+    the overlap. Exact (rational comparisons); refuses rather than guesses."""
+    planes, verts = {}, set()
+    for p in solid.polys:
+        planes.setdefault(p.plane.canonical(), (p.plane.n, p.plane.d))
+        verts.update(p.verts)
+    for n, dpl in planes.values():
+        for v in verts:
+            if dot(n, v) - dpl > 0:
+                raise ValueError(
+                    f"{what} against a non-convex solid — the separating-plane "
+                    "test is not sound there; general quadric booleans arrive "
+                    "at K2.3")
+
+
 def _sphere_solid(s: "Sphere", solid: "Solid") -> None:
     """Disjoint/tangent iff the sphere center lies on the far side of (or
     exactly on) some face plane by at least the radius — exact, sqrt-free:
@@ -780,6 +903,7 @@ def _sphere_solid(s: "Sphere", solid: "Solid") -> None:
     g² ≥ r²·(n·n) (both sides squared, exact). Convex-solid sufficient
     condition; a sphere separated from a convex solid is separated by one
     of its face planes."""
+    _require_convex(solid, "sphere")
     c = (s.cx, s.cy, s.cz)
     seen = set()
     for p in solid.polys:
@@ -793,6 +917,35 @@ def _sphere_solid(s: "Sphere", solid: "Solid") -> None:
             return                            # separated by this face plane
     raise ValueError(
         "sphere overlaps the solid — general quadric booleans arrive at K2.3")
+
+
+def _cyl_solid(c: "Cyl", solid: "Solid") -> None:
+    """Disjoint/tangent iff some face plane of the solid separates the
+    z-cylinder — exact and sqrt-free. For outward plane n·x = d, the
+    cylinder's minimum of n·x is
+
+        n_x·cx + n_y·cy + min(n_z·z0, n_z·z1) − r·√(n_x² + n_y²),
+
+    so the cylinder is clear of that plane iff A ≥ r·√(n_x²+n_y²) where
+    A = n_x·cx + n_y·cy + min(n_z·z0, n_z·z1) − d. Both sides are squared
+    (A ≥ 0 and A² ≥ r²·(n_x²+n_y²)) to stay in ℚ. A mounting boss standing
+    ON a face gives A = 0 exactly — tangent, measure-zero, admitted.
+    Sufficient for a convex solid (separating-plane argument); for a
+    non-convex one it is conservative, so it refuses rather than guesses."""
+    _require_convex(solid, "cylinder")
+    seen = set()
+    for p in solid.polys:
+        key = p.plane.canonical()
+        if key in seen:
+            continue
+        seen.add(key)
+        n, dpl = p.plane.n, p.plane.d
+        a = (n[0] * c.cx + n[1] * c.cy
+             + min(n[2] * c.z0, n[2] * c.z1) - dpl)
+        if a >= 0 and a * a >= c.r * c.r * (n[0] * n[0] + n[1] * n[1]):
+            return                            # separated by this face plane
+    raise ValueError(
+        "cylinder overlaps the solid — general quadric booleans arrive at K2.3")
 
 
 class RoundedBox:
