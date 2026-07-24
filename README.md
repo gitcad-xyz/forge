@@ -1,47 +1,44 @@
-# forge — the gitcad-native B-rep kernel
+# forge
 
-From-scratch, unencumbered (Apache-2.0), built to pass the bar OCCT
-sets and then raise it — the plan and the decision record live in
-gitcad ([ADR-0018](https://github.com/gitcad-xyz/gitcad/blob/main/docs/adr/0018-native-kernel.md),
-[coverage plan](https://github.com/gitcad-xyz/gitcad/blob/main/docs/research/kernel-coverage-plan.md)).
+An exact-arithmetic boundary-representation (B-rep) CAD kernel. Geometric and
+topological decisions use exact rational arithmetic (ℚ, ℚ[π], ℚ[√d]) or
+certified intervals; no result depends on a floating-point tolerance.
 
-## The three-oracle chain
+It ships as two PyPI packages:
 
-```
-forgekernel.ref   Python + exact rational arithmetic — the executable
-                  specification; topological decisions are EXACT, never
-                  epsilon-guarded
-      ⇅ differential
-OCCT              the 30-year-hardened independent oracle, driven from
-                  the gitcad benchmark corpus through the Kernel seam
-      ⇅ oracle
-forge (Rust)      the production port, added operator class by operator
-                  class once ref has proven the semantics
-```
+- `forgekernel` — the kernel, pure Python.
+- `forgekernel_rs` — a native (Rust) build of the performance-critical routines,
+  installed automatically when a wheel is available and returning the same
+  results.
 
-## How progress is measured
+## Capabilities
 
-Not vibes: the [benchmark trend](https://github.com/gitcad-xyz/gitcad/blob/main/bench/TREND.md)
-in the gitcad repo scores every backend on the shared corpus —
-capability %, torture-case pass rate, correctness deltas, wall time.
-Day-one baseline: OCCT scores 93.8%, failing `swept_channel`
-(sharp-cornered sweep → invalid geometry). Beating that number with
-exact arithmetic is the first milestone.
+- Planar solids: rational linear algebra, plane-based B-rep, booleans,
+  divergence-theorem mass properties.
+- Quadrics (cylinder, cone, sphere, torus) with closed-form intersections.
+- NURBS curves and surfaces; surface–surface intersection with complete branch
+  detection and certified points.
+- Procedural offsets and shells; edge blends (fillets); lofts.
+- Exact volume, centroid, and inertia via the divergence theorem.
+- STEP (AP203/AP214) import and export.
 
-## Roadmap (gates, not dates)
+## Design
 
-- **K1** exact planar core: rational linear algebra, plane-based
-  polyhedral B-rep, epsilon-free booleans, divergence-theorem mass
-  properties, native lineage. Gate: planar corpus green vs OCCT.
-- **K2** quadrics + torus with closed-form intersectors — most of
-  real mech. Gate: ≥80% corpus green.
-- **K3** NURBS + branch-complete surface–surface intersection (the
-  crown jewel). **K4** procedural offsets/shell. **K5** G2 blends.
-  **K6** the surfacing suite — the SolidWorks-class end goal.
+A Python reference implementation defines the exact semantics. A Rust build
+provides the same operations for production use; each ported routine is
+cross-checked against the reference. Design notes and decisions are recorded in
+the gitcad repository (ADR-0018).
 
 ## Layout
 
-- `src/forgekernel/` — the Python reference kernel (`ref`)
-- `rust/` — the forge port (arrives with K1 stability)
-- gitcad consumes both through its `Kernel` seam; nothing here depends
-  on gitcad
+- `src/forgekernel/` — the Python kernel.
+- `rust/forge-core/` — the native build (`forgekernel_rs`).
+
+## Install
+
+```
+pip install forgekernel          # pure Python
+pip install forgekernel[rust]    # add the native build
+```
+
+License: Apache-2.0. Source: https://github.com/gitcad-xyz/forge

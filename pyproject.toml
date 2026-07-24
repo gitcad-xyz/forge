@@ -43,7 +43,7 @@ Issues = "https://github.com/gitcad-xyz/forge/issues"
 [project.optional-dependencies]
 # Optional native accelerator (separate compiled wheels). forgekernel runs
 # pure-Python and exact WITHOUT it; forgekernel_rs only speeds the hot paths.
-rust = ["forgekernel_rs>=0.1.0"]
+rust = ["forgekernel_rs>=0.8.0"]
 test = ["pytest>=7"]
 
 [tool.setuptools.dynamic]

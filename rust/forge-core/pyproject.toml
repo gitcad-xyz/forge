@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "forgekernel_rs"
-version = "0.1.0"
+version = "0.8.0"
 description = "Native (Rust) build of performance-critical routines for the forgekernel CAD kernel"
 readme = "README.md"
 license = {text = "Apache-2.0"}
