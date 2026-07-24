@@ -109,6 +109,27 @@ def test_section_through_drilled_hole_splits_into_two_loops() -> None:
     assert spans == [(0, 3), (7, 10)]      # slot clears Y∈(3,7)
 
 
+def test_counterbore_sections_as_one_stepped_profile() -> None:
+    # coaxial bores (r2 through + r4 counterbore over z7..10) must section as a
+    # single stepped profile: two closed loops with the shoulder step, NOT the
+    # inner wall drawn straight through the empty counterbore cavity.
+    cbore = DrilledSolid(Solid.box(20, 20, 10),
+                         [Cyl(10, 10, 2, 0, 10), Cyl(10, 10, 4, 7, 10)])
+    side = _chain(section_polys(cbore, (0, 1, 0), (1, 0, 0), 10.0))
+    assert len(side) == 2                      # material either side of the bore
+    # each loop steps in at the shoulder: both the r2 wall (x=8/12) and the r4
+    # wall (x=6/14) appear, so the x-extent per loop is 8 (0..8), not 6.
+    left = min(side, key=lambda lp: min(p[0] for p in lp))
+    xs = sorted({round(p[0], 3) for p in left})
+    assert 6.0 in xs and 8.0 in xs             # both radii present -> stepped
+    # a plane normal to the bore, inside the counterbore band, shows ONLY the
+    # outer (r4) circle — no phantom inner r2 circle.
+    top = section_polys(cbore, (0, 0, 1), (1, 0, 0), 8.5)
+    radii = [round(math.hypot(p[0] - 10, p[1] - 10), 2)
+             for pl in top for p in pl if math.hypot(p[0] - 10, p[1] - 10) < 6]
+    assert radii and all(abs(r - 4.0) < 0.3 for r in radii)
+
+
 def test_section_normal_to_bore_shows_the_hole_circle() -> None:
     # a plane perpendicular to the bore axis cuts the wall as a full circle:
     # outer rectangle + inner circle = two loops (the hole stays clear).

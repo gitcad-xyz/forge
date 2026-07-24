@@ -419,27 +419,28 @@ def _planar_face_section(poly, fn, nc, dc, bores):
     return segs
 
 
-def _cyl_wall_section(c, nc, dc, deflection):
-    """Segments where the cut plane crosses a z-cylinder's wall. Two vertical
-    generators when the plane is parallel to the axis; a sampled ellipse/circle
-    otherwise."""
-    cx, cy, r, z0, z1 = _cyl_tuple(c)
+def _wall_xy(cx, cy, r, nc, dc):
+    """The up-to-two (x, y) where a z-cylinder wall (radius r) meets a cut plane
+    parallel to the axis (nz≈0), or [] if the plane misses it."""
+    nx, ny, _ = nc
+    mag = r * math.hypot(nx, ny)
+    if mag < 1e-12:
+        return []
+    cth = (dc - (nx * cx + ny * cy)) / mag
+    if cth < -1 - 1e-9 or cth > 1 + 1e-9:
+        return []
+    phi = math.atan2(ny, nx)
+    ac = math.acos(max(-1.0, min(1.0, cth)))
+    return [(cx + r * math.cos(t), cy + r * math.sin(t)) for t in {phi + ac, phi - ac}]
+
+
+def _cyl_wall_seg(cx, cy, r, z0, z1, nc, dc, deflection):
+    """Segments where the cut plane crosses a z-cylinder wall over [z0, z1].
+    Two vertical generators when the plane is parallel to the axis; a sampled
+    ellipse/circle otherwise."""
     nx, ny, nz = nc
-    a0 = nx * cx + ny * cy
     if abs(nz) < 1e-9:                    # plane parallel to the axis
-        mag = r * math.hypot(nx, ny)
-        if mag < 1e-12:
-            return []
-        cth = (dc - a0) / mag
-        if cth < -1 - 1e-9 or cth > 1 + 1e-9:
-            return []
-        phi = math.atan2(ny, nx)
-        ac = math.acos(max(-1.0, min(1.0, cth)))
-        out = []
-        for th in {phi + ac, phi - ac}:
-            x, y = cx + r * math.cos(th), cy + r * math.sin(th)
-            out.append(((x, y, z0), (x, y, z1)))
-        return out
+        return [((x, y, z0), (x, y, z1)) for (x, y) in _wall_xy(cx, cy, r, nc, dc)]
     segs = _circle_segs(r, deflection)   # plane crosses the axis: sample θ
     prev = None
     out = []
@@ -451,6 +452,50 @@ def _cyl_wall_section(c, nc, dc, deflection):
         if prev is not None and cur is not None:
             out.append((prev, cur))
         prev = cur
+    return out
+
+
+def _cyl_wall_section(c, nc, dc, deflection):
+    cx, cy, r, z0, z1 = _cyl_tuple(c)
+    return _cyl_wall_seg(cx, cy, r, z0, z1, nc, dc, deflection)
+
+
+def _bore_bands(group):
+    """Partition a coaxial bore group into z-bands, each tagged with the
+    OUTERMOST radius covering it — the profile of the bores' union. ``group`` is
+    a list of (cx, cy, r, z0, z1) tuples sharing (cx, cy)."""
+    zs = sorted({z for (_, _, _, z0, z1) in group for z in (z0, z1)})
+    bands = []
+    for za, zb in zip(zs, zs[1:]):
+        zmid = (za + zb) / 2
+        rs = [r for (_, _, r, z0, z1) in group if z0 - 1e-9 <= zmid <= z1 + 1e-9]
+        if rs:
+            bands.append((za, zb, max(rs)))
+    return bands
+
+
+def _section_bore_group(group, nc, dc, deflection):
+    """Section a coaxial bore stack (e.g. a counterbore) as ONE stepped-cylinder
+    profile: walls at the outermost radius per z-band, plus shoulder rings where
+    the radius steps (only visible when the plane is parallel to the axis).
+    Sectioning each bore independently would draw the inner wall straight through
+    the empty counterbore cavity and omit the shoulder."""
+    cx, cy = float(group[0][0]), float(group[0][1])
+    bands = _bore_bands(group)
+    out = []
+    for za, zb, r in bands:
+        out += _cyl_wall_seg(cx, cy, r, za, zb, nc, dc, deflection)
+    if abs(nc[2]) < 1e-9:                 # shoulders only cut when plane ∥ axis
+        for (za, zb, r0), (zb2, zc, r1) in zip(bands, bands[1:]):
+            if abs(r0 - r1) < 1e-12:
+                continue
+            lo = _wall_xy(cx, cy, min(r0, r1), nc, dc)
+            hi = _wall_xy(cx, cy, max(r0, r1), nc, dc)
+            for h in hi:                 # connect each outer point to its side's inner
+                if not lo:
+                    continue
+                l = min(lo, key=lambda p: (p[0] - h[0]) ** 2 + (p[1] - h[1]) ** 2)
+                out.append(((l[0], l[1], zb), (h[0], h[1], zb)))
     return out
 
 
@@ -499,8 +544,11 @@ def _section_segments(solid, nc, dc, deflection):
         bores = [_cyl_tuple(x) for x in solid.bores]
         out = [s for poly, fn in _solid_polys_n(solid.base)
                for s in _planar_face_section(poly, fn, nc, dc, bores)]
-        for x in solid.bores:
-            out += _cyl_wall_section(x, nc, dc, deflection)
+        groups = {}                      # coaxial bores section as one profile
+        for b in bores:
+            groups.setdefault((round(b[0], 9), round(b[1], 9)), []).append(b)
+        for g in groups.values():
+            out += _section_bore_group(g, nc, dc, deflection)
         return out
     if name == "Cyl":
         return (_cyl_wall_section(solid, nc, dc, deflection)
