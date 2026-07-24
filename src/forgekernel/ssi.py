@@ -414,11 +414,19 @@ def _order_branch(points):
         gaps.append(d2(nxt, last) ** 0.5)
         order.append(nxt)
         todo.discard(nxt)
-    # closed when the wrap-around gap is on the order of a typical step
+    ordered = [points[i] for i in order]
+    # Closure needs enough samples to be decidable: with only 3 points the
+    # median-of-two collapses to the LARGER gap, and the triangle inequality
+    # then forces wrap ≤ g1+g2 ≤ 2·median for ANY three points — so the test
+    # would call every 3-point arc closed. A genuine median needs ≥3 gaps
+    # (n ≥ 4); below that, report open (closure is undecidable from the
+    # samples) rather than let a float heuristic mis-decide the topology.
+    if n < 4:
+        return ordered, False
     wrap = d2(order[0], order[-1]) ** 0.5
     med = sorted(gaps)[len(gaps) // 2]
     closed = med > 0 and wrap <= 2.0 * med
-    return [points[i] for i in order], closed
+    return ordered, closed
 
 
 def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):

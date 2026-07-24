@@ -91,3 +91,32 @@ def test_validate_catches_bad_topology() -> None:
         TrimmedPatch(_plane(), [[(0, 0), (11, 0), (11, 5), (0, 5)]]).validate()
     with pytest.raises(ValueError, match=">= 3 vertices"):
         TrimmedPatch(_plane(), [[(0, 0), (1, 1)]])
+
+
+def test_validate_rejects_hole_sticking_out_of_outer() -> None:
+    # regression: the old check tested only the hole's vertex AVERAGE. This
+    # triangle averages to (10/3,10/3) — inside the outer square [0,4]^2 — but
+    # two of its vertices lie OUTSIDE it, so the hole is not contained.
+    outer = [(0, 0), (4, 0), (4, 4), (0, 4)]
+    hole = [(2, 2), (6, 2), (2, 6)]                      # avg in, vertices out
+    with pytest.raises(ValueError, match="not inside the outer"):
+        TrimmedPatch(_plane(), [outer, hole]).validate()
+
+
+def test_validate_rejects_hole_edge_crossing_a_concavity() -> None:
+    # every hole vertex is inside a non-convex (L-shaped) outer, yet a hole
+    # edge crosses out through the notch — must be rejected by the edge test.
+    L = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+    hole = [(2, 2), (8, 2), (2, 8)]     # (8,2) in the horizontal arm, (2,8) in
+    #                                     the vertical arm, but edge (8,2)-(2,8)
+    #                                     slices through the empty notch
+    with pytest.raises(ValueError, match="crosses the outer boundary"):
+        TrimmedPatch(_plane(), [L, hole]).validate()
+
+
+def test_validate_accepts_valid_hole_in_nonconvex_outer() -> None:
+    # a hole fully inside the vertical arm of the L — all vertices in, no edge
+    # crossing — must pass (the old vertex-average test could false-reject).
+    L = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+    hole = [(1, 5), (3, 5), (3, 8), (1, 8)]
+    TrimmedPatch(_plane(), [L, hole]).validate()        # no raise

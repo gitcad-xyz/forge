@@ -37,6 +37,23 @@ def _as_uv(pt):
     return (F(pt[0]), F(pt[1]))
 
 
+def _orient(a, b, c):
+    """Sign of the cross product (b−a)×(c−a): +1 left, −1 right, 0 collinear.
+    Exact in ℚ."""
+    d = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return (d > 0) - (d < 0)
+
+
+def _segments_properly_cross(a, b, c, d) -> bool:
+    """Do open segments a→b and c→d cross at an interior point? Exact ℚ, and
+    strict: shared endpoints or collinear touching do NOT count (those are
+    legal hole-touches-outer contacts, not a boundary crossing)."""
+    o1, o2 = _orient(a, b, c), _orient(a, b, d)
+    o3, o4 = _orient(c, d, a), _orient(c, d, b)
+    return o1 != 0 and o2 != 0 and o3 != 0 and o4 != 0 \
+        and o1 != o2 and o3 != o4
+
+
 class TrimmedPatch:
     """A surface restricted to the region its trim loops enclose.
 
@@ -155,8 +172,22 @@ class TrimmedPatch:
                     raise ValueError(
                         f"loop {i}: vertex ({u},{v}) outside surface domain")
         outer = TrimmedPatch(self.surface, [self.loops[0]])
+        outer_loop = self.loops[0]
+        no = len(outer_loop)
         for i, hole in enumerate(self.loops[1:], start=1):
-            hu = sum(p[0] for p in hole) / len(hole)
-            hv = sum(p[1] for p in hole) / len(hole)
-            if outer.classify(hu, hv) != "in":
-                raise ValueError(f"hole {i} is not inside the outer boundary")
+            # WHOLE-polygon containment, not a single sample point: every hole
+            # vertex must be in-or-on the outer boundary AND no hole edge may
+            # properly cross an outer edge. Testing only the vertex average
+            # accepts holes that stick out through the boundary and rejects
+            # valid holes whose average lands in a concavity (reviewed 2026-07).
+            for (u, v) in hole:
+                if outer.classify(u, v) == "out":
+                    raise ValueError(f"hole {i} is not inside the outer boundary")
+            mh = len(hole)
+            for a in range(mh):
+                h0, h1 = hole[a], hole[(a + 1) % mh]
+                for b in range(no):
+                    o0, o1 = outer_loop[b], outer_loop[(b + 1) % no]
+                    if _segments_properly_cross(h0, h1, o0, o1):
+                        raise ValueError(
+                            f"hole {i} crosses the outer boundary")

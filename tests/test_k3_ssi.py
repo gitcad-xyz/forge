@@ -240,6 +240,25 @@ def test_order_branch_open_line_is_monotonic() -> None:
     assert closed is False
 
 
+def test_order_branch_small_arcs_are_not_falsely_closed() -> None:
+    # regression: a 3-point OPEN arc was always reported closed, because for
+    # n==3 the median-of-two gaps is the larger gap and the triangle
+    # inequality forces wrap <= 2*median. Closure is undecidable at n<4.
+    from forgekernel.ssi import _order_branch
+
+    line3 = [(F(0), F(0), F(0), F(0)), (F(1), F(0), F(0), F(0)),
+             (F(2), F(0), F(0), F(0))]
+    ordered, closed = _order_branch(line3)
+    assert closed is False
+    ou = [float(p[0]) for p in ordered]
+    assert ou == sorted(ou) or ou == sorted(ou, reverse=True)
+    # a non-collinear 3-point arc is also open, not a loop
+    _, closed3 = _order_branch([(F(0), F(0), F(0), F(0)),
+                                (F(1), F(2), F(0), F(0)),
+                                (F(3), F(0), F(0), F(0))])
+    assert closed3 is False
+
+
 def test_order_branch_detects_closed_loop() -> None:
     import math
 
