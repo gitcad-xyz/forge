@@ -359,10 +359,32 @@ def _perp(n):
     return (p[0] / m, p[1] / m, p[2] / m)
 
 
-def write_step_planar_solid(solid, *, name: str = "gitcad_part") -> str:
-    """Emit a planar-faced forge Solid as a valid AP214 STEP file
-    (full product structure + MANIFOLD_SOLID_BREP with shared straight
-    edges). Round-trips through OCCT and :func:`read_step_planar_solid`."""
+def _poly_contains_xy(verts, px, py) -> bool:
+    """Ray parity in xy for a face polygon (used to decide which cap fragment
+    a bore breaks through)."""
+    inside = False
+    n = len(verts)
+    for i in range(n):
+        (x1, y1) = verts[i][0], verts[i][1]
+        (x2, y2) = verts[(i + 1) % n][0], verts[(i + 1) % n][1]
+        if (y1 > py) != (y2 > py):
+            if px < x1 + (py - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    return inside
+
+
+def write_step_planar_solid(solid, *, name: str = "gitcad_part",
+                            bores=()) -> str:
+    """Emit a forge solid as a valid AP214 STEP file (full product structure +
+    MANIFOLD_SOLID_BREP with shared edges).
+
+    ``solid`` supplies the planar faces; ``bores`` is an optional list of z-axis
+    ``Cyl`` bores drilled through it. A bore contributes a CYLINDRICAL_SURFACE
+    wall (as two half-faces, so no periodic seam is needed), a circular inner
+    bound on each cap it breaks through, and a flat disk face where it ends
+    blind. Circles and cylinders are emitted as EXACT analytic surfaces, not
+    faceted — a drilled plate exports as a real cylindrical hole that any CAD
+    system reads back as a hole."""
     lines: list[str] = []
     nid = [0]
 
@@ -424,6 +446,36 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part") -> str:
                           ka, kb)
         return edges[key]
 
+    def zplacement(cx, cy, z, up=1):
+        """AXIS2_PLACEMENT_3D on the +z (or −z) axis through (cx, cy, z),
+        ref direction +x — the frame every circle and cylinder here uses."""
+        o = emit(f"CARTESIAN_POINT('',({_dec(cx)},{_dec(cy)},{_dec(z)}))")
+        ax = emit(f"DIRECTION('',(0.,0.,{'1.' if up > 0 else '-1.'}))")
+        rd = emit(f"DIRECTION('',(1.,0.,0.))")
+        return emit(f"AXIS2_PLACEMENT_3D('',#{o},#{ax},#{rd})")
+
+    def rim_edges(c, z):
+        """The two half-circle EDGE_CURVEs of a bore's rim at height z, split at
+        angles 0 and π so the cylindrical face needs no periodic seam. Cached,
+        so the cap's inner bound and the wall share the very same edges."""
+        key = ("rim", c.cx, c.cy, c.r, z)
+        if key in edges:
+            return edges[key]
+        p0 = (c.cx + c.r, c.cy, z)
+        p1 = (c.cx - c.r, c.cy, z)
+        circ = emit(f"CIRCLE('',#{zplacement(c.cx, c.cy, z)},{_dec(c.r)})")
+        e_a = emit(f"EDGE_CURVE('',#{vertex(p0)},#{vertex(p1)},#{circ},.T.)")
+        e_b = emit(f"EDGE_CURVE('',#{vertex(p1)},#{vertex(p0)},#{circ},.T.)")
+        edges[key] = (e_a, e_b, p0, p1)
+        return edges[key]
+
+    def oriented(eid, fwd):
+        return emit(f"ORIENTED_EDGE('',*,*,#{eid},{'.T.' if fwd else '.F.'})")
+
+    def loop_of(oes):
+        return emit(f"EDGE_LOOP('',({','.join('#' + str(x) for x in oes)}))")
+
+    bores = list(bores)
     face_ids = []
     for poly in solid.polys:
         vs = [tuple(v) for v in poly.verts]
@@ -432,10 +484,24 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part") -> str:
             a, b = vs[i], vs[(i + 1) % len(vs)]
             ec, ka, kb = edge_curve(a, b)
             fwd = (a[0], a[1], a[2]) == ka
-            oe.append(emit(f"ORIENTED_EDGE('',*,*,#{ec},"
-                           f"{'.T.' if fwd else '.F.'})"))
-        loop = emit(f"EDGE_LOOP('',({','.join('#' + str(x) for x in oe)}))")
-        bound = emit(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+            oe.append(oriented(ec, fwd))
+        bound = emit(f"FACE_OUTER_BOUND('',#{loop_of(oe)},.T.)")
+        bounds = [bound]
+        # a z-cap gets a circular INNER bound for every bore that breaks it
+        n = poly.plane.n
+        if n[0] == 0 and n[1] == 0:
+            zc = vs[0][2]
+            for c in bores:
+                if (c.z0 < zc < c.z1 or c.z0 == zc or c.z1 == zc) and \
+                        _poly_contains_xy(vs, c.cx, c.cy):
+                    a_e, b_e, _, _ = rim_edges(c, zc)
+                    # each rim half-circle is shared with the bore wall, which
+                    # traverses the LOWER rim forward and the UPPER rim
+                    # backward; the cap must take the opposite sense so every
+                    # edge is used once .T. and once .F. (manifold closure).
+                    fwd = n[2] > 0                       # top cap vs bottom cap
+                    hole = loop_of([oriented(a_e, fwd), oriented(b_e, fwd)])
+                    bounds.append(emit(f"FACE_BOUND('',#{hole},.T.)"))
         (nx, ny, nz), _ = _unit3(poly.plane.n)
         rx, ry, rz = _perp((nx, ny, nz))
         origin = emit(f"CARTESIAN_POINT('',({_dec(vs[0][0])},{_dec(vs[0][1])},"
@@ -444,7 +510,41 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part") -> str:
         rdir = emit(f"DIRECTION('',({fnum(rx)},{fnum(ry)},{fnum(rz)}))")
         place = emit(f"AXIS2_PLACEMENT_3D('',#{origin},#{axis},#{rdir})")
         plane = emit(f"PLANE('',#{place})")
-        face_ids.append(emit(f"ADVANCED_FACE('',(#{bound}),#{plane},.T.)"))
+        blist = ",".join("#" + str(b) for b in bounds)
+        face_ids.append(emit(f"ADVANCED_FACE('',({blist}),#{plane},.T.)"))
+
+    # -- bore walls (two half-cylinder faces) + blind end caps ----------------
+    (_, _, sz0), (_, _, sz1) = solid.bbox()
+    for c in bores:
+        z0, z1 = max(c.z0, sz0), min(c.z1, sz1)
+        if z1 <= z0:
+            continue
+        lo_a, lo_b, lp0, lp1 = rim_edges(c, z0)
+        hi_a, hi_b, hp0, hp1 = rim_edges(c, z1)
+        seam0 = edge_curve(lp0, hp0)[0]         # the two vertical seam edges
+        seam1 = edge_curve(lp1, hp1)[0]
+        cyl = emit(f"CYLINDRICAL_SURFACE('',#{zplacement(c.cx, c.cy, z0)},"
+                   f"{_dec(c.r)})")
+        for lo_e, hi_e, s_from, s_to in ((lo_a, hi_a, seam1, seam0),
+                                         (lo_b, hi_b, seam0, seam1)):
+            oes = [oriented(lo_e, True), oriented(s_from, True),
+                   oriented(hi_e, False), oriented(s_to, False)]
+            b = emit(f"FACE_OUTER_BOUND('',#{loop_of(oes)},.T.)")
+            # material lies OUTSIDE a bore, so the solid's outward normal points
+            # toward the axis — opposite the cylinder's own normal: .F.
+            face_ids.append(emit(f"ADVANCED_FACE('',(#{b}),#{cyl},.F.)"))
+        # A blind end gets a flat disk. Its outward normal points INTO the bore
+        # (material is on the far side): +z at the floor, −z at the ceiling.
+        # The loop sense is independent of that — it mirrors the wall, which
+        # takes the lower rim forward and the upper rim backward.
+        for zb, axis_up, fwd in ((z0, 1, False), (z1, -1, True)):
+            if (zb == sz0 and c.z0 <= sz0) or (zb == sz1 and c.z1 >= sz1):
+                continue                        # breaks through: no disk here
+            a_e, b_e, _, _ = rim_edges(c, zb)
+            disk = loop_of([oriented(a_e, fwd), oriented(b_e, fwd)])
+            b = emit(f"FACE_OUTER_BOUND('',#{disk},.T.)")
+            pl = emit(f"PLANE('',#{zplacement(c.cx, c.cy, zb, axis_up)})")
+            face_ids.append(emit(f"ADVANCED_FACE('',(#{b}),#{pl},.T.)"))
 
     shell = emit(f"CLOSED_SHELL('',({','.join('#' + str(x) for x in face_ids)}))")
     brep = emit(f"MANIFOLD_SOLID_BREP('{name}',#{shell})")
