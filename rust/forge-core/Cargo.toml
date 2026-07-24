@@ -3,7 +3,7 @@ name = "forge-core"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Native (Rust) accelerator for the forgekernel exact-arithmetic B-rep CAD kernel"
+description = "Native (Rust) build of performance-critical routines for the forgekernel CAD kernel"
 repository = "https://github.com/gitcad-xyz/forge"
 
 [lib]

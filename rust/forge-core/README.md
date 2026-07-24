@@ -1,21 +1,23 @@
-# forgekernel_rs — native accelerator for forgekernel
+# forgekernel_rs
 
-The optional Rust build of the hot paths in
-[`forgekernel`](https://pypi.org/project/forgekernel/), the exact-arithmetic
-B-rep CAD kernel. It is a **drop-in speed-up, not a dependency**: `forgekernel`
-runs pure-Python and produces identical (exact ℚ) results without it, then
-transparently uses `forgekernel_rs` for the surface–surface intersection and
-predicate inner loops when the extension is importable.
+Native (Rust) build of performance-critical routines for
+[`forgekernel`](https://pypi.org/project/forgekernel/), an exact-arithmetic
+B-rep CAD kernel.
 
-Bit-identical to the Python reference — every ported routine is oracle-checked
-against it, so the accelerator never changes an answer, only the wall time.
+`forgekernel` runs without this package (pure Python). When `forgekernel_rs` is
+installed, it is used for the surface–surface intersection and geometric
+predicate routines and returns the same results.
 
-```bash
-pip install forgekernel[rust]     # forgekernel + this accelerator
+## Install
+
+```
+pip install forgekernel[rust]
 ```
 
-Built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) as an
-`abi3-py311` wheel (one wheel per platform serves every CPython ≥ 3.11).
-Exact rationals use `num-bigint` / `num-rational`.
+## Build
 
-Apache-2.0. Source and design: https://github.com/gitcad-xyz/forge
+Built with [PyO3](https://pyo3.rs) and [maturin](https://www.maturin.rs) as an
+`abi3` wheel (one wheel per platform, CPython 3.11+). Exact arithmetic uses
+`num-bigint` / `num-rational`.
+
+License: Apache-2.0. Source: https://github.com/gitcad-xyz/forge

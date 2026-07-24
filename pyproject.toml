@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgekernel"
 dynamic = ["version"]
-description = "Exact-arithmetic B-rep CAD kernel: topology decided in ℚ, never by floating-point epsilon"
+description = "Exact-arithmetic B-rep CAD kernel"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
@@ -13,8 +13,7 @@ authors = [{name = "Dan Willis", email = "danielcwillis@gmail.com"}]
 maintainers = [{name = "Dan Willis", email = "danielcwillis@gmail.com"}]
 keywords = [
     "cad", "b-rep", "brep", "geometry", "kernel", "nurbs", "solid-modeling",
-    "computational-geometry", "exact-arithmetic", "rational-arithmetic",
-    "step", "occt", "opencascade",
+    "computational-geometry", "exact-arithmetic", "rational-arithmetic", "step",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
