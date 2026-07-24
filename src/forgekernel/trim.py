@@ -93,6 +93,19 @@ class TrimmedPatch:
         """True iff (u, v) is in the strict interior of the trimmed region."""
         return self.classify(u, v) == "in"
 
+    # -- exact volume contribution (K7 flux over the trim loops) ---------------
+
+    def flux(self):
+        """This trimmed face's exact flux contribution
+        (1/3)∮∮_D S·(S_u×S_v) du dv to the enclosed solid volume, via Green's
+        theorem over the trim loops (:func:`forgekernel.bsolid.trimmed_patch_flux`).
+        Requires a polynomial surface. Loops are winding-normalized first so
+        the outer/hole orientation is correct. Summing ``flux`` over the
+        outward-oriented faces of a closed shell gives the solid volume."""
+        from forgekernel.bsolid import trimmed_patch_flux
+        n = self.normalized()
+        return trimmed_patch_flux(n.surface, n.loops)
+
     # -- exact measures --------------------------------------------------------
 
     @staticmethod

@@ -88,6 +88,66 @@ def patch_flux(surface: BSplineSurface) -> Fraction:
     return total / 3
 
 
+def trimmed_patch_flux(surface: BSplineSurface, loops) -> Fraction:
+    """(1/3)∮∮_D S·(S_u×S_v) du dv over the TRIMMED parameter region D of a
+    polynomial patch — D bounded by polygonal ``loops`` in the surface's
+    (u, v) domain (outer CCW, holes CW; use ``TrimmedPatch.normalized()``).
+
+    Green's theorem turns the area integral into a contour integral over the
+    loop edges: ∫∫_D F du dv = ∮_∂D G dv with G(u,v)=∫_{u0}^{u} F(u',v) du'.
+    F = S·(S_u×S_v) is a polynomial (u-degree 3p−1, v-degree 3q−1), so the
+    inner u-antiderivative is an exact 3p-node quadrature and the outer
+    edge integral (G is degree 3(p+q)−1 along a straight edge) an exact
+    3(p+q)-node one — the whole result is exact ℚ.
+
+    Exactness holds for polynomial patches AND polygonal trim loops. When
+    the loops are the polyline sampling of a curved SSI trim boundary, the
+    result is exact for THAT polygon — i.e. it carries the boundary's
+    discretization error, not a rounding one (the honest K7 caveat)."""
+    if any(w != F(1) for row in surface.w for w in row):
+        raise ValueError("exact trimmed flux: polynomial patches only (K7.1)")
+    p, q = surface.p, surface.q
+    (ud0, _), _ = surface.domain()
+    ud0 = F(ud0)
+    inn = _nodes(3 * p)
+    inw = _lagrange_weights(inn)
+    otn = _nodes(3 * (p + q))
+    otw = _lagrange_weights(otn)
+
+    def Fpt(u, v):
+        S, Su, Sv = surface_partials2(surface, u, v)[:3]
+        return _triple(S, Su, Sv)
+
+    def Gpt(u, v):                 # ∫_{ud0}^{u} F(u',v) du' via σ∈[0,1] map
+        span = u - ud0
+        return span * sum(w * Fpt(ud0 + s * span, v) for w, s in zip(inw, inn))
+
+    total = F(0)
+    for loop in loops:
+        pts = [(F(a), F(b)) for a, b in loop]
+        m = len(pts)
+        for k in range(m):
+            (ua, va), (ub, vb) = pts[k], pts[(k + 1) % m]
+            dvv = vb - va
+            if dvv == 0:           # a horizontal edge adds nothing to ∮ G dv
+                continue
+            duu = ub - ua
+            edge = F(0)
+            for w, tau in zip(otw, otn):
+                edge += w * Gpt(ua + tau * duu, va + tau * dvv)
+            total += dvv * edge
+    return total / 3
+
+
+def trimmed_solid_volume(faces) -> Fraction:
+    """Volume of a solid whose closed, outward-oriented boundary is a set of
+    TRIMMED polynomial patches — Σ per-face flux, exact ℚ. ``faces`` is a
+    list of ``(surface, loops)``. This is the boolean-assembly reduction:
+    a boolean re-trims faces and adds intersection-curve loops, but the
+    enclosed volume is just the sum of the trimmed-face fluxes."""
+    return abs(sum((trimmed_patch_flux(s, loops) for s, loops in faces), F(0)))
+
+
 class PatchSolid:
     """A closed solid whose boundary is a list of outward-oriented
     polynomial Bézier patches. Volume exact in ℚ via the flux theorem."""
