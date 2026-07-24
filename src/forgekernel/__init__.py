@@ -4,4 +4,4 @@ Exact rational arithmetic for every topological decision; approximation
 only with tracked error bounds. See README for the three-oracle chain.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"

@@ -4,8 +4,32 @@ build-backend = "maturin"
 
 [project]
 name = "forgekernel_rs"
-version = "0.0.1"
+version = "0.1.0"
+description = "Native (Rust) accelerator for forgekernel — the exact-arithmetic B-rep CAD kernel"
+readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
+authors = [{name = "Dan Willis", email = "danielcwillis@gmail.com"}]
+keywords = ["cad", "b-rep", "geometry", "kernel", "nurbs", "exact-arithmetic", "rust", "pyo3"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.urls]
+Homepage = "https://github.com/gitcad-xyz/forge"
+Repository = "https://github.com/gitcad-xyz/forge"
+Issues = "https://github.com/gitcad-xyz/forge/issues"
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
+# abi3 wheel — a single artifact per platform serves all CPython >= 3.11.
+features = ["pyo3/abi3-py311"]

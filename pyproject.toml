@@ -4,10 +4,51 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forgekernel"
-version = "0.0.1"
-description = "gitcad-native B-rep kernel: exact-arithmetic reference implementation"
+dynamic = ["version"]
+description = "Exact-arithmetic B-rep CAD kernel: topology decided in ℚ, never by floating-point epsilon"
+readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
+authors = [{name = "Dan Willis", email = "danielcwillis@gmail.com"}]
+maintainers = [{name = "Dan Willis", email = "danielcwillis@gmail.com"}]
+keywords = [
+    "cad", "b-rep", "brep", "geometry", "kernel", "nurbs", "solid-modeling",
+    "computational-geometry", "exact-arithmetic", "rational-arithmetic",
+    "step", "occt", "opencascade",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+# Pure standard library at runtime — exact arithmetic needs no third-party deps.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/gitcad-xyz/forge"
+Repository = "https://github.com/gitcad-xyz/forge"
+Issues = "https://github.com/gitcad-xyz/forge/issues"
+"Design — ADR-0018" = "https://github.com/gitcad-xyz/gitcad/blob/main/docs/adr/0018-native-kernel.md"
+"Benchmarks vs OCCT" = "https://github.com/gitcad-xyz/gitcad/blob/main/bench/RUST-vs-OCCT.md"
+
+[project.optional-dependencies]
+# Optional native accelerator (separate compiled wheels). forgekernel runs
+# pure-Python and exact WITHOUT it; forgekernel_rs only speeds the hot paths.
+rust = ["forgekernel_rs>=0.1.0"]
+test = ["pytest>=7"]
+
+[tool.setuptools.dynamic]
+version = {attr = "forgekernel.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
