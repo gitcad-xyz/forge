@@ -56,7 +56,22 @@ def lathe(profile_rz: list[tuple], deflection: float = 0.2,
             else:
                 tris.append([a0 + k, b0 + k, b0 + kn])
                 tris.append([a0 + k, b0 + kn, a0 + kn])
+    # orient outward: the revolved profile's winding depends on its direction,
+    # so flip the whole mesh if the signed volume came out negative (inward).
+    if _signed_volume(verts, tris) < 0:
+        tris = [[t[0], t[2], t[1]] for t in tris]
     return {"vertices": verts, "triangles": tris}
+
+
+def _signed_volume(verts: list, tris: list) -> float:
+    total = 0.0
+    for a, b, c in tris:
+        ax, ay, az = verts[a]
+        bx, by, bz = verts[b]
+        cx, cy, cz = verts[c]
+        total += (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
+                  + az * (bx * cy - by * cx))
+    return total
 
 
 def mesh_volume(mesh: dict) -> float:

@@ -83,6 +83,15 @@ class Cyl:
         return ((self.cx - self.r, self.cy - self.r, self.z0),
                 (self.cx + self.r, self.cy + self.r, self.z1))
 
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """Display mesh (walls + both caps) via the surface-of-revolution
+        lathe — floats are legal for a bounded-error view (ADR-0019)."""
+        from forgekernel.tess import lathe
+
+        r, z0, z1 = float(self.r), float(self.z0), float(self.z1)
+        profile = [(0.0, z0), (r, z0), (r, z1), (0.0, z1)]
+        return lathe(profile, deflection, float(self.cx), float(self.cy))
+
 
 def _dist2_point_seg(px, py, ax, ay, bx, by) -> Fraction:
     """Exact squared distance from point to segment (all rational)."""
@@ -197,6 +206,176 @@ class DrilledSolid:
                  "axis_origin": [float(c.cx), float(c.cy), float(c.z0)]}
                 for c in self.bores]
 
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """A watertight display mesh: the base's faces (top/bottom capped
+        around the bores), the bore walls (stepped for coaxial counterbores),
+        the counterbore shoulder rings, and any blind-hole end caps. Floats are
+        legal here — this approximates the exact solid to ``deflection`` chord
+        error (ADR-0019: meshing is a display property)."""
+        import math
+
+        from forgekernel.mesh2d import triangulate
+
+        verts: list[list[float]] = []
+        tris: list[list[int]] = []
+        index: dict = {}
+
+        def V(p) -> int:
+            k = (round(p[0], 9), round(p[1], 9), round(p[2], 9))
+            if k not in index:
+                index[k] = len(verts)
+                verts.append([float(p[0]), float(p[1]), float(p[2])])
+            return index[k]
+
+        def tri(a, b, c, outward) -> None:
+            ia, ib, ic = V(a), V(b), V(c)
+            if ia == ib or ib == ic or ia == ic:
+                return
+            n = ((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+                 (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+                 (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+            if n[0] * outward[0] + n[1] * outward[1] + n[2] * outward[2] < 0:
+                ib, ic = ic, ib
+            tris.append([ia, ib, ic])
+
+        def _segs(r):
+            return (max(24, int(math.ceil(math.pi / math.acos(max(-1.0, 1.0 - deflection / r)))))
+                    if r > deflection else 24)
+
+        def circle(cx, cy, r, n):
+            return [(cx + r * math.cos(2 * math.pi * k / n),
+                     cy + r * math.sin(2 * math.pi * k / n)) for k in range(n)]
+
+        (_, _, bz0), (_, _, bz1) = self.base.bbox()
+        zmin, zmax = float(bz0), float(bz1)
+
+        # coaxial bore groups -> z-bands with the outermost radius per band
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for c in self.bores:
+            groups[(float(c.cx), float(c.cy))].append(c)
+        axis_bands = {}
+        for axis, cyls in groups.items():
+            zs = sorted({z for c in cyls for z in (float(c.z0), float(c.z1))})
+            bands = []
+            for za, zb in zip(zs, zs[1:]):
+                zmid = (za + zb) / 2
+                rs = [float(c.r) for c in cyls
+                      if float(c.z0) - 1e-9 <= zmid <= float(c.z1) + 1e-9]
+                if rs:
+                    bands.append((za, zb, max(rs)))
+            if bands:
+                axis_bands[axis] = bands
+        # ONE segment count per coaxial axis (from its widest radius) so every
+        # ring on that axis — cap hole, wall, shoulder, blind cap — shares
+        # vertices and the seams stay watertight (no T-junctions across bands).
+        axis_segs = {axis: _segs(max(r for _, _, r in bands))
+                     for axis, bands in axis_bands.items()}
+
+        def _in_loop(pt, loop) -> bool:
+            x, y = pt
+            inside = False
+            n = len(loop)
+            for i in range(n):
+                (x1, y1), (x2, y2) = loop[i], loop[(i + 1) % n]
+                if (y1 > y) != (y2 > y):
+                    xc = x1 + (y - y1) / (y2 - y1) * (x2 - x1)
+                    if x < xc:
+                        inside = not inside
+            return inside
+
+        # -- base faces: z-caps get holes, lateral faces are hole-free ---------
+        zcaps: dict = defaultdict(list)
+        for p in self.base.polys:
+            nrm = p.plane.n
+            nx, ny, nz = float(nrm[0]), float(nrm[1]), float(nrm[2])
+            if nx == 0 and ny == 0:
+                z = float(p.verts[0][2])
+                zcaps[(round(z, 9), 1 if nz > 0 else -1)].append(
+                    [(float(v[0]), float(v[1])) for v in p.verts])
+            else:
+                vs = [(float(v[0]), float(v[1]), float(v[2])) for v in p.verts]
+                for i in range(1, len(vs) - 1):
+                    tri(vs[0], vs[i], vs[i + 1], (nx, ny, nz))
+
+        def _cap_loops(polys_xy):
+            def key(p):
+                return (round(p[0], 9), round(p[1], 9))
+            present, coords = set(), {}
+            for poly in polys_xy:
+                m = len(poly)
+                for i in range(m):
+                    a, b = poly[i], poly[(i + 1) % m]
+                    coords[key(a)] = a
+                    coords[key(b)] = b
+                    present.add((key(a), key(b)))
+            nxt = {a: b for (a, b) in present if (b, a) not in present}
+            loops, used = [], set()
+            for start in list(nxt):
+                if start in used:
+                    continue
+                loop, cur = [], start
+                while cur in nxt and cur not in used:
+                    used.add(cur)
+                    loop.append(coords[cur])
+                    cur = nxt[cur]
+                if len(loop) >= 3:
+                    loops.append(loop)
+            return loops
+
+        for (z, sign), polys in zcaps.items():
+            holes = []
+            for axis, bands in axis_bands.items():
+                r = 0.0
+                if abs(bands[-1][1] - z) < 1e-9:
+                    r = bands[-1][2]           # axis reaches this (top) cap
+                elif abs(bands[0][0] - z) < 1e-9:
+                    r = bands[0][2]            # ... or this (bottom) cap
+                if r > 0:
+                    holes.append((axis, circle(axis[0], axis[1], r, axis_segs[axis])))
+            for loop in _cap_loops(polys):
+                hs = [h for (ax, h) in holes if _in_loop(ax, loop)]
+                pts2, t2 = triangulate(loop, hs)
+                out = (0.0, 0.0, float(sign))
+                for a, b, c in t2:
+                    tri((pts2[a][0], pts2[a][1], z), (pts2[b][0], pts2[b][1], z),
+                        (pts2[c][0], pts2[c][1], z), out)
+
+        # -- bore walls, counterbore shoulders, blind end caps -----------------
+        for (cx, cy), bands in axis_bands.items():
+            n = axis_segs[(cx, cy)]            # one resolution for the whole stack
+            for za, zb, r in bands:
+                ring = circle(cx, cy, r, n)
+                for i in range(n):
+                    a, b = ring[i], ring[(i + 1) % n]
+                    outw = (cx - (a[0] + b[0]) / 2, cy - (a[1] + b[1]) / 2, 0.0)
+                    tri((a[0], a[1], za), (b[0], b[1], za), (b[0], b[1], zb), outw)
+                    tri((a[0], a[1], za), (b[0], b[1], zb), (a[0], a[1], zb), outw)
+            for (za, zb, r0), (zb2, zc, r1) in zip(bands, bands[1:]):
+                if abs(r0 - r1) < 1e-12:
+                    continue
+                rin, rout = min(r0, r1), max(r0, r1)
+                out = (0.0, 0.0, 1.0 if r1 > r0 else -1.0)
+                ci, co = circle(cx, cy, rin, n), circle(cx, cy, rout, n)
+                for i in range(n):             # same n -> rings share θ, seams seal
+                    ai, bi = ci[i], ci[(i + 1) % n]
+                    ao, bo = co[i], co[(i + 1) % n]
+                    tri((ai[0], ai[1], zb), (ao[0], ao[1], zb), (bo[0], bo[1], zb), out)
+                    tri((ai[0], ai[1], zb), (bo[0], bo[1], zb), (bi[0], bi[1], zb), out)
+            zlo, zhi = bands[0][0], bands[-1][1]
+            if zlo > zmin + 1e-9:              # blind at the bottom -> end cap
+                ring = circle(cx, cy, bands[0][2], n)
+                for i in range(n):
+                    a, b = ring[i], ring[(i + 1) % n]
+                    tri((cx, cy, zlo), (a[0], a[1], zlo), (b[0], b[1], zlo), (0, 0, 1))
+            if zhi < zmax - 1e-9:              # blind at the top -> end cap
+                ring = circle(cx, cy, bands[-1][2], n)
+                for i in range(n):
+                    a, b = ring[i], ring[(i + 1) % n]
+                    tri((cx, cy, zhi), (a[0], a[1], zhi), (b[0], b[1], zhi), (0, 0, -1))
+
+        return {"vertices": verts, "triangles": tris}
+
 
 @dataclass(frozen=True)
 class Sphere:
@@ -215,6 +394,40 @@ class Sphere:
 
     def translated(self, x, y, z) -> "Sphere":
         return Sphere(self.cx + F(x), self.cy + F(y), self.cz + F(z), self.r)
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """A UV-sphere display mesh with collapsed poles (floats legal)."""
+        import math
+
+        r, cx, cy, cz = float(self.r), float(self.cx), float(self.cy), float(self.cz)
+        seg = (max(8, int(math.ceil(math.pi / math.acos(max(-1.0, 1.0 - deflection / r)))))
+               if r > deflection else 8)
+        nlat, nlon = max(4, seg), max(8, 2 * seg)
+        verts, tris = [], []
+        top = len(verts)
+        verts.append([cx, cy, cz + r])
+        rings = []
+        for i in range(1, nlat):
+            theta = math.pi * i / nlat
+            rings.append(len(verts))
+            for j in range(nlon):
+                phi = 2 * math.pi * j / nlon
+                verts.append([cx + r * math.sin(theta) * math.cos(phi),
+                              cy + r * math.sin(theta) * math.sin(phi),
+                              cz + r * math.cos(theta)])
+        bot = len(verts)
+        verts.append([cx, cy, cz - r])
+        for j in range(nlon):                  # top fan (outward, CCW from outside)
+            tris.append([top, rings[0] + j, rings[0] + (j + 1) % nlon])
+        for k in range(len(rings) - 1):        # middle quads
+            a, b = rings[k], rings[k + 1]
+            for j in range(nlon):
+                j2 = (j + 1) % nlon
+                tris.append([a + j, b + j, b + j2])
+                tris.append([a + j, b + j2, a + j2])
+        for j in range(nlon):                  # bottom fan
+            tris.append([bot, rings[-1] + (j + 1) % nlon, rings[-1] + j])
+        return {"vertices": verts, "triangles": tris}
 
 
 @dataclass(frozen=True)
@@ -237,6 +450,15 @@ class Cone:
     def translated(self, x, y, z) -> "Cone":
         return Cone(self.cx + F(x), self.cy + F(y), self.r1, self.r2,
                     self.z0 + F(z), self.z1 + F(z))
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """Display mesh (frustum wall + caps) via the lathe (floats legal)."""
+        from forgekernel.tess import lathe
+
+        r1, r2 = float(self.r1), float(self.r2)
+        z0, z1 = float(self.z0), float(self.z1)
+        profile = [(0.0, z0), (r1, z0), (r2, z1), (0.0, z1)]
+        return lathe(profile, deflection, float(self.cx), float(self.cy))
 
 
 class _Quad:

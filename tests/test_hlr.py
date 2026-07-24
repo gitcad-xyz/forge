@@ -109,6 +109,94 @@ def test_section_through_drilled_hole_splits_into_two_loops() -> None:
     assert spans == [(0, 3), (7, 10)]      # slot clears Y∈(3,7)
 
 
+def _nonmanifold(mesh):
+    from collections import defaultdict
+    ec = defaultdict(int)
+    for a, b, c in mesh["triangles"]:
+        for e in ((a, b), (b, c), (c, a)):
+            ec[tuple(sorted(e))] += 1
+    return sum(1 for n in ec.values() if n != 2)
+
+
+def _signed_volume(mesh):
+    v = mesh["vertices"]
+    t = 0.0
+    for a, b, c in mesh["triangles"]:
+        ax, ay, az = v[a]
+        bx, by, bz = v[b]
+        cx, cy, cz = v[c]
+        t += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)
+    return t / 6.0
+
+
+def test_drilled_solid_tessellates_watertight() -> None:
+    # bolt patterns (multiple holes) and counterbores with mismatched facet
+    # buckets are the layouts that broke the first cut — pin them.
+    bolt_col = DrilledSolid(Solid.box(100, 60, 20), []).cut(
+        Cyl(50, 20, 8, 0, 20)).cut(Cyl(50, 45, 8, 0, 20))
+    grid = (DrilledSolid(Solid.box(100, 60, 20), [])
+            .cut(Cyl(35, 20, 6, 0, 20)).cut(Cyl(65, 20, 6, 0, 20))
+            .cut(Cyl(35, 40, 6, 0, 20)).cut(Cyl(65, 40, 6, 0, 20)))
+    cbore_buckets = DrilledSolid(Solid.box(30, 30, 10), []).cut(
+        Cyl(15, 15, 3, 0, 10)).cut(Cyl(15, 15, 12, 7, 10))
+    cases = [
+        (DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)]),
+         40 * 20 * 5 - math.pi * 16 * 5),                       # through hole
+        (DrilledSolid(Solid.box(20, 20, 10), [Cyl(10, 10, 3, 4, 10)]),
+         20 * 20 * 10 - math.pi * 9 * 6),                       # blind hole
+        (bolt_col, 100 * 60 * 20 - 2 * math.pi * 64 * 20),      # 2-hole column
+        (grid, 100 * 60 * 20 - 4 * math.pi * 36 * 20),          # 2x2 bolt grid
+        (cbore_buckets,
+         30 * 30 * 10 - (math.pi * 9 * 7 + math.pi * 144 * 3)),  # counterbore
+    ]
+    for solid, vexp in cases:
+        mesh = solid.tessellate(0.05)
+        assert _nonmanifold(mesh) == 0                          # watertight
+        sv = _signed_volume(mesh)
+        assert sv > 0                                           # outward normals
+        assert abs(sv - vexp) / vexp < 0.02
+
+
+def test_bare_primitives_tessellate_watertight() -> None:
+    from forgekernel.quadric import Cone, Sphere
+
+    cases = [
+        (Cyl(0, 0, 4, 0, 10), math.pi * 16 * 10),
+        (Sphere(0, 0, 0, 5), 4 / 3 * math.pi * 125),
+        (Cone(0, 0, 3, 1, 0, 8), math.pi * 8 / 3 * (9 + 3 + 1)),
+        (Cone(0, 0, 3, 0, 0, 8), math.pi * 9 * 8 / 3),          # cone to a point
+    ]
+    for solid, vexp in cases:
+        mesh = solid.tessellate(0.02)
+        assert _nonmanifold(mesh) == 0
+        sv = _signed_volume(mesh)
+        assert sv > 0                                          # outward normals
+        assert abs(sv - vexp) / vexp < 0.02
+
+
+def test_earcut_handles_multi_hole_bolt_patterns() -> None:
+    from forgekernel.mesh2d import triangulate
+
+    def circle(cx, cy, r, n=32):
+        return [(cx + r * math.cos(2 * math.pi * k / n),
+                 cy + r * math.sin(2 * math.pi * k / n)) for k in range(n)]
+
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+
+    rect = [(0, 0), (100, 0), (100, 60), (0, 60)]
+    for holes, exp in [
+        ([circle(50, 20, 8), circle(50, 45, 8)], 6000 - 2 * math.pi * 64),   # column
+        ([circle(35, 20, 6), circle(65, 20, 6),
+          circle(35, 40, 6), circle(65, 40, 6)], 6000 - 4 * math.pi * 36),   # grid
+    ]:
+        pts, tris = triangulate(rect, holes)
+        area = sum(abs(orient(pts[a], pts[b], pts[c])) / 2 for a, b, c in tris)
+        flips = sum(1 for a, b, c in tris if orient(pts[a], pts[b], pts[c]) < -1e-6)
+        assert flips == 0                                     # no inverted triangles
+        assert abs(area - exp) / exp < 0.01                   # no missing/overlap area
+
+
 def test_counterbore_sections_as_one_stepped_profile() -> None:
     # coaxial bores (r2 through + r4 counterbore over z7..10) must section as a
     # single stepped profile: two closed loops with the shoulder step, NOT the
