@@ -87,9 +87,11 @@ jobs:
           path: dist-rs/*
 
   # ---- publish (tags only, Trusted Publishing) -----------------------------
-  publish:
-    name: publish to PyPI
-    needs: [sdist-pure, wheels-rs, wheels-rs-sdist]
+  # forgekernel (pure Python) publishes on its own — it depends only on its own
+  # build, so a Rust-wheel hiccup can never block it.
+  publish-forgekernel:
+    name: publish forgekernel to PyPI
+    needs: [sdist-pure]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
@@ -97,16 +99,13 @@ jobs:
       id-token: write        # OIDC for Trusted Publishing
     steps:
       - uses: actions/download-artifact@v4
-        with: {path: staged}
-      - name: Collect forgekernel dist
-        run: mkdir -p dist && cp staged/dist-forgekernel/* dist/
-      - name: Publish forgekernel
-        uses: pypa/gh-action-pypi-publish@release/v1
+        with: {name: dist-forgekernel, path: dist}
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-      - name: Collect forgekernel_rs dist
-        run: mkdir -p dist-rs && cp staged/dist-rs-*/* dist-rs/
-      - name: Publish forgekernel_rs
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist-rs
+
+  # forgekernel_rs publishing is enabled once its PyPI trusted publisher is set
+  # up (see RELEASING.md). Until then the wheels-rs jobs above still build+check
+  # it on every tag. To turn it on, add a job mirroring publish-forgekernel that
+  # `needs: [wheels-rs, wheels-rs-sdist]`, sets its own `environment:`, collects
+  # the dist-rs-* artifacts, and publishes them.
