@@ -314,15 +314,16 @@ def _net_str(net):
     return [[[_rstr(c) for c in pt] for pt in row] for row in net]
 
 
-def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
-    """SSI between two B-spline surfaces: exact Bézier extraction,
-    pairwise subdivision detection, branch clustering in the ORIGINAL
-    parameter squares (branches crossing patch boundaries stay one
-    branch), certified points in global parameters.
+def _ssi_cells(A, B, depth: int, use_rust: bool | None):
+    """Shared detection for the surface SSI entry points: exact Bézier
+    extraction + pairwise subdivision detection, deduplicated into a
+    surviving ``{A-cell: B-cell}`` map, plus the branch clustering of the
+    A-cells (connected components in A's parameter domain). Returns
+    ``(cells, branches)`` — ``({}, [])`` means certified-empty.
 
     Detection — the hot loop — runs in the Rust port (``ssi_pairs``,
-    oracle-verified bit-identical) when the extension is built; the
-    Python path is the fallback and stays the executable spec."""
+    oracle-verified bit-identical) when the extension is built; the Python
+    path is the fallback and stays the executable spec."""
     from forgekernel.nurbs import bezier_patches
 
     rs = None
@@ -358,12 +359,22 @@ def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
                 boxes.extend(((p.u0, p.u1, p.v0, p.v1),
                               (q.u0, q.u1, q.v0, q.v1)) for p, q in pairs)
     if not boxes:
-        return {"branches": 0, "points": [], "uncertified": 0,
-                "empty_certified": True}
+        return {}, []
     cells: dict = {}
     for abox, bbox_ in boxes:
         cells.setdefault(abox, bbox_)
     branches = _cluster(list(cells))
+    return cells, branches
+
+
+def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
+    """SSI between two B-spline surfaces: certified points in global
+    parameters plus the branch count. See :func:`ssi_curves` for the same
+    points chained into ordered per-branch polylines."""
+    cells, branches = _ssi_cells(A, B, depth, use_rust)
+    if not cells:
+        return {"branches": 0, "points": [], "uncertified": 0,
+                "empty_certified": True}
     pts, bad = [], 0
     for abox, bbox_ in cells.items():
         um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
@@ -375,6 +386,76 @@ def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
             bad += 1
     return {"branches": len(branches), "points": pts, "uncertified": bad,
             "empty_certified": False}
+
+
+def _order_branch(points):
+    """Chain a branch's certified points into an ordered polyline in A's
+    (u, v) parameter space by greedy nearest-neighbour, started from an
+    endpoint via the double-sweep diameter heuristic (furthest point from
+    an arbitrary sample is an endpoint of an open arc). Reports whether the
+    branch closes on itself. Float ordering over exact points — a
+    render/report artifact; the points themselves are the certified data."""
+    n = len(points)
+    if n <= 2:
+        return list(points), False
+    uv = [(float(p[0]), float(p[1])) for p in points]
+
+    def d2(i, j):
+        return (uv[i][0] - uv[j][0]) ** 2 + (uv[i][1] - uv[j][1]) ** 2
+
+    start = max(range(n), key=lambda i: d2(i, 0))   # an extreme end
+    todo = set(range(n))
+    todo.discard(start)
+    order = [start]
+    gaps = []
+    while todo:
+        last = order[-1]
+        nxt = min(todo, key=lambda i: d2(i, last))
+        gaps.append(d2(nxt, last) ** 0.5)
+        order.append(nxt)
+        todo.discard(nxt)
+    # closed when the wrap-around gap is on the order of a typical step
+    wrap = d2(order[0], order[-1]) ** 0.5
+    med = sorted(gaps)[len(gaps) // 2]
+    closed = med > 0 and wrap <= 2.0 * med
+    return [points[i] for i in order], closed
+
+
+def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):
+    """Ordered SSI output: the certified intersection points chained into
+    one parameter-space polyline **per branch** (a branch = a connected
+    component of surviving cells in A's parameter domain). Within a branch
+    the points are ordered along the curve; a branch that returns to its
+    start is flagged ``closed``.
+
+    Returns ``{"curves": [{"points": [(u,v,s,t)…] (exact ℚ),
+    "xyz": [(x,y,z)…] (float, for render), "closed": bool}, …],
+    "uncertified": n, "empty_certified": bool}``. The points are the
+    certified objects (residual < 1e-20); the ordering is a float
+    convenience layered on top."""
+    cells, branches = _ssi_cells(A, B, depth, use_rust)
+    if not cells:
+        return {"curves": [], "uncertified": 0, "empty_certified": True}
+    branch_of = {abox: bi for bi, group in enumerate(branches) for abox in group}
+    per_branch: dict[int, list] = {bi: [] for bi in range(len(branches))}
+    bad = 0
+    for abox, bbox_ in cells.items():
+        um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
+        sm, tm = (bbox_[0] + bbox_[1]) / 2, (bbox_[2] + bbox_[3]) / 2
+        u, v, s, t, ok, _ = _refine_global(A, B, um, vm, sm, tm)
+        if ok:
+            per_branch[branch_of[abox]].append((u, v, s, t))
+        else:
+            bad += 1
+    curves = []
+    for bi in range(len(branches)):
+        bpts = per_branch[bi]
+        if not bpts:
+            continue
+        ordered, closed = _order_branch(bpts)
+        xyz = [tuple(float(c) for c in A.eval(p[0], p[1])) for p in ordered]
+        curves.append({"points": ordered, "xyz": xyz, "closed": closed})
+    return {"curves": curves, "uncertified": bad, "empty_certified": False}
 
 
 def _refine_global(A, B, u, v, s, t, iters: int = 12):

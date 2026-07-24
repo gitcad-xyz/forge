@@ -187,6 +187,78 @@ def test_rational_patch_requires_positive_weights() -> None:
                      [(1, 0, 0, 1), (1, 1, 0, 1)]])
 
 
+# -- K7 ordered SSI output: per-branch parameter-space polylines --------------
+
+def test_order_branch_open_line_is_monotonic() -> None:
+    from forgekernel.ssi import _order_branch
+
+    # certified points along u at v=1/2, handed in shuffled; s,t placeholders
+    us = [F(1, 2), F(1, 10), F(9, 10), F(3, 10), F(7, 10)]
+    pts = [(u, F(1, 2), F(0), F(0)) for u in us]
+    ordered, closed = _order_branch(pts)
+    ou = [float(p[0]) for p in ordered]
+    assert ou == sorted(ou) or ou == sorted(ou, reverse=True)
+    assert closed is False
+
+
+def test_order_branch_detects_closed_loop() -> None:
+    import math
+
+    from forgekernel.ssi import _order_branch
+
+    n = 12
+    raw = []
+    for k in range(n):
+        ang = 2 * math.pi * k / n
+        u = F(round(1000 * (0.5 + 0.4 * math.cos(ang))), 1000)
+        v = F(round(1000 * (0.5 + 0.4 * math.sin(ang))), 1000)
+        raw.append((u, v, F(0), F(0)))
+    perm = [0, 5, 2, 9, 4, 11, 6, 1, 8, 3, 10, 7]     # deterministic shuffle
+    ordered, closed = _order_branch([raw[i] for i in perm])
+    assert closed is True
+    # consecutive ordered points are ring neighbours — no jump across the loop
+    angs = [math.atan2(float(p[1]) - 0.5, float(p[0]) - 0.5) for p in ordered]
+    steps = []
+    for i in range(len(angs)):
+        d = (angs[(i + 1) % len(angs)] - angs[i]) % (2 * math.pi)
+        steps.append(min(d, 2 * math.pi - d))
+    assert max(steps) < 2 * (2 * math.pi / n)
+
+
+def test_ssi_curves_single_open_branch_is_ordered() -> None:
+    from forgekernel.nurbs import BSplineSurface
+    from forgekernel.ssi import ssi_curves
+
+    plane = BSplineSurface(1, 1, [[(0, 0, 0), (0, 1, 0)],
+                                  [(2, 0, 0), (2, 1, 0)]], [0, 0, 2, 2], [0, 0, 1, 1])
+    net = [[(x, 0, F(-1, 2)), (x, 1, F(1, 2))] for x in range(4)]
+    s = BSplineSurface(2, 1, net, [0, 0, 0, 1, 2, 2, 2], [0, 0, 1, 1])
+    r = ssi_curves(plane, s, depth=4)
+    assert r["empty_certified"] is False
+    assert r["uncertified"] == 0
+    assert len(r["curves"]) == 1
+    c = r["curves"][0]
+    assert c["closed"] is False
+    assert len(c["points"]) == len(c["xyz"]) >= 2
+    us = [float(p[0]) for p in c["points"]]
+    assert us == sorted(us) or us == sorted(us, reverse=True)   # ordered along u
+    for xyz in c["xyz"]:
+        assert abs(xyz[1] - 0.5) < 1e-9                          # y = 1/2 line
+
+
+def test_ssi_curves_certifies_empty_for_disjoint() -> None:
+    from forgekernel.nurbs import BSplineSurface
+    from forgekernel.ssi import ssi_curves
+
+    a = BSplineSurface(1, 1, [[(0, 0, 0), (0, 1, 0)],
+                              [(2, 0, 0), (2, 1, 0)]], [0, 0, 2, 2], [0, 0, 1, 1])
+    b = BSplineSurface(1, 1, [[(0, 0, 5), (0, 1, 5)],
+                              [(2, 0, 5), (2, 1, 5)]], [0, 0, 2, 2], [0, 0, 1, 1])
+    r = ssi_curves(a, b, depth=3)
+    assert r["empty_certified"] is True
+    assert r["curves"] == []
+
+
 def test_step_planar_solid_import_is_exact() -> None:
     from forgekernel.stepio import read_step_planar_solid
 
