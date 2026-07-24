@@ -270,11 +270,26 @@ def test_disjoint_in_z_passes_despite_close_axes() -> None:
     assert u.volume() == PiVal(0, 1000)
 
 
-def test_internally_tangent_cylinders_exact() -> None:
+def test_internally_tangent_cylinders_are_an_overlap_not_a_union() -> None:
+    """INTERNAL tangency of two SOLID cylinders is containment, not disjointness.
+
+    r=10 at the origin and r=4 at (6,0): d² = 36 = (10−4)², so they touch at
+    (10,0) — but the small cylinder lies wholly INSIDE the big one (its farthest
+    point is 6+4 = 10 = the big radius) and their z-ranges coincide. The union is
+    therefore just the big cylinder, 800π — NOT 928π. An earlier version of this
+    test asserted 928π, and that is what let ``_classify_pair`` admit nested
+    cylinders into a DisjointUnion and silently double-count the overlap. Only
+    EXTERNAL separation (d² ≥ (ra+rb)²) certifies disjointness.
+    """
+    import pytest
+
     from forgekernel.quadric import Cyl, DisjointUnion, PiVal
 
-    # r=10 and r=4, centers 6 apart: d^2 = 36 = (10-4)^2 internally tangent
-    u = DisjointUnion([Cyl.make(10, 8), Cyl.make(4, 8).translated(6, 0, 0)])
+    with pytest.raises(ValueError, match="overlapping cylinders"):
+        DisjointUnion([Cyl.make(10, 8), Cyl.make(4, 8).translated(6, 0, 0)])
+
+    # externally tangent (d² = (ra+rb)²) IS measure-zero contact: exact sum
+    u = DisjointUnion([Cyl.make(10, 8), Cyl.make(4, 8).translated(14, 0, 0)])
     assert u.volume() == PiVal(0, (100 + 16) * 8)
 
 

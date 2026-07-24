@@ -93,6 +93,35 @@ class Cyl:
         return lathe(profile, deflection, float(self.cx), float(self.cy))
 
 
+def _xy_inside_footprint(solid: Solid, px, py) -> bool:
+    """Exact: is (px, py) inside the solid's xy footprint?
+
+    The footprint boundary is the xy projection of the lateral (non-horizontal)
+    faces. Ray parity along +x with the half-open upward-crossing rule — all
+    rational, no tolerance. Needed because "the bore does not CROSS a lateral
+    wall" does not distinguish a bore strictly inside from one entirely
+    outside: neither crosses anything."""
+    segs = set()
+    for p in solid.polys:
+        n = p.plane.n
+        if n[0] == 0 and n[1] == 0:
+            continue                           # horizontal face: no footprint edge
+        m = len(p.verts)
+        for i in range(m):
+            a, b = p.verts[i], p.verts[(i + 1) % m]
+            if a[0] == b[0] and a[1] == b[1]:
+                continue                       # vertical edge: projects to a point
+            key = ((a[0], a[1]), (b[0], b[1]))
+            segs.add(key if key[0] <= key[1] else (key[1], key[0]))
+    inside = False
+    for (x1, y1), (x2, y2) in segs:
+        if (y1 > py) != (y2 > py):
+            xc = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+            if px < xc:
+                inside = not inside
+    return inside
+
+
 def _dist2_point_seg(px, py, ax, ay, bx, by) -> Fraction:
     """Exact squared distance from point to segment (all rational)."""
     dx, dy = bx - ax, by - ay
@@ -140,6 +169,12 @@ class DrilledSolid:
                     raise ValueError(
                         "bore crosses a lateral wall — general quadric "
                         "booleans arrive at K2.1")
+        # The wall check above proves the bore straddles no wall; it does NOT
+        # say which side it is on. Without this, a bore placed entirely outside
+        # the footprint is recorded as a phantom hole and its volume silently
+        # subtracted from a solid it never touches.
+        if not _xy_inside_footprint(self.base, c.cx, c.cy):
+            raise ValueError("bore misses the solid in xy (nothing to drill)")
         for o in self.bores:
             if o.cx == c.cx and o.cy == c.cy:
                 continue                       # coaxial stack (counterbore)
@@ -781,9 +816,9 @@ class DisjointUnion:
                 try:
                     out.append(base.cut(tool))
                 except ValueError as exc:
-                    if "misses the solid in z" not in str(exc):
-                        raise
-                    out.append(m)               # tool misses this member
+                    if "misses the solid in" not in str(exc):
+                        raise                   # a real precondition violation
+                    out.append(m)               # tool misses this member (z or xy)
             else:
                 raise ValueError(
                     f"cut of {type(m).__name__} by {type(tool).__name__} in a "
@@ -842,10 +877,12 @@ def _classify_pair(a, b) -> None:
         if za[1] <= zb[0] or zb[1] <= za[0]:
             return                            # disjoint in z
         d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2
-        outer = (a.r + b.r) ** 2
-        inner = (a.r - b.r) ** 2
-        if d2 >= outer or d2 <= inner:
-            return                            # externally/internally clear
+        if d2 >= (a.r + b.r) ** 2:
+            return                            # externally clear (or tangent)
+        # NOTE: d2 <= (ra−rb)² is CONTAINMENT, not separation — these are solid
+        # cylinders, not tubes, so a nested one overlaps with positive measure
+        # (identical cylinders land here too, at d2 = 0). Treating it as clear
+        # silently doubled the volume; it must refuse.
         raise ValueError(
             "overlapping cylinders — general quadric booleans arrive at K2.3")
     # sphere / planar Solid
@@ -865,8 +902,10 @@ def _classify_pair(a, b) -> None:
     # sphere / sphere
     if isinstance(a, Sphere) and isinstance(b, Sphere):
         d2 = (a.cx - b.cx) ** 2 + (a.cy - b.cy) ** 2 + (a.cz - b.cz) ** 2
-        if d2 >= (a.r + b.r) ** 2 or d2 <= (a.r - b.r) ** 2:
-            return
+        if d2 >= (a.r + b.r) ** 2:
+            return                            # externally clear (or tangent)
+        # containment (d2 ≤ (ra−rb)²) is an overlap, not a separation — see the
+        # cylinder note above; SphereOverlap already rejects it as "nesting".
         raise ValueError(
             "overlapping spheres — general quadric booleans arrive at K2.3")
     raise ValueError(

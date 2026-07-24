@@ -59,6 +59,28 @@ def test_non_convex_solids_refuse_rather_than_double_count() -> None:
             DisjointUnion([ell, buried])
 
 
+def test_a_bore_outside_the_footprint_is_not_a_phantom_hole() -> None:
+    """SOUNDNESS: "the bore crosses no lateral wall" does not mean "the bore is
+    inside" — a bore entirely OUTSIDE the footprint crosses nothing either. It
+    used to be recorded as a hole, silently deleting volume from a solid the
+    tool never touched (a Ø4 tool 40 mm away removed 125.66 mm³ from a box)."""
+    from forgekernel.quadric import DrilledSolid
+
+    box = Solid.box(10, 10, 10)
+    with pytest.raises(ValueError, match="misses the solid in xy"):
+        DrilledSolid(box, []).cut(Cyl(50, 50, 2, 0, 10))
+    inside = DrilledSolid(box, []).cut(Cyl(5, 5, 2, 0, 10))     # a real hole
+    assert float(inside.volume()) == pytest.approx(1000 - math.pi * 4 * 10)
+
+
+def test_cut_leaves_members_the_tool_misses_untouched() -> None:
+    # a post standing 50 mm clear of a plate; boring the POST must not shrink
+    # the plate (the tool never enters it in xy).
+    plate, post = Solid.box(100, 100, 10), Cyl(150, 50, 8, 0, 20)
+    out = DisjointUnion([plate, post]).cut(Cyl(150, 50, 4, 0, 20))
+    assert float(out.volume()) == pytest.approx(100000 + (64 - 16) * 20 * math.pi)
+
+
 def test_coaxial_bore_of_a_cylinder_is_an_exact_revolve() -> None:
     cyl = Cyl(0, 0, 10, 0, 2)
     washer = bore_cyl(cyl, Cyl(0, 0, 4, 0, 2))           # through bore: annulus
