@@ -54,6 +54,24 @@ def test_boolean_union_of_rotated_copies_is_watertight_and_exact() -> None:
     assert out.watertight_violations() == []
 
 
+def test_overlapping_boolean_mixes_rational_and_surd_coords() -> None:
+    # the case disjoint patterns miss: an axis-aligned (ℚ) body booleaned with
+    # an OVERLAPPING rotated (ℚ[√3]) body — BSP clipping makes mixed-type
+    # polygons, so Fraction−SurdVal must resolve (needs SurdVal.__rsub__).
+    from fractions import Fraction as F
+
+    a = fk.box(2, 2, 2)
+    b = fk.rotate(fk.translate(fk.box(2, 2, 2), F(1, 2), F(1, 2), 0), (0, 0, 1), 30)
+    vu = float(fk.boolean("union", a, b).volume())
+    vi = float(fk.boolean("intersect", a, b).volume())
+    vc = float(fk.boolean("cut", a, b).volume())
+    assert vi > 0                                   # they genuinely overlap
+    assert abs(vu + vi - 16) < 1e-9                 # |A∪B| + |A∩B| = |A| + |B|
+    assert abs(vc - (8 - vi)) < 1e-9                # |A∖B| = |A| − |A∩B|
+    for op in ("union", "cut", "intersect"):
+        assert fk.boolean(op, a, b).watertight_violations() == []
+
+
 def test_surd_is_an_ordered_field() -> None:
     import random
     random.seed(0)

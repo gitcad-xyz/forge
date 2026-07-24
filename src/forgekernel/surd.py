@@ -76,6 +76,9 @@ class SurdVal:
         o = self._co(o)
         return SurdVal(self.a - o.a, self.b - o.b, self._radical(o))
 
+    def __rsub__(self, o) -> "SurdVal":     # o − self, for rational/int on the left
+        return self._co(o) - self
+
     def __mul__(self, o) -> "SurdVal":
         o = self._co(o)
         if self.b == 0 or o.b == 0:
