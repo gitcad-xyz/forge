@@ -341,6 +341,22 @@ def _dec(x: Fraction, digits: int = 15) -> str:
     return s
 
 
+def _real(x) -> str:
+    """A STEP REAL literal.
+
+    Part 21 types ``4`` as an INTEGER, so a direction ratio or a radius
+    written without a decimal point is a type error even though the number is
+    right — strict readers reject the file. Almost every direction in a
+    mechanical part is a whole number, so this is the common case, not an
+    edge case.
+    """
+    s = f"{float(x):.15g}"
+    if "e" in s or "E" in s:
+        mant, _, exp = s.replace("E", "e").partition("e")
+        return f"{mant if '.' in mant else mant + '.'}E{exp}"
+    return s if "." in s else s + "."
+
+
 def _unit3(v):
     """Float unit vector of an exact rational direction."""
     import math
@@ -393,8 +409,7 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part",
         lines.append(f"#{nid[0]} = {body};")
         return nid[0]
 
-    def fnum(x):
-        return f"{x:.15g}"
+    fnum = _real
 
     # --- product + context chain (required for OCCT to transfer a solid)
     appctx = emit("APPLICATION_CONTEXT('automotive_design')")

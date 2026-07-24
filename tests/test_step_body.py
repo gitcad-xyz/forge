@@ -1,0 +1,162 @@
+"""AP214 export written once against the canonical B-rep (ADR-0021).
+
+The acceptance test is a MANIFOLD ORACLE on the emitted file itself, not a
+smoke test that it parses: in a closed shell every EDGE_CURVE is used by
+exactly two faces, traversed in opposite directions once the ADVANCED_FACE
+same_sense flag is folded in. An exporter that gets this wrong still produces
+a file that opens — and a solid that will not boolean, will not mesh for CAM,
+and imports as a surface soup.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+
+import pytest
+
+from forgekernel import body as B
+from forgekernel.brep import Solid
+from forgekernel.kernel import boolean, prism, translate
+from forgekernel.quadric import Cyl, DisjointUnion, DrilledSolid, Sphere
+from forgekernel.stepbody import write_step_body
+
+L_PRISM = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+
+
+def _entities(text):
+    """id -> entity name. A COMPLEX entity opens with '(' (the unit and
+    geometric-context instances do), so it needs its own pattern or its id
+    reads as undefined and every reference to it looks dangling."""
+    out = dict(re.findall(r"#(\d+) = (\w+)", text))
+    out.update({i: "COMPLEX" for i in re.findall(r"#(\d+) = \(", text)})
+    return out
+
+
+def _edge_uses(text):
+    """Effective traversal direction of every EDGE_CURVE, per using face."""
+    oriented = {i: (r, s) for i, r, s in re.findall(
+        r"#(\d+) = ORIENTED_EDGE\(.*?#(\d+),(\.[TF]\.)\)", text)}
+    loops = {i: re.findall(r"#(\d+)", a) for i, a in re.findall(
+        r"#(\d+) = EDGE_LOOP\(.*?\((.*?)\)\)", text)}
+    bounds = {i: m for i, m in re.findall(
+        r"#(\d+) = FACE_(?:OUTER_)?BOUND\(.*?#(\d+),", text)}
+    uses = defaultdict(list)
+    for bl, flag in re.findall(
+            r"#\d+ = ADVANCED_FACE\(.*?\((.*?)\),#\d+,(\.[TF]\.)\)", text):
+        for b in re.findall(r"#(\d+)", bl):
+            for o in loops[bounds[b]]:
+                ref, sense = oriented[o]
+                uses[ref].append((sense == ".T.") == (flag == ".T."))
+    return uses
+
+
+SHAPES = [
+    ("box", lambda: Solid.box(20, 20, 10), 6, 12),
+    ("L-prism", lambda: prism(L_PRISM, 5), 8, 18),
+    ("notched plate",
+     lambda: boolean("cut", Solid.box(40, 20, 10),
+                     translate(Solid.box(10, 20, 10), 15, 0, 6)), 10, 28),
+    # a through hole: two caps, a split cylindrical wall, shared rim arcs
+    ("drilled plate",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)]), 8, 18),
+    ("blind hole",
+     lambda: DrilledSolid(Solid.box(30, 30, 10), [Cyl(15, 15, 3, 4, 10)]), 9, 18),
+    ("counterbore",
+     lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 2, 0, 10)).cut(Cyl(15, 15, 4, 7, 10)), 11, 24),
+    ("four mounting holes",
+     lambda: DrilledSolid(Solid.box(100, 60, 10), [])
+     .cut(Cyl(10, 10, 3, 5, 10)).cut(Cyl(90, 10, 3, 5, 10))
+     .cut(Cyl(10, 50, 3, 5, 10)).cut(Cyl(90, 50, 3, 5, 10)), 18, 36),
+    # neither of these has a planar base to hang topology on: both used to
+    # refuse outright, which is the O(ops x reps) gap ADR-0021 removes
+    ("bare cylinder", lambda: Cyl(0, 0, 5, 0, 12), 4, 6),
+    ("boss", lambda: DisjointUnion([Solid.box(30, 30, 3), Cyl(15, 15, 4, 3, 9)]),
+     10, 18),
+]
+
+
+@pytest.mark.parametrize("label,build,nfaces,nedges", SHAPES,
+                         ids=[s[0] for s in SHAPES])
+def test_the_exported_shell_is_closed(label, build, nfaces, nedges) -> None:
+    text = write_step_body(B.to_body(build()))
+    ents = _entities(text)
+    uses = _edge_uses(text)
+    curves = [i for i, t in ents.items() if t == "EDGE_CURVE"]
+    assert len(curves) == nedges
+    assert sum(1 for t in ents.values() if t == "ADVANCED_FACE") == nfaces
+    open_edges = [e for e in curves if sorted(uses.get(e, [])) != [False, True]]
+    assert open_edges == [], (
+        f"{len(open_edges)} edge(s) not traversed once each way — the shell is "
+        "open, which no manifold check downstream will forgive")
+
+
+@pytest.mark.parametrize("label,build,nfaces,nedges", SHAPES,
+                         ids=[s[0] for s in SHAPES])
+def test_the_file_has_the_product_structure_a_reader_needs(
+        label, build, nfaces, nedges) -> None:
+    text = write_step_body(B.to_body(build()), name="part_x")
+    assert text.startswith("ISO-10303-21;")
+    assert text.rstrip().endswith("END-ISO-10303-21;")
+    kinds = set(_entities(text).values())
+    for required in ("APPLICATION_CONTEXT", "PRODUCT", "CLOSED_SHELL",
+                     "MANIFOLD_SOLID_BREP",
+                     "ADVANCED_BREP_SHAPE_REPRESENTATION",
+                     "SHAPE_DEFINITION_REPRESENTATION"):
+        assert required in kinds, f"missing {required}"
+    assert "PRODUCT('part_x'" in text
+    # every referenced entity must exist — a dangling #id is a corrupt file
+    defined = {int(i) for i in _entities(text)}
+    body = text.split("DATA;", 1)[1]
+    assert not [r for r in re.findall(r"#(\d+)", body)
+                if int(r) not in defined]
+
+
+def test_a_hole_is_an_exact_cylinder_not_a_fan_of_facets() -> None:
+    text = write_step_body(B.to_body(
+        DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])))
+    ents = _entities(text)
+    assert sum(1 for t in ents.values() if t == "CYLINDRICAL_SURFACE") == 1
+    assert sum(1 for t in ents.values() if t == "CIRCLE") == 2
+    assert "CYLINDRICAL_SURFACE('',#" in text and ",4.)" in text
+
+
+def test_the_seam_points_come_from_the_circles_exact_frame() -> None:
+    """Both the cap and the bore wall must derive the SAME two split points,
+    or the shared rim silently becomes two edges. Taking them from a float
+    sample would be the easy way to break this."""
+    text = write_step_body(B.to_body(
+        DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])))
+    # bore at (20,10) r=4 -> seam points at x = 24 and x = 16, on both caps
+    for want in ("(24.,10.,0.)", "(16.,10.,0.)", "(24.,10.,5.)", "(16.,10.,5.)"):
+        assert f"CARTESIAN_POINT('',{want})" in text
+
+
+NUMERIC = ("DIRECTION", "VECTOR", "CIRCLE", "CYLINDRICAL_SURFACE",
+           "CARTESIAN_POINT")
+
+
+@pytest.mark.parametrize("writer", ["body", "planar"])
+def test_every_real_literal_carries_a_decimal_point(writer) -> None:
+    """Part 21 types ``0`` as an INTEGER, so ``DIRECTION('',(0,0,1))`` is a
+    type error even though the numbers are right — and almost every direction
+    in a mechanical part is whole, so this is the common case. Both writers
+    shipped it."""
+    plate = DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])
+    if writer == "body":
+        text = write_step_body(B.to_body(plate))
+    else:
+        from forgekernel.stepio import write_step_planar_solid
+        text = write_step_planar_solid(plate.base, bores=plate.bores)
+    offenders = [
+        ln.strip() for ln in text.splitlines()
+        if any(f"= {k}(" in ln for k in NUMERIC)
+        and re.search(r"(?<![\w.#])-?\d+(?![\w.])", ln.split("=", 1)[1])
+    ]
+    assert offenders == [], f"integer literals where STEP wants REAL: {offenders[:3]}"
+
+
+def test_a_surface_with_no_writer_refuses_with_its_stage() -> None:
+    with pytest.raises(ValueError, match="K3.7"):
+        write_step_body(B.to_body(Sphere(0, 0, 0, 6)))
