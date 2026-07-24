@@ -15,7 +15,7 @@ import pytest
 
 from forgekernel import body as B
 from forgekernel.brep import Solid
-from forgekernel.kernel import prism
+from forgekernel.kernel import boolean, prism, translate
 from forgekernel.quadric import Cyl, DisjointUnion, DrilledSolid, PiVal, Sphere
 from forgekernel.tess import mesh_volume
 
@@ -149,3 +149,41 @@ def test_plane_normals_survive_a_non_uniform_scale() -> None:
                   true[0] * stored[1] - true[1] * stored[0])
             assert math.sqrt(sum(x * x for x in cr)) < 1e-9 * max(
                 1.0, math.sqrt(sum(x * x for x in true))), "normal not perpendicular"
+
+
+FRAGMENTED = [
+    # a prism cap is EAR-CLIPPED into triangles, so any profile with >3 points
+    # has coplanar cap fragments — matching a bore to a cap by z alone attached
+    # its hole to every fragment, including ones the bore never reaches
+    ("ear-clipped prism cap",
+     lambda: DrilledSolid(prism([(0, 0), (20, 0), (20, 20), (0, 20)], 10), [])
+     .cut(Cyl(10, 10, 2, -1, 11))),
+    # a pocket splits the top face into two coplanar pieces
+    ("slotted plate",
+     lambda: DrilledSolid(
+         boolean("cut", Solid.box(40, 20, 10),
+                 translate(Solid.box(10, 20, 10), 15, 0, 6)), [])
+     .cut(Cyl(5, 10, 3, 0, 10))),
+    # two blind holes at a COMMON depth: each bore's floor disk sits at the
+    # other's clamped z, so each punched a phantom hole through the other
+    ("two blind holes, same depth",
+     lambda: DrilledSolid(Solid.box(40, 20, 10), [])
+     .cut(Cyl(10, 10, 3, 4, 10)).cut(Cyl(30, 10, 3, 4, 10))),
+    ("blind holes, unequal radii",
+     lambda: DrilledSolid(Solid.box(40, 20, 10), [])
+     .cut(Cyl(10, 10, 2, 4, 10)).cut(Cyl(30, 10, 5, 4, 10))),
+    ("four mounting holes",
+     lambda: DrilledSolid(Solid.box(100, 60, 10), [])
+     .cut(Cyl(10, 10, 3, 5, 10)).cut(Cyl(90, 10, 3, 5, 10))
+     .cut(Cyl(10, 50, 3, 5, 10)).cut(Cyl(90, 50, 3, 5, 10))),
+]
+
+
+@pytest.mark.parametrize("label,build", FRAGMENTED, ids=[f[0] for f in FRAGMENTED])
+def test_a_bore_only_holes_the_cap_fragment_it_reaches(label, build) -> None:
+    """A cap is often split into coplanar fragments. Attaching a bore's hole to
+    every fragment at that height silently overstates the removed material —
+    on a four-hole mounting plate by 50%. The canonical volume must equal the
+    representation's own exact volume."""
+    d = build()
+    assert B.volume(B.to_body(d)) == d.volume()

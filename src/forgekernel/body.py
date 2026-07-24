@@ -326,11 +326,15 @@ def _face_volume_term(face: Face):
         # combine into n·n — entirely rational, no square root needed.
         nn = dot(s.n, s.n)
         rat, pi = F(0), F(0)
+        area_rat, area_pi = F(0), F(0)     # for the sanity check below
         for i, lp in enumerate(face.loops):
             circ = _loop_is_circle(lp)
             if circ is None:
                 a2 = _planar_loop_area2(lp, s.n)
                 rat += s.d * (a2 if i == 0 else -abs(a2)) / (6 * nn)
+                ln2 = _rational_sqrt(nn)
+                if ln2 is not None:
+                    area_rat += (a2 if i == 0 else -abs(a2)) / (2 * ln2)
             else:
                 # a circular loop has area π r², which needs |n| on its own
                 ln = _rational_sqrt(nn)
@@ -339,6 +343,15 @@ def _face_volume_term(face: Face):
                         "circular loop on a plane whose normal has irrational "
                         "length — outside ℚ[π] (arrives with K3.7)")
                 pi += (1 if i == 0 else -1) * s.d * circ.r * circ.r / (3 * ln)
+                area_pi += (1 if i == 0 else -1) * circ.r * circ.r
+        # A face cannot have negative area. If it does, an inner loop was
+        # attached to a face that does not contain it — refuse rather than
+        # return a confidently wrong exact volume.
+        if float(_as_fraction(area_rat) or 0) + math.pi * float(
+                _as_fraction(area_pi) or 0) < -1e-12:
+            raise ValueError(
+                "face has negative area — an inner loop is larger than the "
+                "boundary carrying it (a hole attached to the wrong face)")
         return PiVal(_exact(sgn * rat, "planar area"),
                      _exact(sgn * pi, "circular area"))
     if isinstance(s, Cylinder):
@@ -658,6 +671,26 @@ def from_cyl(c) -> Body:
                  wall))
 
 
+def _face_contains_xy(face: "Face", px, py) -> bool:
+    """Exact: does (px, py) lie inside this face's OUTER loop, in xy?
+
+    A cap is often split into several coplanar fragments — ear-clipped prism
+    caps, boolean-split tops — so matching a bore to a cap by z alone attaches
+    its hole to every fragment at that height, including ones the bore never
+    touches. (quadric.DrilledSolid.cut already carries the whole-solid version
+    of this predicate, _xy_inside_footprint; this is the per-face analogue.)"""
+    pts = [e.v0 for e in face.loops[0].edges]
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i][0], pts[i][1]
+        x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        if (y1 > py) != (y2 > py):
+            if px < x1 + (py - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    return inside
+
+
 def from_drilled(d) -> Body:
     """A planar base minus z-cylindrical bores: cap faces gain circular inner
     loops, each bore contributes a cylindrical wall (and a disk if blind)."""
@@ -678,6 +711,8 @@ def from_drilled(d) -> Body:
             zc = f.loops[0].edges[0].v0[2]
             if zc not in (z0, z1):
                 continue
+            if not _face_contains_xy(f, c.cx, c.cy):
+                continue            # a coplanar fragment the bore never reaches
             circ = _circle_at(c.cx, c.cy, zc, c.r)
             v = (c.cx + c.r, c.cy, zc)
             faces[i] = Face(s, f.loops + (Loop((Edge(circ, v, v),)),), f.sense)
