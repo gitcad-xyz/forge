@@ -157,6 +157,27 @@ def test_every_real_literal_carries_a_decimal_point(writer) -> None:
     assert offenders == [], f"integer literals where STEP wants REAL: {offenders[:3]}"
 
 
+def test_a_sphere_ships_as_two_lunes_seamed_at_the_poles() -> None:
+    """A whole sphere has no loops at all, and its parametrisation is periodic
+    in longitude AND degenerate at the poles. Splitting along a meridian puts
+    the seam where the surface is already degenerate; splitting at the equator
+    would strand a pole inside a face."""
+    text = write_step_body(B.to_body(Sphere(1, 2, 3, 6)))
+    ents = _entities(text)
+    assert sum(1 for t in ents.values() if t == "SPHERICAL_SURFACE") == 1
+    assert sum(1 for t in ents.values() if t == "ADVANCED_FACE") == 2
+    # exactly two vertices: the poles, at z = 3 +- 6
+    assert sum(1 for t in ents.values() if t == "VERTEX_POINT") == 2
+    assert "CARTESIAN_POINT('',(1.,2.,9.))" in text
+    assert "CARTESIAN_POINT('',(1.,2.,-3.))" in text
+    curves = [i for i, t in ents.items() if t == "EDGE_CURVE"]
+    uses = _edge_uses(text)
+    assert [e for e in curves if sorted(uses.get(e, [])) != [False, True]] == []
+
+
 def test_a_surface_with_no_writer_refuses_with_its_stage() -> None:
+    from fractions import Fraction as Q
+
+    cone = B.Face(B.Cone((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), Q(1)), (), True)
     with pytest.raises(ValueError, match="K3.7"):
-        write_step_body(B.to_body(Sphere(0, 0, 0, 6)))
+        write_step_body(B.Body((cone,)))

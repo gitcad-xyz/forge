@@ -228,6 +228,9 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
             return emit(f"CYLINDRICAL_SURFACE('',"
                         f"#{placement(s.p, s.d, _perp((dx, dy, dz)))},"
                         f"{fnum(s.r)})")
+        if isinstance(s, SphereS):
+            return emit(f"SPHERICAL_SURFACE('',"
+                        f"#{placement(s.c, (0, 0, 1), (1, 0, 0))},{fnum(s.r)})")
         raise ValueError(
             f"STEP export of a {type(s).__name__} face is not implemented yet "
             "— spherical and conical surfaces arrive with K3.7")
@@ -244,9 +247,23 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
     for face in body.faces:
         s = face.surface
         if isinstance(s, SphereS):
-            raise ValueError(
-                "STEP export of a spherical face is not implemented yet — its "
-                "closed parametrisation needs seam handling (K3.7)")
+            # A whole sphere carries no loops and its parametrisation is
+            # periodic in longitude AND degenerate at the poles. Split it into
+            # two lunes along the meridian great circle through the poles: the
+            # seam then runs pole to pole, where the surface is degenerate
+            # anyway, and each face is a clean 180° longitude range. Putting
+            # the split anywhere else (an equator, say) leaves a pole stranded
+            # in a face's interior, which readers handle far less reliably.
+            c, r = s.c, s.r
+            north = (c[0], c[1], c[2] + r)
+            south = (c[0], c[1], c[2] - r)
+            meridian = Circle(c, (_f(0), _f(-1), _f(0)),
+                              (_f(0), _f(0), _f(1)), r)
+            surf = surface_of(s)
+            lune = [(meridian, north, south, 0), (meridian, south, north, 1)]
+            faces.append(advanced_face(surf, [lune], face.sense))
+            faces.append(advanced_face(surf, [_reverse(lune)], face.sense))
+            continue
         loops = _split_full_circles(face)
         if isinstance(s, Cylinder):
             # a tube is periodic: split it into two half-faces bounded by the
