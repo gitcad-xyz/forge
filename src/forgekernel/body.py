@@ -1367,11 +1367,56 @@ def from_cone(cone) -> Body:
     return Body(tuple(faces))
 
 
+def from_revolve(rev) -> Body:
+    """A lathed (r, z) profile as canonical faces — one per profile segment.
+
+    With ``Cone`` in the surface set every segment has an exact analytic
+    surface: constant z is an annular PLANE, constant r a CYLINDER band, and
+    anything else a cone frustum. Nothing here is faceted.
+
+    Orientation comes from the profile's own winding. ``RevolveSolid``
+    normalises the loop so its volume is positive, which makes the outward
+    normal the right-hand perpendicular ``(dz, -dr)`` in the half-plane — so a
+    segment travelling UP faces outward and one travelling DOWN faces in, which
+    is exactly what distinguishes a tube's bore from its outside.
+    """
+    cx, cy = F(rev.cx), F(rev.cy)
+    faces = []
+    for (r1, z1), (r2, z2) in rev._edges():
+        r1, z1, r2, z2 = F(r1), F(z1), F(r2), F(z2)
+        if r1 == r2 == 0 or (r1 == r2 and z1 == z2):
+            continue                            # on the axis, or degenerate
+        if z1 == z2:                            # annular disk
+            up = r2 < r1                        # (0, -dr) points +z when dr<0
+            lo, hi = (r2, r1) if up else (r1, r2)
+            n = (F(0), F(0), F(1) if up else F(-1))
+            loops = [Loop((Edge(_circle_at(cx, cy, z1, hi),
+                                (cx + hi, cy, z1), (cx + hi, cy, z1)),))]
+            if lo > 0:
+                loops.append(Loop((Edge(_circle_at(cx, cy, z1, lo),
+                                        (cx + lo, cy, z1), (cx + lo, cy, z1)),)))
+            faces.append(Face(Plane(n, z1 if up else -z1), tuple(loops), True))
+            continue
+        rims = tuple(Edge(_circle_at(cx, cy, z, r), (cx + r, cy, z),
+                          (cx + r, cy, z))
+                     for r, z in ((r1, z1), (r2, z2)) if r > 0)
+        sense = z2 > z1
+        if r1 == r2:
+            surf = Cylinder((cx, cy, F(0)), (F(0), F(0), F(1)), r1)
+        else:
+            slope = (r2 - r1) / (z2 - z1)
+            apex = (cx, cy, z1 - r1 / slope)
+            surf = Cone(apex, (F(0), F(0), F(1)),
+                        slope if slope > 0 else -slope)
+        faces.append(Face(surf, (Loop(rims),), sense))
+    return Body(tuple(faces))
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
     from forgekernel.quadric import (Cone as QCone, Cyl, DisjointUnion,
-                                     DrilledSolid, Sphere)
+                                     DrilledSolid, RevolveSolid, Sphere)
 
     if isinstance(shape, Body):
         return shape
@@ -1379,6 +1424,8 @@ def to_body(shape) -> Body:
         return from_solid(shape)
     if isinstance(shape, QCone):
         return from_cone(shape)
+    if isinstance(shape, RevolveSolid):
+        return from_revolve(shape)
     if isinstance(shape, Cyl):
         return from_cyl(shape)
     if isinstance(shape, DrilledSolid):

@@ -624,3 +624,53 @@ def test_a_cone_with_equal_radii_is_routed_to_the_cylinder() -> None:
     body = B.to_body(QCone(0, 0, 4, 4, 0, 10))
     assert {type(f.surface).__name__ for f in body.faces} == {"Plane", "Cylinder"}
     assert B.volume(body) == PiVal(0, 16 * 10)
+
+
+REVOLVES = [
+    ("cylinder profile", [(0, 0), (5, 0), (5, 12), (0, 12)], 3),
+    ("cone profile", [(0, 0), (6, 0), (0, 9)], 2),
+    # an annular profile never touches r = 0: a tube, with a real bore whose
+    # wall must face INWARD
+    ("tube", [(3, 0), (6, 0), (6, 10), (3, 10)], 4),
+    ("stepped shaft", [(0, 0), (4, 0), (4, 5), (7, 5), (7, 9), (0, 9)], 5),
+    ("tapered tube", [(2, 0), (5, 0), (4, 8), (3, 8)], 4),
+    ("vase", [(0, 0), (6, 0), (6, 3), (3, 6), (5, 10), (0, 10)], 5),
+]
+
+
+@pytest.mark.parametrize("label,profile,nfaces", REVOLVES,
+                         ids=[r[0] for r in REVOLVES])
+def test_a_lathed_profile_converts_exactly(label, profile, nfaces) -> None:
+    """One canonical face per profile segment, all analytic: constant z is an
+    annular PLANE, constant r a CYLINDER band, anything else a cone frustum.
+    Nothing is faceted, and the volume must equal the representation's own."""
+    from forgekernel.quadric import RevolveSolid
+
+    rev = RevolveSolid(profile, 0, 0)
+    body = B.to_body(rev)
+    assert len(body.faces) == nfaces
+    assert B.volume(body) == rev.volume()
+
+
+@pytest.mark.parametrize("label,profile,nfaces", REVOLVES,
+                         ids=[r[0] for r in REVOLVES])
+def test_a_lathed_profile_meshes_watertight(label, profile, nfaces) -> None:
+    from forgekernel.quadric import RevolveSolid
+
+    assert _non_manifold(
+        B.tessellate(B.to_body(RevolveSolid(profile, 0, 0)), 0.02)) == 0
+
+
+def test_a_tubes_bore_faces_inward() -> None:
+    """Orientation comes from the profile's own winding: the outward normal is
+    the right-hand perpendicular (dz, -dr), so a segment travelling UP faces
+    out and one travelling DOWN faces in. Get it wrong and a tube's bore reads
+    as solid — the volume comes back as the outer cylinder."""
+    from forgekernel.quadric import RevolveSolid
+
+    tube = RevolveSolid([(3, 0), (6, 0), (6, 10), (3, 10)], 0, 0)
+    body = B.to_body(tube)
+    walls = {float(f.surface.r): f.sense for f in body.faces
+             if isinstance(f.surface, B.Cylinder)}
+    assert walls == {6.0: True, 3.0: False}
+    assert B.volume(body) == PiVal(0, (36 - 9) * 10)
