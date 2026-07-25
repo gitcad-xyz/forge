@@ -980,6 +980,52 @@ def centroid(body: Body):
     return tuple(x / v for x in m)
 
 
+def _edge_key(e: Edge):
+    """A geometric, EXACT, direction-free name for an edge.
+
+    Direction-free because the two faces meeting at an edge traverse it
+    opposite ways; exact because an edge key that rounded would fuse two
+    genuinely distinct edges a micron apart (ADR-0019).
+    """
+    from forgekernel.brep import _canon_dir
+
+    ends = tuple(sorted((_key3(e.v0), _key3(e.v1)), key=repr))
+    if isinstance(e.curve, Circle):
+        # sign-invariant axis: a band's rim carries the unit axis while the
+        # octant beside it carries a cross product pointing the other way
+        return ("arc", _key3(e.curve.c), e.curve.r,
+                _canon_dir(e.curve.n), ends)
+    return ("line", ends)
+
+
+def manifold_violations(body: Body) -> list[str]:
+    """Every edge of a closed shell is shared by exactly two faces.
+
+    This is the check ``validate`` had no way to run on a ``Body``: it called
+    ``Solid.watertight_violations``, which a Body does not have, so every
+    pocketed or curved-shelled solid came back as "unsupported representation"
+    — unvalidatable, which reads far too much like fine.
+
+    It audits COUNTS, not directions. A Body stores no traversal direction for
+    a full-circle edge (the writer derives it from the surface normal and the
+    loop's role), so a direction audit belongs where that derivation happens —
+    ``write_step_body`` does exactly that before it emits. Counts alone still
+    catch the whole family this kernel has actually produced: a rim minted
+    twice, a T-junction left unsplit, a face dropped, an arc unpaired.
+    """
+    seen: dict = {}
+    for f in body.faces:
+        for lp in f.loops:
+            for e in lp.edges:
+                k = _edge_key(e)
+                seen[k] = seen.get(k, 0) + 1
+    bad = []
+    for k, n in sorted(seen.items(), key=repr):
+        if n != 2:
+            bad.append(f"edge {k[0]} at {k[-1][0]} used by {n} face(s), not 2")
+    return bad
+
+
 def bbox(body: Body):
     """Float bbox of the body (a bound, not a topological decision)."""
     lo = [math.inf] * 3

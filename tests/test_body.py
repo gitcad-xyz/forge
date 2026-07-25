@@ -17,7 +17,8 @@ import pytest
 from forgekernel import body as B
 from forgekernel.brep import Solid
 from forgekernel.kernel import boolean, prism, translate
-from forgekernel.quadric import Cyl, DisjointUnion, DrilledSolid, PiVal, Sphere
+from forgekernel.quadric import (Cone, Cyl, DisjointUnion, DrilledSolid, PiVal,
+                                 RevolveSolid, RoundedBox, Sphere)
 from forgekernel.tess import mesh_volume
 
 L_PRISM = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
@@ -1128,3 +1129,80 @@ def test_a_lathe_arc_off_a_quarter_turn_refuses_by_name() -> None:
     segs = [("arc", (F(0), F(0)), (F(5), F(0)), (F(3), F(4)))]
     with pytest.raises(ValueError, match="quarter turn"):
         B.lathe_body(segs, F(0), F(0))
+
+
+T_PROFILE = [(0, 0), (9, 0), (9, 3), (6, 3), (6, 9), (3, 9), (3, 3), (0, 3)]
+I_BEAM = [(0, 0), (9, 0), (9, 2), (6, 2), (6, 7), (9, 7), (9, 9), (0, 9),
+          (0, 7), (3, 7), (3, 2), (0, 2)]
+
+
+@pytest.mark.parametrize("name,prof,area", [("T", T_PROFILE, 45),
+                                            ("I-beam", I_BEAM, 51)])
+def test_a_rectilinear_profile_with_a_vertex_on_a_diagonal_extrudes(
+        name, prof, area) -> None:
+    """``_ear_clip`` counted a blocker only in the OPEN triangle, so a vertex
+    lying exactly ON a candidate ear's diagonal did not block it. The ear was
+    clipped straight through that vertex and the remainder collapsed to
+    collinear points — so a T and an I-beam, the two most ordinary non-convex
+    profiles there are, came back as ``degenerate profile``. A blocker is a
+    point in the CLOSED triangle."""
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import _ear_clip
+    from forgekernel.kernel import prism
+
+    tris = _ear_clip([(Q(x), Q(y)) for x, y in prof])
+    assert len(tris) == len(prof) - 2
+    got = sum(abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+              for a, b, c in tris) / 2
+    assert got == area, "the triangles must tile the profile exactly"
+    assert prism(prof, 5).volume() == area * 5
+
+
+MANIFOLD_SHAPES = [
+    ("box", lambda: Solid.box(20, 20, 10)),
+    ("L-prism", lambda: prism([(0, 0), (10, 0), (10, 4), (4, 4), (4, 10),
+                               (0, 10)], 5)),
+    ("T-prism", lambda: prism(T_PROFILE, 5)),
+    ("drilled plate",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])),
+    ("blind hole",
+     lambda: DrilledSolid(Solid.box(30, 30, 10), [Cyl(15, 15, 3, 4, 10)])),
+    ("bare cylinder", lambda: Cyl(0, 0, 5, 0, 12)),
+    ("cone", lambda: Cone(0, 0, 2, 5, 0, 10)),
+    ("sphere", lambda: Sphere(1, 2, 3, 6)),
+    ("rounded box", lambda: RoundedBox(20, 20, 20, 3)),
+    ("revolve", lambda: RevolveSolid(
+        [(0, 0), (4, 0), (4, 5), (7, 5), (7, 9), (0, 9)], 0, 0)),
+]
+
+
+@pytest.mark.parametrize("label,build", MANIFOLD_SHAPES,
+                         ids=[s[0] for s in MANIFOLD_SHAPES])
+def test_every_corpus_body_pairs_all_of_its_edges(label, build) -> None:
+    """In a closed shell every edge is shared by exactly two faces. This is the
+    check ``validate`` could not run on a Body at all — it reached for
+    ``Solid.watertight_violations``, which a Body does not have, so every
+    pocketed or curved-shelled solid came back "unsupported representation".
+    Unvalidatable reads far too much like fine."""
+    assert B.manifold_violations(B.to_body(build())) == []
+
+
+def test_a_body_missing_a_face_is_reported_unpaired() -> None:
+    body = B.to_body(Solid.box(10, 10, 10))
+    bad = B.manifold_violations(B.Body(body.faces[:-1]))
+    assert len(bad) == 4 and all("used by 1 face" in m for m in bad)
+
+
+def test_the_edge_key_is_exact_and_direction_free() -> None:
+    """Both faces at an edge must land on the same key however each traverses
+    it, and the key must not round: two edges a micron apart are two edges."""
+    from fractions import Fraction as Q
+
+    p, q = (Q(0), Q(0), Q(0)), (Q(1), Q(2), Q(3))
+    fwd = B.Edge(B.Line(p, tuple(q[i] - p[i] for i in range(3))), p, q)
+    rev = B.Edge(B.Line(q, tuple(p[i] - q[i] for i in range(3))), q, p)
+    assert B._edge_key(fwd) == B._edge_key(rev)
+    near = (Q(1), Q(2), Q(3) + Q(1, 10 ** 6))
+    off = B.Edge(B.Line(p, tuple(near[i] - p[i] for i in range(3))), p, near)
+    assert B._edge_key(fwd) != B._edge_key(off)

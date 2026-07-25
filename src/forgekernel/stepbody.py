@@ -24,6 +24,7 @@ from fractions import Fraction
 
 from forgekernel.body import (Body, Circle, Cone, Cylinder, Line, Plane,
                               SphereS, dot, sub)
+from forgekernel.brep import _canon_dir
 from forgekernel.stepio import _dec, _perp, _real, _unit3
 
 
@@ -119,6 +120,41 @@ def _cross(a, b):
             a[0] * b[1] - a[1] * b[0])
 
 
+def _arc_samples(curve, a, b):
+    """Interior points of an arc, spaced so no step exceeds a quarter turn.
+
+    ``_param_area`` unwraps its longitudes by the ±π rule, which can only be
+    right when consecutive SAMPLES are less than π apart. Sampling only the
+    loop's vertices, a single edge sweeping 270° read as −90° — sign inverted
+    and magnitude wrong, so the writer reversed a bound that was already
+    correct and opened the shell. Floats are fine here: this feeds a sign, and
+    the arc's own endpoints are still the exact ones.
+    """
+    import math
+
+    if not isinstance(curve, Circle):
+        return []
+    cf = [float(x) for x in curve.c]
+    n = _unit3(curve.n)[0]
+    u = _unit3(sub(a, curve.c))[0]
+    w = (n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2],
+         n[0] * u[1] - n[1] * u[0])
+    v = [float(b[i]) - cf[i] for i in range(3)]
+    theta = math.atan2(sum(v[i] * w[i] for i in range(3)),
+                       sum(v[i] * u[i] for i in range(3)))
+    sweep = theta % (2 * math.pi)                 # CCW about the circle's axis
+    if sweep < 1e-12:
+        sweep = 2 * math.pi                       # a closed edge is the whole turn
+    m = max(1, math.ceil(sweep / (math.pi / 2)))
+    r = float(curve.r)
+    out = []
+    for j in range(1, m):
+        t = sweep * j / m
+        out.append(tuple(cf[i] + r * (math.cos(t) * u[i] + math.sin(t) * w[i])
+                         for i in range(3)))
+    return out
+
+
 def _param_area(surf, loop):
     """Signed area of a loop in the SURFACE's parameter space (float).
 
@@ -128,10 +164,17 @@ def _param_area(surf, loop):
     """
     import math
 
+    # Sample each edge's START vertex AND the interior of any arc it carries:
+    # the unwrap below is only valid when consecutive samples are under π
+    # apart, and one 270° edge is not (see _arc_samples).
+    samples = []
+    for crv, a, b, _h in loop:
+        samples.append(a)
+        samples.extend(_arc_samples(crv, a, b))
     pts = []
     if isinstance(surf, SphereS):
         c = tuple(float(x) for x in surf.c)
-        for _crv, a, _b, _h in loop:
+        for a in samples:
             v = [float(a[i]) - c[i] for i in range(3)]
             pts.append((math.atan2(v[1], v[0]),
                         math.atan2(v[2], math.hypot(v[0], v[1]))))
@@ -142,7 +185,7 @@ def _param_area(surf, loop):
         w = (d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2],
              d[0] * u[1] - d[1] * u[0])
         o = tuple(float(x) for x in surf.p)
-        for _crv, a, _b, _h in loop:
+        for a in samples:
             v = [float(a[i]) - o[i] for i in range(3)]
             pts.append((math.atan2(sum(v[i] * w[i] for i in range(3)),
                                    sum(v[i] * u[i] for i in range(3))),
@@ -239,11 +282,23 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
             # product of length r^2, and it points the other way besides. Using
             # the raw vector minted a second EDGE_CURVE for every shared arc
             # and left a rounded box with 48 open edges.
-            (nx, ny, nz), _ln = _unit3(curve.n)
-            lead = next((v for v in (nx, ny, nz) if abs(v) > 1e-12), 1.0)
-            sgn_ = -1.0 if lead < 0 else 1.0
-            axis_key = tuple(round(sgn_ * v, 12) for v in (nx, ny, nz))
-            k = ("arc", _key(curve.c), curve.r, axis_key, half, ends)
+            #
+            # The direction key is now EXACT: ``_canon_dir`` divides by the
+            # leading component, so it is invariant under both scale and sign
+            # just as the old key was — but it was a unit float triple rounded
+            # to 12 places, i.e. a FLOAT deciding whether two faces share an
+            # edge, which ADR-0019 forbids outright.
+            #
+            # ``ends`` alone does not NAME an arc — the 90° and the 270° arc
+            # between the same two points of one circle have identical
+            # endpoints — and no cheap key fixes that, because the arc a face
+            # means is CCW about ITS OWN normal and the two faces at a shared
+            # arc disagree about both. The ``half`` tag settles the case the
+            # writer itself creates; anything else that collided would show up
+            # as an edge used more than twice, which is what the closing audit
+            # below refuses on. A wrong file that opens is the bad outcome.
+            k = ("arc", _key(curve.c), curve.r, _canon_dir(curve.n),
+                 half, ends)
         else:
             k = ("line", ends)
         if k not in edges:
@@ -259,12 +314,18 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
                         _key(a), _key(b))
         return edges[k]
 
-    def edge_loop(seq) -> int:
+    uses: dict = {}
+
+    def edge_loop(seq, sense_flag) -> int:
         oes = []
         for curve, a, b, half in seq:
             eid, ka, _ = edge_curve(curve, a, b, half)
-            sense = ".T." if ka == _key(a) else ".F."
-            oes.append(emit(f"ORIENTED_EDGE('',*,*,#{eid},{sense})"))
+            fwd = ka == _key(a)
+            # record the EFFECTIVE traversal: the ORIENTED_EDGE sense composed
+            # with the face's same_sense flag, which is what a reader sees
+            uses.setdefault(eid, []).append(fwd == sense_flag)
+            oes.append(emit(f"ORIENTED_EDGE('',*,*,#{eid},"
+                            f"{'.T.' if fwd else '.F.'})"))
         return emit(f"EDGE_LOOP('',({','.join('#%d' % o for o in oes)}))")
 
     def surface_of(s) -> int:
@@ -300,7 +361,7 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
         parts = []
         for i, lp in enumerate(bounds):
             kind = "FACE_OUTER_BOUND" if i == 0 else "FACE_BOUND"
-            parts.append(emit(f"{kind}('',#{edge_loop(lp)},.T.)"))
+            parts.append(emit(f"{kind}('',#{edge_loop(lp, sense)},.T.)"))
         return emit(f"ADVANCED_FACE('',({','.join('#%d' % p for p in parts)}),"
                     f"#{surf_id},{'.T.' if sense else '.F.'})")
 
@@ -444,6 +505,23 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
             continue
         faces.append(advanced_face(surface_of(s),
                                    _oriented_bounds(s.n, loops), face.sense))
+
+    # THE CLOSING AUDIT. In a closed shell every EDGE_CURVE is used by exactly
+    # two faces, traversed once each way after the ADVANCED_FACE same_sense
+    # flag is folded in. This is the oracle the tests apply to the emitted
+    # file; running it in the writer is what makes the difference between an
+    # honest refusal and a MANIFOLD_SOLID_BREP over an open shell — a file that
+    # opens, and then will not boolean, will not mesh for CAM, and imports as a
+    # surface soup. Every topology defect found in this writer so far (rims
+    # minted twice, bounds wound the wrong way, a pre-flipped mouth circle)
+    # would have surfaced here at the moment it was introduced.
+    open_edges = sorted(e for e, us in uses.items() if sorted(us) != [False, True])
+    if open_edges:
+        raise ValueError(
+            f"the shell is not closed: {len(open_edges)} edge(s) of "
+            f"{len(uses)} are not traversed once each way (first #"
+            f"{open_edges[0]}) — refusing to write a MANIFOLD_SOLID_BREP over "
+            "an open shell (K3.7)")
 
     shell = emit(f"CLOSED_SHELL('',({','.join('#%d' % f for f in faces)}))")
     brep = emit(f"MANIFOLD_SOLID_BREP('{name}',#{shell})")

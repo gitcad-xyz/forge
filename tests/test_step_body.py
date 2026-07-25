@@ -231,3 +231,72 @@ def test_a_degenerate_shape_refuses_rather_than_dangling() -> None:
 
     with pytest.raises(ValueError, match="degenerate"):
         write_step_body(B.to_body(RoundedBox(12, 12, 12, 6)))
+
+
+def _sector(deg: int):
+    """A trimmed cylinder face sweeping `deg` degrees, built by hand.
+
+    Nothing in the corpus reaches a face wider than a quarter turn yet, so this
+    is the only way to exercise the >180-degree branch.
+    """
+    from fractions import Fraction as Q
+
+    from forgekernel.body import Circle, Cylinder, Line
+
+    up, dn, rf = (Q(0), Q(0), Q(1)), (Q(0), Q(0), Q(-1)), (Q(1), Q(0), Q(0))
+    cyl = Cylinder((Q(0), Q(0), Q(0)), up, Q(1))
+    c0 = Circle((Q(0), Q(0), Q(0)), up, rf, Q(1))         # bottom rim, CCW +z
+    c1 = Circle((Q(0), Q(0), Q(2)), dn, rf, Q(1))         # top rim, CCW -z
+    pts = {0: (Q(1), Q(0)), 90: (Q(0), Q(1)),
+           180: (Q(-1), Q(0)), 270: (Q(0), Q(-1))}
+    a2 = pts[deg % 360]                                   # b is `deg` CCW of a
+    a, b = (Q(1), Q(0), Q(0)), (a2[0], a2[1], Q(0))
+    at, bt = (a[0], a[1], Q(2)), (b[0], b[1], Q(2))
+    ln = lambda p, q: (Line(p, tuple(q[i] - p[i] for i in range(3))), p, q, None)
+    return cyl, [(c0, a, b, None), ln(b, bt), (c1, bt, at, None), ln(at, a)]
+
+
+@pytest.mark.parametrize("deg", [90, 180, 270])
+def test_a_sector_wider_than_half_a_turn_still_reads_as_positive(deg) -> None:
+    """``_param_area`` unwraps longitudes by the +-pi rule, which is only valid
+    when consecutive SAMPLES are under pi apart. Sampling just the loop's
+    vertices, a single edge sweeping 270 degrees read as -90: sign INVERTED and
+    magnitude wrong, so the writer would reverse a bound that was already right
+    and open the shell. Every one of these winds positively."""
+    import math
+
+    from forgekernel.stepbody import _param_area
+
+    surf, loop = _sector(deg)
+    got = _param_area(surf, loop)
+    assert got == pytest.approx(2 * math.radians(deg) * 2)   # 2 x area, h = 2
+    assert got > 0
+
+
+def test_the_writer_refuses_an_open_shell_rather_than_emitting_one() -> None:
+    """The manifold oracle now runs INSIDE the writer. A MANIFOLD_SOLID_BREP
+    over an open shell is a file that opens and then will not boolean, will not
+    mesh for CAM, and imports as a surface soup — the worst outcome available,
+    because nothing downstream reports it."""
+    from forgekernel.brep import Solid
+
+    body = B.to_body(Solid.box(10, 10, 10))
+    maimed = B.Body(body.faces[:-1])                # drop one face
+    with pytest.raises(ValueError, match="shell is not closed"):
+        write_step_body(maimed)
+
+
+def test_the_arc_key_is_exact_not_a_rounded_float_axis() -> None:
+    """Whether two faces SHARE an edge was decided by a unit float triple
+    rounded to 12 places — a float deciding topology, which ADR-0019 forbids
+    outright. The exact key is scale- and sign-invariant just as that one was
+    meant to be, and the rounded box (whose bands and octants carry the same
+    axis at wildly different lengths) still shares all 48."""
+    from fractions import Fraction as Q
+
+    from forgekernel.body import Circle
+    from forgekernel.brep import _canon_dir
+
+    unit = Circle((Q(0),) * 3, (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(1))
+    scaled = Circle((Q(0),) * 3, (Q(0), Q(0), Q(-49)), (Q(1), Q(0), Q(0)), Q(1))
+    assert _canon_dir(unit.n) == _canon_dir(scaled.n)

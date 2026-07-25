@@ -266,8 +266,13 @@ def _ear_clip(loop: list[tuple]) -> list[tuple]:
         return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
     def inside(p, a, b, c) -> bool:
-        return (orient(a, b, p) > 0 and orient(b, c, p) > 0
-                and orient(c, a, p) > 0)
+        # A blocker is a point in the CLOSED triangle. With strict `> 0` a
+        # vertex lying exactly ON the candidate ear's diagonal did not block
+        # it, the ear was clipped straight through that vertex, and what was
+        # left collapsed to collinear points — so `prism` could not build a T
+        # or an I-beam, refusing a perfectly valid profile as "degenerate".
+        return (orient(a, b, p) >= 0 and orient(b, c, p) >= 0
+                and orient(c, a, p) >= 0)
 
     pts = list(loop)
     tris: list[tuple] = []
