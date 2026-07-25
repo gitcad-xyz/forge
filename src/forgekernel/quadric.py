@@ -63,6 +63,49 @@ class PiVal:
             return NotImplemented
         return self.a == o.a and self.b == o.b
 
+    # -- order, EXACTLY --------------------------------------------------------
+    # PiVal could be added, subtracted and compared for equality but not
+    # ORDERED, so the one question anyone actually asks of a volume — "is it
+    # positive?" — could only be answered by float(v) > 0. That is a float
+    # deciding whether a solid is valid, which ADR-0019 forbids, and it is
+    # wrong at the boundary: a true volume a hair above zero rounds to 0.0 and
+    # the solid reads as inside-out. PiPoly already decides this exactly, by
+    # narrowing a rational enclosure of π until the sign is certain, so defer
+    # to it rather than grow a second implementation.
+
+    def sign(self) -> int:
+        """-1, 0 or +1 — exact, no float anywhere."""
+        from forgekernel.polypi import PiPoly
+
+        return PiPoly.from_pival(self).sign()
+
+    def _cmp(self, o):
+        from forgekernel.polypi import PiPoly
+
+        try:
+            return (PiPoly.from_pival(self) - PiPoly(o)
+                    if isinstance(o, (int, Fraction))
+                    else PiPoly.from_pival(self) - PiPoly.from_pival(self._co(o))
+                    ).sign()
+        except (TypeError, ValueError):
+            return None
+
+    def __lt__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c < 0
+
+    def __le__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c <= 0
+
+    def __gt__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c > 0
+
+    def __ge__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c >= 0
+
     def __float__(self) -> float:
         return float(self.a) + float(self.b) * math.pi
 

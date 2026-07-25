@@ -154,3 +154,46 @@ def test_the_stored_digits_really_do_enclose_pi() -> None:
     lo, hi = _pi_bounds(len(_PI_DIGITS))
     d = lambda q: decimal.Decimal(q.numerator) / decimal.Decimal(q.denominator)
     assert d(lo) <= pi <= d(hi)
+
+
+PIVAL_ORDER = [
+    ("pi is positive", (0, 1), ">", 0, True),
+    ("pi is not <= 0", (0, 1), "<=", 0, False),
+    ("pi < 4", (0, 1), "<", 4, True),
+    ("22/7 does NOT exceed pi from below", (0, 1), ">", F(22, 7), False),
+    ("pi > 333/106", (0, 1), ">", F(333, 106), True),
+    ("zero volume is not positive", (0, 0), ">", 0, False),
+    ("a negative sweeps negative", (-1, 0), "<", 0, True),
+]
+
+
+@pytest.mark.parametrize("label,ab,op,rhs,want", PIVAL_ORDER,
+                         ids=[p[0] for p in PIVAL_ORDER])
+def test_pival_can_be_ordered_exactly(label, ab, op, rhs, want) -> None:
+    """PiVal could be added, subtracted and compared for EQUALITY but not
+    ordered — so the one question anyone asks of a volume, "is it positive?",
+    could only be answered by ``float(v) > 0``. That is a float deciding
+    whether a solid is valid, which ADR-0019 forbids."""
+    from forgekernel.quadric import PiVal
+
+    v = PiVal(F(ab[0]), F(ab[1]))
+    got = {">": v > rhs, "<": v < rhs, ">=": v >= rhs, "<=": v <= rhs}[op]
+    assert got is want
+
+
+def test_the_boundary_a_float_gets_wrong() -> None:
+    """A true volume a hair above zero rounds to 0.0 and the solid reads as
+    inside-out. This is the case the exact comparison exists for."""
+    from forgekernel.quadric import PiVal
+
+    tiny = PiVal(F(1, 10 ** 400), F(0))
+    assert tiny > 0
+    assert float(tiny) == 0.0, "…which is exactly what float() would have said"
+
+
+def test_pival_sign_agrees_with_pipoly() -> None:
+    from forgekernel.quadric import PiVal
+
+    for a, b in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (-22, 7), (22, -7)):
+        v = PiVal(F(a), F(b))
+        assert v.sign() == PiPoly.from_pival(v).sign()
