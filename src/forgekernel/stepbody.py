@@ -119,6 +119,45 @@ def _cross(a, b):
             a[0] * b[1] - a[1] * b[0])
 
 
+def _param_area(surf, loop):
+    """Signed area of a loop in the SURFACE's parameter space (float).
+
+    Only the SIGN is used, and it decides how a bound is written, not any
+    geometry — so evaluating in floats is the same boundary STEP's decimal
+    output already sits on.
+    """
+    import math
+
+    pts = []
+    if isinstance(surf, SphereS):
+        c = tuple(float(x) for x in surf.c)
+        for _crv, a, _b, _h in loop:
+            v = [float(a[i]) - c[i] for i in range(3)]
+            pts.append((math.atan2(v[1], v[0]),
+                        math.atan2(v[2], math.hypot(v[0], v[1]))))
+    else:
+        (dx, dy, dz), _ = _unit3(surf.d)
+        d = (dx, dy, dz)
+        u = _perp(d)
+        w = (d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2],
+             d[0] * u[1] - d[1] * u[0])
+        o = tuple(float(x) for x in surf.p)
+        for _crv, a, _b, _h in loop:
+            v = [float(a[i]) - o[i] for i in range(3)]
+            pts.append((math.atan2(sum(v[i] * w[i] for i in range(3)),
+                                   sum(v[i] * u[i] for i in range(3))),
+                        sum(v[i] * d[i] for i in range(3))))
+    # unwrap so a sector that straddles the seam still reads as one sweep
+    for i in range(1, len(pts)):
+        while pts[i][0] - pts[i - 1][0] > math.pi:
+            pts[i] = (pts[i][0] - 2 * math.pi, pts[i][1])
+        while pts[i][0] - pts[i - 1][0] < -math.pi:
+            pts[i] = (pts[i][0] + 2 * math.pi, pts[i][1])
+    n = len(pts)
+    return sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+               for i in range(n))
+
+
 def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
     """Emit a canonical ``Body`` as a valid AP214 file with a full product
     structure and a MANIFOLD_SOLID_BREP whose edges are shared."""
@@ -194,7 +233,17 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
         """
         ends = tuple(sorted((_key(a), _key(b)), key=repr))
         if isinstance(curve, Circle):
-            k = ("arc", _key(curve.c), curve.r, _key(curve.n), half, ends)
+            # Identify the arc by its GEOMETRIC circle. Two faces meeting at
+            # one arc can carry different vectors for the same normal — a
+            # band's rim is the unit axis while an octant's comes from a cross
+            # product of length r^2, and it points the other way besides. Using
+            # the raw vector minted a second EDGE_CURVE for every shared arc
+            # and left a rounded box with 48 open edges.
+            (nx, ny, nz), _ln = _unit3(curve.n)
+            lead = next((v for v in (nx, ny, nz) if abs(v) > 1e-12), 1.0)
+            sgn_ = -1.0 if lead < 0 else 1.0
+            axis_key = tuple(round(sgn_ * v, 12) for v in (nx, ny, nz))
+            k = ("arc", _key(curve.c), curve.r, axis_key, half, ends)
         else:
             k = ("line", ends)
         if k not in edges:
@@ -255,9 +304,43 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
         return emit(f"ADVANCED_FACE('',({','.join('#%d' % p for p in parts)}),"
                     f"#{surf_id},{'.T.' if sense else '.F.'})")
 
+    # A DEGENERATE face has no place in a closed shell: a rounded box whose
+    # fillet radius reaches half its smallest dimension has flats that are
+    # points and bands of zero length. Its volume and mesh are still exact
+    # (the solid is a sphere), but the AP214 topology cannot express it, so
+    # say that rather than emit 18 dangling edges.
+    for face in body.faces:
+        for lp in face.loops:
+            for e in lp.edges:
+                # a whole circle legitimately has v0 == v1; a zero-length LINE
+                # does not, and it is exactly what a collapsed flat leaves
+                if isinstance(e.curve, Line) and _key(e.v0) == _key(e.v1):
+                    raise ValueError(
+                        "a face has collapsed to a point or a line — this "
+                        "shape's topology is degenerate and AP214 cannot "
+                        "express it (K3.7)")
+
     faces: list[int] = []
     for face in body.faces:
         s = face.surface
+        # A face that is ALREADY trimmed carries a proper single loop --
+        # a rounded box's quarter bands are arc/line/arc/line and its corners
+        # three arcs. Forcing the periodic split on those is both unnecessary
+        # and wrong: there is no period left to straddle.
+        if (isinstance(s, (Cylinder, SphereS, Cone)) and len(face.loops) == 1
+                and any(isinstance(e.curve, Circle)
+                        and _key(e.v0) != _key(e.v1)
+                        for e in face.loops[0].edges)):
+            lp = _split_full_circles(face)[0]
+            # STEP defines a bound's orientation in the surface's PARAMETER
+            # space, and a curved face's loop is not planar, so no 3D area
+            # test settles it. Half the bands of a rounded box wind one way
+            # and half the other, which left 12 of its 48 edges traversed
+            # identically by both their faces.
+            if _param_area(s, lp) < 0:
+                lp = _reverse(lp)
+            faces.append(advanced_face(surface_of(s), [lp], face.sense))
+            continue
         if isinstance(s, SphereS):
             # A whole sphere carries no loops and its parametrisation is
             # periodic in longitude AND degenerate at the poles. Split it into

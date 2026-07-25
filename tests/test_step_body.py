@@ -181,3 +181,53 @@ def test_a_surface_with_no_writer_refuses_with_its_stage() -> None:
     cone = B.Face(B.Cone((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), Q(1)), (), True)
     with pytest.raises(ValueError, match="K3.7"):
         write_step_body(B.Body((cone,)))
+
+
+TRIMMED = [
+    ("rounded box", lambda: __import__(
+        "forgekernel.quadric", fromlist=["RoundedBox"]).RoundedBox(20, 20, 20, 3),
+     26, 48),
+    ("rounded slab", lambda: __import__(
+        "forgekernel.quadric", fromlist=["RoundedBox"]).RoundedBox(30, 20, 10, 2),
+     26, 48),
+    ("half-integer radius", lambda: __import__(
+        "forgekernel.quadric", fromlist=["RoundedBox"]).RoundedBox(21, 13, 9, 2.5),
+     26, 48),
+]
+
+
+@pytest.mark.parametrize("label,build,nfaces,nedges", TRIMMED,
+                         ids=[t[0] for t in TRIMMED])
+def test_a_trimmed_quadric_body_exports_a_closed_shell(label, build, nfaces,
+                                                       nedges) -> None:
+    """A rounded box's quarter bands and corner octants already carry proper
+    single loops, so forcing the periodic two-half split on them is both
+    unnecessary and wrong — there is no period left to straddle.
+
+    Two things had to be settled to close it. An arc is identified by its
+    GEOMETRIC circle: a band's rim carries the unit axis while the octant
+    beside it carries a cross product of length r^2 pointing the other way,
+    and using the raw vector minted a second EDGE_CURVE for every shared arc
+    (48 open edges). And a bound's orientation is defined in the SURFACE's
+    parameter space — a curved loop is not planar, so no 3D area test settles
+    it, and half the bands wound the other way (12 more)."""
+    text = write_step_body(B.to_body(build()))
+    ents = _entities(text)
+    uses = _edge_uses(text)
+    curves = [i for i, t in ents.items() if t == "EDGE_CURVE"]
+    assert sum(1 for t in ents.values() if t == "ADVANCED_FACE") == nfaces
+    assert len(curves) == nedges
+    assert sum(1 for t in ents.values() if t == "CYLINDRICAL_SURFACE") == 12
+    assert sum(1 for t in ents.values() if t == "SPHERICAL_SURFACE") == 8
+    assert [e for e in curves if sorted(uses.get(e, [])) != [False, True]] == []
+
+
+def test_a_degenerate_shape_refuses_rather_than_dangling() -> None:
+    """When the fillet radius reaches half the smallest dimension the core box
+    collapses: the flats become points and the bands zero length. The volume
+    and mesh are still exact (the solid IS a sphere) but AP214 cannot express
+    that topology, and emitting it left 18 dangling edges."""
+    from forgekernel.quadric import RoundedBox
+
+    with pytest.raises(ValueError, match="degenerate"):
+        write_step_body(B.to_body(RoundedBox(12, 12, 12, 6)))
