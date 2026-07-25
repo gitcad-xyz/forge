@@ -926,9 +926,63 @@ def _classify_pair(a, b) -> None:
         # cylinder note above; SphereOverlap already rejects it as "nesting".
         raise ValueError(
             "overlapping spheres — general quadric booleans arrive at K2.3")
+    # General fallback: EXACT axis-aligned separation. If the two bounding
+    # boxes do not overlap on some axis then neither do the solids, whatever
+    # they are — so the pair needs no type-specific predicate at all. This is
+    # the common case in practice (a boss standing on a plate, two features on
+    # opposite ends of a bracket) and it was refusing purely for want of a
+    # rule for that particular pair of types. Touching counts as separated:
+    # a tangent contact has measure zero.
+    ba, bb = _exact_bbox(a), _exact_bbox(b)
+    if ba is not None and bb is not None:
+        if any(ba[1][k] <= bb[0][k] or bb[1][k] <= ba[0][k] for k in range(3)):
+            return
     raise ValueError(
         f"disjoint-union of {type(a).__name__}+{type(b).__name__} arrives "
         "at K2.3")
+
+
+def _exact_bbox(shape):
+    """Exact axis-aligned bounds, or None when the representation cannot give
+    them without leaving ℚ. Never a float — this decides topology."""
+    from forgekernel.brep import Solid
+
+    if isinstance(shape, Solid):
+        vs = [v for p in shape.polys for v in p.verts]
+        if not vs:
+            return None
+        return (tuple(min(v[k] for v in vs) for k in range(3)),
+                tuple(max(v[k] for v in vs) for k in range(3)))
+    if isinstance(shape, Cyl):
+        return ((shape.cx - shape.r, shape.cy - shape.r, min(shape.z0, shape.z1)),
+                (shape.cx + shape.r, shape.cy + shape.r, max(shape.z0, shape.z1)))
+    if isinstance(shape, Sphere):
+        return ((shape.cx - shape.r, shape.cy - shape.r, shape.cz - shape.r),
+                (shape.cx + shape.r, shape.cy + shape.r, shape.cz + shape.r))
+    if isinstance(shape, Cone):
+        r = max(shape.r1, shape.r2)
+        return ((shape.cx - r, shape.cy - r, min(shape.z0, shape.z1)),
+                (shape.cx + r, shape.cy + r, max(shape.z0, shape.z1)))
+    if isinstance(shape, RevolveSolid):
+        r = max(rr for rr, _ in shape.loop)
+        zs = [zz for _, zz in shape.loop]
+        return ((shape.cx - r, shape.cy - r, min(zs)),
+                (shape.cx + r, shape.cy + r, max(zs)))
+    if isinstance(shape, DrilledSolid):
+        return _exact_bbox(shape.base)         # bores only remove material
+    if isinstance(shape, RoundedBox):
+        o = shape.origin
+        return (tuple(o), (o[0] + shape.a, o[1] + shape.b, o[2] + shape.c))
+    if isinstance(shape, AxisStack):
+        parts = [_exact_bbox(m) for m in shape.members]
+    elif isinstance(shape, DisjointUnion):
+        parts = [_exact_bbox(m) for m in shape.members]
+    else:
+        return None
+    if not parts or any(p is None for p in parts):
+        return None
+    return (tuple(min(p[0][k] for p in parts) for k in range(3)),
+            tuple(max(p[1][k] for p in parts) for k in range(3)))
 
 
 def _require_convex(solid: "Solid", what: str) -> None:
