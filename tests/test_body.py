@@ -1029,17 +1029,21 @@ def test_a_whole_torus_is_centred_on_its_own_centre() -> None:
 def test_a_filleted_cylinder_matches_green_by_hand() -> None:
     """A fillet lives on the (r, z) PROFILE, so the whole solid's volume is
     Green's pi * contour integral of r^2 dz. For a d=10 x 12 cylinder rounded
-    1 mm the arcs contribute 2pi + 50/3 each and the wall 250, giving
-    pi(850/3) + 4 pi^2 — the pi^2 term being the torus."""
-    import sys
-    sys.path.insert(0, str(__import__("pathlib").Path(
-        "C:/Users/danie/cad-dev/packages/gitcad-mech/src")))
-    from gitcad.kernel.ref import _fillet_profile, _lathe_body
+    1 mm the wall contributes 250 and each arc 2pi + 50/3, giving
+    pi(850/3) + 4 pi^2 — the pi^2 term being the torus.
+
+    Built here from the segments directly, so forge stays self-contained.
+    """
     from forgekernel.polypi import PiPoly
 
-    prof = [(F(0), F(0)), (F(5), F(0)), (F(5), F(12)), (F(0), F(12))]
-    body = _lathe_body(_fillet_profile(prof, F(1)), F(0), F(0))
+    segs = [("line", (F(0), F(0)), (F(4), F(0))),
+            ("arc", (F(4), F(1)), (F(4), F(0)), (F(5), F(1))),
+            ("line", (F(5), F(1)), (F(5), F(11))),
+            ("arc", (F(4), F(11)), (F(5), F(11)), (F(4), F(12))),
+            ("line", (F(4), F(12)), (F(0), F(12)))]
+    body = B.lathe_body(segs, F(0), F(0))
     assert B.volume(body) == PiPoly([0, F(850, 3), 4])
+    assert sum(1 for f in body.faces if isinstance(f.surface, B.Torus)) == 2
 
 
 def test_a_torus_sweeping_past_a_full_turn_refuses() -> None:

@@ -2000,6 +2000,54 @@ def from_rounded_box(rb) -> Body:
     return Body(tuple(faces))
 
 
+def lathe_body(segs, cx, cy) -> Body:
+    """Build the canonical B-rep of a lathed profile whose segments may be
+    ARCS as well as lines: an arc sweeps a torus, which is what a fillet on a
+    turned rim actually is."""
+    axis = (F(0), F(0), F(1))
+    faces = []
+
+    def circ(z, rad):
+        return Edge(_circle_at(cx, cy, z, rad),
+                      (cx + rad, cy, z), (cx + rad, cy, z))
+
+    for sg in segs:
+        if sg[0] == "arc":
+            cen, p0, p1 = sg[1], sg[2], sg[3]
+            a = max(abs(p0[0] - cen[0]), abs(p0[1] - cen[1]))
+            def quarter(pt):
+                co, si = (pt[0] - cen[0]) / a, (pt[1] - cen[1]) / a
+                return {(1, 0): 0, (0, 1): 1, (-1, 0): 2, (0, -1): 3}[(co, si)]
+            k0 = quarter(p0)
+            span = (quarter(p1) - k0) % 4 or 4
+            faces.append(Face(
+                Torus((cx, cy, cen[1]), axis, cen[0], a, k0, span), (), True))
+            continue
+        (r1, z1), (r2, z2) = sg[1], sg[2]
+        if r1 == r2 == 0 or (r1 == r2 and z1 == z2):
+            continue
+        if z1 == z2:
+            up = r2 < r1
+            lo, hi = (r2, r1) if up else (r1, r2)
+            n = (F(0), F(0), F(1) if up else F(-1))
+            loops = [Loop((circ(z1, hi),))]
+            if lo > 0:
+                loops.append(Loop((circ(z1, lo),)))
+            faces.append(Face(Plane(n, z1 if up else -z1),
+                                tuple(loops), True))
+            continue
+        rims = tuple(circ(z, r) for r, z in ((r1, z1), (r2, z2)) if r > 0)
+        sense = z2 > z1
+        if r1 == r2:
+            surf = Cylinder((cx, cy, min(z1, z2)), axis, r1)
+        else:
+            slope = (r2 - r1) / (z2 - z1)
+            surf = Cone((cx, cy, z1 - r1 / slope), axis,
+                          slope if slope > 0 else -slope)
+        faces.append(Face(surf, (Loop(rims),), sense))
+    return Body(tuple(faces))
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
