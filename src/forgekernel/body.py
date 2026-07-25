@@ -1874,19 +1874,34 @@ def from_drilled(d) -> Body:
                 bands.append((za, zb, max(rs)))
         if not bands:
             continue
-        zlo, zhi = bands[0][0], bands[-1][1]
-        # cap holes: only on a fragment this stack actually passes through
-        for i in cap_faces:
-            f = faces[i]
-            zc = f.loops[0].edges[0].v0[2]
-            r = (bands[-1][2] if zc == zhi else
-                 bands[0][2] if zc == zlo else None)
-            if r is None or not _face_contains_xy(f, cx, cy):
-                continue
-            circ = _circle_at(cx, cy, zc, r)
-            v = (cx + r, cy, zc)
-            faces[i] = Face(f.surface, f.loops + (Loop((Edge(circ, v, v),)),),
-                            f.sense)
+        # A mouth belongs at every band boundary that is not a STEP between two
+        # touching bands (a counterbore's shoulder, handled below). The stack
+        # may have GAPS: a bore through a shelled plate is two bands with the
+        # cavity between them, and taking only the outermost two z values left
+        # the cavity's ceiling and floor unpunched — the two rims there paired
+        # with nothing and the shell was open.
+        ends = []
+        for j, (za, zb, r) in enumerate(bands):
+            if j == 0 or bands[j - 1][1] != za:
+                ends.append((za, r, True))            # a floor: faces UP
+            if j == len(bands) - 1 or bands[j + 1][0] != zb:
+                ends.append((zb, r, False))           # a ceiling: faces DOWN
+        for z, r, up in ends:
+            cut_in = False
+            for i in cap_faces:
+                f = faces[i]
+                if f.loops[0].edges[0].v0[2] != z or not _face_contains_xy(
+                        f, cx, cy):
+                    continue
+                circ = _circle_at(cx, cy, z, r)
+                v = (cx + r, cy, z)
+                faces[i] = Face(f.surface,
+                                f.loops + (Loop((Edge(circ, v, v),)),), f.sense)
+                cut_in = True
+            if not cut_in:
+                # nothing to punch: the bore ends inside material, so it needs
+                # a floor of its own (the blind case)
+                faces.append(_disk_face(cx, cy, z, r, up))
         for za, zb, r in bands:                       # one wall per band
             lo_c, hi_c = _circle_at(cx, cy, za, r), _circle_at(cx, cy, zb, r)
             a, b = (cx + r, cy, za), (cx + r, cy, zb)
@@ -1905,10 +1920,6 @@ def from_drilled(d) -> Body:
             faces.append(Face(Plane((F(0), F(0), F(1)), zb),
                               (Loop((Edge(outer, vo, vo),)),
                                Loop((Edge(inner, vi, vi),))), up))
-        if zlo > F(bz0):                              # blind at the bottom
-            faces.append(_disk_face(cx, cy, zlo, bands[0][2], True))
-        if zhi < F(bz1):                              # blind at the top
-            faces.append(_disk_face(cx, cy, zhi, bands[-1][2], False))
     return Body(tuple(faces))
 
 

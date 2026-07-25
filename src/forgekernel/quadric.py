@@ -194,7 +194,19 @@ class DrilledSolid:
         # subtracted from a solid it never touches.
         if not _xy_inside_footprint(self.base, c.cx, c.cy):
             raise ValueError("bore misses the solid in xy (nothing to drill)")
-        _require_uniform_column(self.base, c)
+        # The column may be a STACK of slabs, not just one: a bore through a
+        # shelled plate meets the outer top and bottom plus the void's ceiling
+        # and floor. That used to refuse ("meets 4 horizontal levels, not 2"),
+        # because a single full-barrel removal would have taken the cavity's
+        # air as if it were material. One bore PER SLAB is the honest answer —
+        # coaxial bores are already what a counterbore is, and their volumes
+        # union by z-interval — and it is exact: the cross-section is constant
+        # over the disc, so each slab really is a full barrel.
+        pieces = [Cyl(c.cx, c.cy, c.r, max(z0, lo), min(z1, hi))
+                  for lo, hi in _column_slabs(self.base, c)
+                  if max(z0, lo) < min(z1, hi)]
+        if not pieces:
+            raise ValueError("bore misses the solid in z (K2.1 for the rest)")
         for o in self.bores:
             if o.cx == c.cx and o.cy == c.cy:
                 continue                       # coaxial stack (counterbore)
@@ -203,7 +215,7 @@ class DrilledSolid:
                 raise ValueError(
                     "bores intersect — general quadric booleans arrive "
                     "at K2.1")
-        return DrilledSolid(self.base, self.bores + [c])
+        return DrilledSolid(self.base, self.bores + pieces)
 
     def _bore_union_volume(self) -> PiVal:
         """Exact removed volume: coaxial groups unioned by z-interval with
@@ -985,8 +997,10 @@ def _seg_dist2(px, py, ax, ay, bx, by):
     return (px - qx) ** 2 + (py - qy) ** 2
 
 
-def _require_uniform_column(base: Solid, c: "Cyl") -> None:
-    """The bore's whole DISC must sit over a constant solid z-span.
+def _column_slabs(base: Solid, c: "Cyl") -> list:
+    """The SOLID z-intervals the bore's disc passes through, in order.
+
+    The bore's whole DISC must sit over a constant cross-section.
 
     ``_bore_union_volume`` removes π r² (z1−z0) — the volume of a full-height
     barrel — so it is only right when the material really is full height
@@ -1039,11 +1053,18 @@ def _require_uniform_column(base: Solid, c: "Cyl") -> None:
                 "bore reaches a non-vertical wall, so the solid is not full "
                 "height across the hole — a full-barrel removal would "
                 "overstate it (K2.1)")
-    if len(levels) != 2:
+    zs = sorted(levels)
+    if len(zs) < 2 or len(zs) % 2:
         raise ValueError(
-            f"bore column meets {len(levels)} horizontal levels, not 2 — the "
-            "solid is not one slab there (a cavity or a step), so a "
-            "full-barrel removal would overstate it (K2.1)")
+            f"bore column meets {len(zs)} horizontal levels — an odd count "
+            "cannot be a stack of closed slabs, so the material over the disc "
+            "is not decidable here (K2.1)")
+    # No lateral face reaches the disc (checked above), so the cross-section is
+    # CONSTANT over the whole disc and the column is a clean stack of slabs:
+    # the lowest level is the first slab's floor, the next its ceiling, and so
+    # on alternating. A shelled plate is two slabs — its outer top and bottom
+    # plus the void's ceiling and floor — which used to refuse outright.
+    return [(zs[i], zs[i + 1]) for i in range(0, len(zs), 2)]
 
 
 def _exact_bbox(shape):

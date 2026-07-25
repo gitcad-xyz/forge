@@ -803,10 +803,11 @@ UNIFORM = [
     ("dead centre of a chamfered plate", lambda: __import__(
         "forgekernel.kernel", fromlist=["chamfer"]).chamfer(
             Solid.box(20, 20, 4), 2.0), (10, 10, 2), (0, 4), True),
-    # after hollowing, the bore passes through the CAVITY
+    # the bore passes through the CAVITY: two slabs, not one, and each is a
+    # full barrel in its own right — see the volume test below
     ("through a shelled plate", lambda: __import__(
         "forgekernel.kernel", fromlist=["shell"]).shell(
-            Solid.box(20, 20, 10), 2.0), (10, 10, 2), (0, 10), False),
+            Solid.box(20, 20, 10), 2.0), (10, 10, 2), (0, 10), True),
     ("a plain slab", lambda: Solid.box(40, 20, 5), (20, 10, 4), (0, 5), True),
     # non-convex but still one slab through the column
     ("an L-prism", lambda: prism(
@@ -1206,3 +1207,58 @@ def test_the_edge_key_is_exact_and_direction_free() -> None:
     near = (Q(1), Q(2), Q(3) + Q(1, 10 ** 6))
     off = B.Edge(B.Line(p, tuple(near[i] - p[i] for i in range(3))), p, near)
     assert B._edge_key(fwd) != B._edge_key(off)
+
+
+SLABS = [
+    # (label, base, bore, exact removed volume as a multiple of pi)
+    ("through a shelled plate",
+     lambda: __import__("forgekernel.kernel", fromlist=["shell"]).shell(
+         Solid.box(20, 20, 10), 2.0), Cyl(10, 10, 2, 0, 10), 4 * 2 + 4 * 2),
+    ("through a shelled cube",
+     lambda: __import__("forgekernel.kernel", fromlist=["shell"]).shell(
+         Solid.box(20, 20, 20), 2.0), Cyl(10, 10, 1, 0, 20), 1 * 2 + 1 * 2),
+    # only the top wall: the tool stops inside the cavity, so the lower slab
+    # contributes nothing and clipping must drop it rather than remove air
+    ("stopping inside the cavity",
+     lambda: __import__("forgekernel.kernel", fromlist=["shell"]).shell(
+         Solid.box(20, 20, 20), 2.0), Cyl(10, 10, 1, 10, 20), 1 * 2),
+    ("a plain slab is still one barrel", lambda: Solid.box(40, 20, 5),
+     Cyl(20, 10, 4, 0, 5), 16 * 5),
+]
+
+
+@pytest.mark.parametrize("label,build,bore,removed", SLABS,
+                         ids=[s[0] for s in SLABS])
+def test_a_bore_through_a_cavity_removes_each_slab_and_no_air(
+        label, build, bore, removed) -> None:
+    """A bore's column may be a STACK of slabs — through a shelled plate it is
+    the top wall and the bottom wall with the void between. One full barrel
+    over the whole span would have taken the cavity's air as if it were metal,
+    so the kernel refused outright ("meets 4 horizontal levels, not 2"). One
+    bore per slab is exact: no lateral face reaches the disc, so the
+    cross-section is constant and each slab really is a full barrel."""
+    base = build()
+    out = DrilledSolid(base, []).cut(bore)
+    got = PiVal(base.volume(), F(0)) - out.volume()
+    assert got == PiVal(F(0), F(removed)), f"removed {got}, want {removed} pi"
+    body = B.to_body(out)
+    assert B.manifold_violations(body) == []
+    from forgekernel.stepbody import write_step_body
+    write_step_body(body)                 # its own closing audit runs here
+
+
+def test_an_odd_level_count_still_refuses() -> None:
+    """Two slabs is a stack; an odd count cannot be one, so the material over
+    the disc is not decidable and the barrel arithmetic must not guess."""
+    from forgekernel.quadric import _column_slabs
+
+    sh = __import__("forgekernel.kernel", fromlist=["shell"]).shell(
+        Solid.box(20, 20, 10), 2.0)
+    assert _column_slabs(sh, Cyl(10, 10, 2, 0, 10)) == [
+        (F(0), F(2)), (F(8), F(10))]
+    # a chamfer's taper is a non-horizontal face over the disc: still refused,
+    # because there the cross-section is not constant at all
+    ch = __import__("forgekernel.kernel", fromlist=["chamfer"]).chamfer(
+        Solid.box(20, 20, 4), 2.0)
+    with pytest.raises(ValueError, match="K2.1"):
+        _column_slabs(ch, Cyl(1.5, 1.0, 0.25, 0, 4))
