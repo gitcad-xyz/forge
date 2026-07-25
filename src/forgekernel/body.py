@@ -323,6 +323,77 @@ def _arc_pts(c: Circle, v0, v1, deflection: float):
                   for i in range(3)) for k in range(n)]
 
 
+def _circle_frame(c: Circle):
+    """The circle's exact orthonormal frame (u, w). Refuses unless both are
+    exactly unit and perpendicular — a quarter position has to be EXACT or
+    none of the trimmed-quadric arithmetic below is."""
+    if dot(c.n, c.n) != 1 or dot(c.ref, c.ref) != 1 or dot(c.ref, c.n) != 0:
+        raise ValueError(
+            "circle frame is not exactly orthonormal — a trimmed quadric "
+            "needs exact quarter positions (K3.7)")
+    return c.ref, cross(c.n, c.ref)
+
+
+def _quarter_depth(r: float, deflection: float) -> int:
+    """Subdivision depth for a quarter arc, shared by trimmed bands and corner
+    octants so that they agree vertex for vertex along the arcs they share."""
+    d = 1
+    while d < 7 and r * (1 - math.cos(math.pi / 4 / (2 ** d))) > deflection:
+        d += 1
+    return d
+
+
+def _quarter_index(c: Circle, p):
+    """Which quarter turn from `ref` the point sits at (0..3), or None.
+
+    Trimmed quadrics stay in ℚ[π] only at right angles, where sin and cos are
+    0 and ±1. Anywhere else the band's ∫n̂ dθ term is a transcendental that
+    leaves the field, so this is the predicate that decides exact-or-refuse.
+    """
+    u, w = _circle_frame(c)
+    rel = sub(p, c.c)
+    for k, v in enumerate((u, w, tuple(-x for x in u), tuple(-x for x in w))):
+        if rel == tuple(c.r * x for x in v):
+            return k
+    return None
+
+
+def _arc_quarters(c: Circle, v0, v1):
+    """(start index, number of quarter turns) for an arc, counter-clockwise
+    about the circle's normal. A closed edge is the whole four."""
+    k0, k1 = _quarter_index(c, v0), _quarter_index(c, v1)
+    if k0 is None or k1 is None:
+        raise ValueError(
+            "arc endpoint is not at a quarter turn — a trimmed quadric is "
+            "exact only at right angles (K3.7)")
+    span = (k1 - k0) % 4
+    return k0, (4 if span == 0 else span)
+
+
+def _quarter_antiderivative(c: Circle, k: int):
+    """∫n̂ dθ evaluated at θ = k·π/2, i.e. sin(θ)u − cos(θ)w. Rational."""
+    u, w = _circle_frame(c)
+    sin_, cos_ = ((0, 1), (1, 0), (0, -1), (-1, 0))[k % 4]
+    return tuple(sin_ * u[i] - cos_ * w[i] for i in range(3))
+
+
+def _band_arc(face: Face):
+    """The face's arcs as (circle, start quarter, quarter span), or None when
+    every loop is a whole circle (the untrimmed case)."""
+    arcs = []
+    for lp in face.loops:
+        if _loop_is_circle(lp) is not None:
+            continue
+        for e in lp.edges:
+            if isinstance(e.curve, Circle) and _key3(e.v0) != _key3(e.v1):
+                arcs.append((e.curve,) + _arc_quarters(e.curve, e.v0, e.v1))
+    return arcs or None
+
+
+def _key3(v):
+    return tuple(v)
+
+
 def _planar_loop_area2(loop: Loop, n: Vec):
     """Twice the signed area of a polygonal loop, projected along n (exact)."""
     pts = [e.v0 for e in loop.edges]
@@ -428,13 +499,40 @@ def _face_volume_term(face: Face):
         return PiVal(_exact(sgn * rat, "planar area"),
                      _exact(sgn * pi, "circular area"))
     if isinstance(s, Cylinder):
-        # Over a full band of radius r and axial height h, ∮ x·û dθ drops the
-        # axis-offset term (∫û dθ = 0), leaving (1/3)(2π r² h).
+        # x·n̂ = p·N̂ + r on the surface, so ∮x·n̂ dA = r·h·(p·∫N̂dθ + r·Δθ).
+        # Over a FULL band ∫N̂dθ vanishes and this is the familiar
+        # (1/3)(2πr²h); over a TRIMMED one it does not, and the leftover term
+        # is rational exactly when the arc ends on quarter turns — which is
+        # what keeps a rounded box's edge fillets inside ℚ[π].
         h = _band_height(face, s)
-        return PiVal(0, _exact(sgn * 2 * s.r * s.r * h / 3, "cylinder band"))
+        arcs = _band_arc(face)
+        if arcs is None:
+            return PiVal(0, _exact(sgn * 2 * s.r * s.r * h / 3, "cylinder band"))
+        if len({sp for _c, _k, sp in arcs}) != 1:
+            raise ValueError(
+                "a trimmed band whose rims sweep different angles is not one "
+                "face (K3.7)")
+        # read the sweep off the rim whose normal runs WITH the axis: the
+        # other rim carries -n, because an Edge on a Circle is CCW about that
+        # circle's own normal and the two rims run opposite ways
+        forward = [x for x in arcs if dot(x[0].n, s.d) > 0]
+        circ, k0, span = (forward or arcs)[0]
+        vint = sub(_quarter_antiderivative(circ, k0 + span),
+                   _quarter_antiderivative(circ, k0))
+        rat = sgn * s.r * h * dot(s.p, vint) / 3
+        pi = sgn * s.r * h * s.r * Fraction(span, 2) / 3          # Δθ = span·π/2
+        return PiVal(_exact(rat, "trimmed band offset"),
+                     _exact(pi, "trimmed band sweep"))
     if isinstance(s, SphereS):
-        # x·n̂ = r + c·n̂, and ∮ c·n̂ dA = 0 over the whole sphere: (1/3)r·4πr².
-        return PiVal(0, _exact(sgn * 4 * s.r ** 3 / 3, "sphere"))
+        # x·n̂ = r + c·n̂. Over the whole sphere ∮c·n̂ dA = 0, leaving
+        # (1/3)r·4πr². Over one OCTANT neither term vanishes: the area is
+        # πr²/2 and ∮n̂ dA is (πr²/4) times the octant's sign vector.
+        oct_ = _sphere_octant(face)
+        if oct_ is None:
+            return PiVal(0, _exact(sgn * 4 * s.r ** 3 / 3, "sphere"))
+        return PiVal(0, _exact(
+            sgn * (dot(s.c, oct_) * s.r * s.r / 4 + s.r ** 3 / 2) / 3,
+            "sphere octant"))
     if isinstance(s, Cone):
         # Every point of a cone satisfies (x − apex)·n̂ = 0, so x·n̂ = p·n̂ and
         # ∮x·n̂ dA = p·∮n̂ dA. The radial part of ∮n̂ dA cancels round the band,
@@ -483,6 +581,34 @@ def _cone_rims(face: Face, cone: Cone):
             "conical face without one or two circular rims — a trimmed cone "
             "needs general seam handling (K3.7)")
     return rims[0], rims[1]
+
+
+def _sphere_octant(face: Face):
+    """The octant's outward sign vector, or None for a whole sphere.
+
+    A corner patch of a rounded box is bounded by three quarter arcs whose
+    shared corners are the sphere centre plus r along each signed axis, so
+    summing those corners recovers the octant directly — exactly, with no
+    angle arithmetic at all.
+    """
+    if not face.loops:
+        return None
+    pts = [e.v0 for lp in face.loops for e in lp.edges]
+    if len(pts) != 3:
+        raise ValueError(
+            "a spherical patch that is not a whole sphere or an octant is "
+            "outside ℚ[π] (K3.7)")
+    c = face.surface.c
+    acc = [F(0), F(0), F(0)]
+    for q in pts:
+        for i in range(3):
+            acc[i] += q[i] - c[i]
+    out = tuple(F(1) if x > 0 else (F(-1) if x < 0 else F(0)) for x in acc)
+    if 0 in out or any(abs(a) != face.surface.r for a in acc):
+        raise ValueError(
+            "spherical patch corners are not on the signed axes — not an "
+            "octant (K3.7)")
+    return out
 
 
 def _band_height(face: Face, cyl: Cylinder) -> Fraction:
@@ -794,6 +920,71 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             pts2, t2 = triangulate(rings[0], rings[1:], keep_collinear=True)
             for a, b, c in t2:
                 tri(to3(pts2[a]), to3(pts2[b]), to3(pts2[c]), out)
+        elif isinstance(s, Cylinder) and _band_arc(face) is not None:
+            # a TRIMMED band: sample only the swept sector, from the rim whose
+            # normal runs with the axis (the other carries -n by contract)
+            arcs = _band_arc(face)
+            fwd = [x for x in arcs if dot(x[0].n, s.d) > 0] or arcs
+            circ, k0, span = fwd[0]
+            u, w = (tuple(float(x) for x in v) for v in _circle_frame(circ))
+            rr = float(s.r)
+            # a trimmed band and the corner octants next to it SHARE their
+            # quarter arcs, so both must land on the same points. Projecting a
+            # chord midpoint onto a circle lands on the ANGULAR midpoint, so a
+            # depth-d octant subdivision gives 2^d uniform steps per quarter —
+            # match the band to that or the shell tears along every seam.
+            per = 2 ** _quarter_depth(rr, deflection)
+            nseg = per * span
+            axis = _unit(tuple(float(x) for x in s.d))
+            ends = sorted({sum((float(c.c[t]) - float(s.p[t])) * axis[t]
+                                for t in range(3))
+                           for c, _k, _sp in arcs})
+            base = tuple(float(x) for x in s.p)
+            def at(tt, ang):
+                th = (k0 + ang) * math.pi / 2
+                return tuple(base[t] + tt * axis[t]
+                             + rr * (math.cos(th) * u[t] + math.sin(th) * w[t])
+                             for t in range(3))
+            for m in range(nseg):
+                a0, a1 = span * m / nseg, span * (m + 1) / nseg
+                pa, pb = at(ends[0], a0), at(ends[0], a1)
+                qa, qb = at(ends[-1], a0), at(ends[-1], a1)
+                mid = tuple((pa[t] + pb[t]) / 2 for t in range(3))
+                rel = tuple(mid[t] - base[t] for t in range(3))
+                axl = sum(rel[t] * axis[t] for t in range(3))
+                radial = _unit(tuple(rel[t] - axl * axis[t] for t in range(3)))
+                outn = radial if face.sense else tuple(-x for x in radial)
+                tri(pa, pb, qb, outn)
+                tri(pa, qb, qa, outn)
+        elif isinstance(s, SphereS) and face.loops:
+            oct_ = _sphere_octant(face)
+            rr = float(s.r)
+            cc = tuple(float(x) for x in s.c)
+            corners = [tuple(cc[t] + rr * float(oct_[ax]) * (1.0 if ax == t else 0.0)
+                             for t in range(3)) for ax in range(3)]
+            depth = _quarter_depth(rr, deflection)
+
+            def onsphere(q):
+                v = [q[t] - cc[t] for t in range(3)]
+                ln = math.sqrt(sum(x * x for x in v)) or 1.0
+                return tuple(cc[t] + rr * v[t] / ln for t in range(3))
+
+            def sub(a, b2, c2, lvl):
+                if lvl == 0:
+                    m = tuple((a[t] + b2[t] + c2[t]) / 3 for t in range(3))
+                    outn = _unit(tuple(m[t] - cc[t] for t in range(3)))
+                    tri(a, b2, c2, outn if face.sense
+                        else tuple(-x for x in outn))
+                    return
+                ab = onsphere(tuple((a[t] + b2[t]) / 2 for t in range(3)))
+                bc = onsphere(tuple((b2[t] + c2[t]) / 2 for t in range(3)))
+                ca = onsphere(tuple((c2[t] + a[t]) / 2 for t in range(3)))
+                sub(a, ab, ca, lvl - 1)
+                sub(ab, b2, bc, lvl - 1)
+                sub(ca, bc, c2, lvl - 1)
+                sub(ab, bc, ca, lvl - 1)
+
+            sub(corners[0], corners[1], corners[2], depth)
         elif isinstance(s, Cylinder):
             circs = [e.curve for lp in face.loops for e in lp.edges
                      if isinstance(e.curve, Circle)]
@@ -1429,11 +1620,99 @@ def from_revolve(rev) -> Body:
     return Body(tuple(faces))
 
 
+def from_rounded_box(rb) -> Body:
+    """A box with every edge and corner filleted — the Minkowski sum of the
+    core box with a ball — as 6 planes, 12 quarter-cylinders and 8 octants.
+
+    This is the first TRIMMED-quadric body: its bands sweep a right angle
+    rather than a full turn, and its spherical patches are corner octants.
+    Both stay in ℚ[π] precisely because the trims are at right angles, where
+    sin and cos are 0 and ±1 (see ``_quarter_index``).
+    """
+    r = F(rb.r)
+    ox, oy, oz = (F(v) for v in rb.origin)
+    lo = (ox + r, oy + r, oz + r)
+    hi = (ox + F(rb.a) - r, oy + F(rb.b) - r, oz + F(rb.c) - r)
+    out = (ox, oy, oz), (ox + F(rb.a), oy + F(rb.b), oz + F(rb.c))
+    E = [(F(1), F(0), F(0)), (F(0), F(1), F(0)), (F(0), F(0), F(1))]
+    faces = []
+
+    def corner(i, si, j, sj, k, t):
+        """Point on the core box: extreme in axes i and j by the given signs,
+        at parameter t along axis k."""
+        pt = [None, None, None]
+        pt[i] = hi[i] if si > 0 else lo[i]
+        pt[j] = hi[j] if sj > 0 else lo[j]
+        pt[k] = t
+        return tuple(pt)
+
+    # --- 6 flats, each the core rectangle pushed out to the true surface
+    for ax in range(3):
+        for sgn_ in (1, -1):
+            n = tuple(sgn_ * x for x in E[ax])
+            level = out[1][ax] if sgn_ > 0 else out[0][ax]
+            u, v = (ax + 1) % 3, (ax + 2) % 3
+            if sgn_ < 0:
+                u, v = v, u
+            ring = []
+            for du, dv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                pt = [None, None, None]
+                pt[ax] = level
+                pt[u] = hi[u] if du else lo[u]
+                pt[v] = hi[v] if dv else lo[v]
+                ring.append(tuple(pt))
+            edges = tuple(Edge(Line(ring[i], sub(ring[(i + 1) % 4], ring[i])),
+                               ring[i], ring[(i + 1) % 4]) for i in range(4))
+            faces.append(Face(Plane(n, level * sgn_), (Loop(edges),), True))
+
+    # --- 12 quarter-cylinders, one per box edge
+    for k in range(3):
+        i, j = (k + 1) % 3, (k + 2) % 3
+        for si in (1, -1):
+            for sj in (1, -1):
+                axis = E[k]
+                c0 = corner(i, si, j, sj, k, lo[k])
+                c1 = corner(i, si, j, sj, k, hi[k])
+                u = tuple(si * x for x in E[i])
+                w = tuple(sj * x for x in E[j])
+                # the band must sweep CCW about +axis from u to w, so pick the
+                # ref that makes it so; cross(axis, u) is w or -w
+                fwd = cross(axis, u) == w
+                ref0, ref1 = (u, w) if fwd else (w, u)
+                a0 = Circle(c0, axis, ref0, r)
+                a1 = Circle(c1, tuple(-x for x in axis), ref1, r)
+                p0, p1 = tuple(c0[t] + r * ref0[t] for t in range(3)),                     tuple(c0[t] + r * (w if fwd else u)[t] for t in range(3))
+                q0, q1 = tuple(c1[t] + r * ref0[t] for t in range(3)),                     tuple(c1[t] + r * (w if fwd else u)[t] for t in range(3))
+                loop = Loop((
+                    Edge(a0, p0, p1),
+                    Edge(Line(p1, sub(q1, p1)), p1, q1),
+                    Edge(a1, q1, q0),
+                    Edge(Line(q0, sub(p0, q0)), q0, p0),
+                ))
+                faces.append(Face(Cylinder(c0, axis, r), (loop,), True))
+
+    # --- 8 corner octants
+    for sx in (1, -1):
+        for sy in (1, -1):
+            for sz in (1, -1):
+                cen = (hi[0] if sx > 0 else lo[0], hi[1] if sy > 0 else lo[1],
+                       hi[2] if sz > 0 else lo[2])
+                pts = [tuple(cen[t] + r * (s * E[ax][t]) for t in range(3))
+                       for ax, s in ((0, sx), (1, sy), (2, sz))]
+                edges = tuple(
+                    Edge(Circle(cen, cross(sub(pts[m], cen), sub(pts[(m + 1) % 3], cen)),
+                                tuple(x / r for x in sub(pts[m], cen)), r),
+                         pts[m], pts[(m + 1) % 3]) for m in range(3))
+                faces.append(Face(SphereS(cen, r), (Loop(edges),), True))
+    return Body(tuple(faces))
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
     from forgekernel.quadric import (Cone as QCone, Cyl, DisjointUnion,
-                                     DrilledSolid, RevolveSolid, Sphere)
+                                     DrilledSolid, RevolveSolid, RoundedBox,
+                                     Sphere)
 
     if isinstance(shape, Body):
         return shape
@@ -1443,6 +1722,8 @@ def to_body(shape) -> Body:
         return from_cone(shape)
     if isinstance(shape, RevolveSolid):
         return from_revolve(shape)
+    if isinstance(shape, RoundedBox):
+        return from_rounded_box(shape)
     if isinstance(shape, Cyl):
         return from_cyl(shape)
     if isinstance(shape, DrilledSolid):

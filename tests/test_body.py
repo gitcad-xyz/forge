@@ -827,3 +827,66 @@ def test_a_bore_needs_a_full_height_column_under_its_whole_disc(
     else:
         with pytest.raises(ValueError, match="K2.1"):
             cut(Cyl(cx, cy, r, zs[0], zs[1]))
+
+
+# --- trimmed quadrics: the rounded box (ADR-0021, K5.1) ---------------------
+
+ROUNDED = [
+    ("cube r3", (20, 20, 20, 3)),
+    ("slab r2", (30, 20, 10, 2)),
+    ("plate r5", (40, 25, 15, 5)),
+    # 2r == the smallest dimension: the core box degenerates and the whole
+    # solid IS a sphere — the limiting case the formula must still hit
+    ("degenerate: a sphere", (12, 12, 12, 6)),
+    ("half-integer radius", (21, 13, 9, 2.5)),
+]
+
+
+@pytest.mark.parametrize("label,args", ROUNDED, ids=[r[0] for r in ROUNDED])
+def test_a_rounded_box_matches_steiner_exactly(label, args) -> None:
+    """The FIRST trimmed-quadric body: its bands sweep a right angle rather
+    than a full turn and its corners are sphere octants. Both stay in Q[pi]
+    precisely because the trims are at right angles, where sin and cos are 0
+    and +-1 — so the volume must equal Steiner's formula EXACTLY, not nearly.
+
+        V = pqs + 2r(pq+qs+sp) + pi r^2 (p+q+s) + (4/3) pi r^3
+    """
+    from forgekernel.quadric import RoundedBox
+
+    rb = RoundedBox(*args)
+    body = B.to_body(rb)
+    assert len(body.faces) == 6 + 12 + 8
+    assert B.volume(body) == rb.volume()
+
+
+@pytest.mark.parametrize("label,args", ROUNDED, ids=[r[0] for r in ROUNDED])
+def test_a_rounded_box_meshes_watertight(label, args) -> None:
+    """A trimmed band and the corner octants beside it SHARE quarter arcs.
+    Projecting a chord midpoint onto a circle lands on the ANGULAR midpoint,
+    so a depth-d octant gives 2^d uniform steps per quarter and the band has
+    to match it — sampling the band independently tore every seam (912
+    unpaired edges)."""
+    from forgekernel.quadric import RoundedBox
+
+    assert _non_manifold(B.tessellate(B.to_body(RoundedBox(*args)), 0.1)) == 0
+
+
+def test_an_arc_off_a_quarter_turn_refuses() -> None:
+    """A trim is exact only at right angles: anywhere else the band's
+    integral of n_hat carries a transcendental and leaves the field."""
+    from fractions import Fraction as Q
+
+    c = B.Circle((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(5))
+    with pytest.raises(ValueError, match="quarter turn"):
+        B._arc_quarters(c, (Q(5), Q(0), Q(0)), (Q(3), Q(4), Q(0)))
+
+
+def test_a_rounded_box_survives_a_rigid_transform_exactly() -> None:
+    from forgekernel.quadric import RoundedBox
+
+    rb = RoundedBox(30, 20, 10, 2)
+    body = B.to_body(rb)
+    exact = B.volume(body)
+    for m in (B.Affine.translation(3, -7, 11), B.Affine.mirror("x"),
+              B.Affine.rotation((0, 0, 1), 90)):
+        assert B.volume(body.transformed(m)) == exact
