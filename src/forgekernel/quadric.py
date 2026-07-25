@@ -96,30 +96,31 @@ class Cyl:
 def _xy_inside_footprint(solid: Solid, px, py) -> bool:
     """Exact: is (px, py) inside the solid's xy footprint?
 
-    The footprint boundary is the xy projection of the lateral (non-horizontal)
-    faces. Ray parity along +x with the half-open upward-crossing rule — all
-    rational, no tolerance. Needed because "the bore does not CROSS a lateral
-    wall" does not distinguish a bore strictly inside from one entirely
-    outside: neither crosses anything."""
-    segs = set()
+    Needed because "the bore does not CROSS a lateral wall" does not
+    distinguish a bore strictly inside from one entirely outside: neither
+    crosses anything. Ray parity along +x, all rational, no tolerance.
+
+    The footprint is the union of the xy projections of the faces: if a face
+    covers (px, py) then the solid occupies that column at some z, and if the
+    solid occupies the column then a vertical ray meets a face there. Parity
+    over the LATERAL edges instead is only equivalent for a PRISM — a chamfer
+    or a draft makes the slanted faces project to bands whose extra crossings
+    flip the parity back, and a bore at the dead centre of a chamfered plate
+    reads as missing the solid entirely.
+    """
     for p in solid.polys:
-        n = p.plane.n
-        if n[0] == 0 and n[1] == 0:
-            continue                           # horizontal face: no footprint edge
-        m = len(p.verts)
+        verts = [(v[0], v[1]) for v in p.verts]
+        inside = False
+        m = len(verts)
         for i in range(m):
-            a, b = p.verts[i], p.verts[(i + 1) % m]
-            if a[0] == b[0] and a[1] == b[1]:
-                continue                       # vertical edge: projects to a point
-            key = ((a[0], a[1]), (b[0], b[1]))
-            segs.add(key if key[0] <= key[1] else (key[1], key[0]))
-    inside = False
-    for (x1, y1), (x2, y2) in segs:
-        if (y1 > py) != (y2 > py):
-            xc = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
-            if px < xc:
-                inside = not inside
-    return inside
+            (x1, y1), (x2, y2) = verts[i], verts[(i + 1) % m]
+            if (y1 > py) != (y2 > py):
+                xc = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+                if px < xc:
+                    inside = not inside
+        if inside:
+            return True
+    return False
 
 
 def _dist2_point_seg(px, py, ax, ay, bx, by) -> Fraction:
