@@ -558,3 +558,69 @@ def test_an_unmergeable_group_falls_back_to_its_fragments() -> None:
 
     pl = B.Plane((Q(0), Q(0), Q(1)), Q(0))
     assert B._merge_coplanar(pl, [sq(0, 0), sq(1, 1)]) is None
+
+
+# --- cones (ADR-0021 converter) --------------------------------------------
+
+def _frustum_volume(r1, r2, h):
+    from fractions import Fraction as Q
+    return Q(h) * (Q(r1) ** 2 + Q(r1) * Q(r2) + Q(r2) ** 2) / 3
+
+
+def _frustum_centroid_z(r1, r2, z0, z1):
+    h = z1 - z0
+    return z0 + h * (r1 * r1 + 2 * r1 * r2 + 3 * r2 * r2) / (
+        4 * (r1 * r1 + r1 * r2 + r2 * r2))
+
+
+CONES = [
+    ("frustum", (0, 0, 2, 5, 0, 10)),
+    ("true cone, apex below", (0, 0, 0, 6, 0, 9)),
+    ("true cone, apex above", (0, 0, 4, 0, 0, 8)),
+    ("narrowing", (0, 0, 5, 2, 0, 10)),
+    ("off-axis, offset in z", (7, -3, 3, 6, 2, 8)),
+    ("half-integer radii", (0, 0, 1.5, 4.5, 0, 7)),
+]
+
+
+@pytest.mark.parametrize("label,args", CONES, ids=[c[0] for c in CONES])
+def test_a_cone_has_an_exact_volume_in_the_pi_field(label, args) -> None:
+    """A cone looks like it needs a square root — the slant length carries
+    sqrt(1+t^2). It cancels: every point satisfies (x - apex).n = 0, so the
+    divergence term is (p.d)*n_ax*Area, where n_ax contributes 1/sqrt(1+t^2)
+    and Area contributes the slant's sqrt(1+t^2). A taper is exact."""
+    from forgekernel.quadric import Cone as QCone
+
+    cx, cy, r1, r2, z0, z1 = args
+    body = B.to_body(QCone(*args))
+    assert B.volume(body) == PiVal(0, _frustum_volume(r1, r2, z1 - z0))
+
+
+@pytest.mark.parametrize("label,args", CONES, ids=[c[0] for c in CONES])
+def test_a_cones_centre_of_mass_matches_the_analytic_frustum(label, args) -> None:
+    from forgekernel.quadric import Cone as QCone
+
+    cx, cy, r1, r2, z0, z1 = args
+    got = B.centroid(B.to_body(QCone(*args)))
+    assert got == pytest.approx(
+        (cx, cy, _frustum_centroid_z(r1, r2, z0, z1)), abs=1e-9)
+
+
+@pytest.mark.parametrize("label,args", CONES, ids=[c[0] for c in CONES])
+def test_a_cone_meshes_watertight(label, args) -> None:
+    """Both rims of a taper have DIFFERENT radii, so a per-circle segment
+    count gives the wall and the caps different vertex counts and the mesh
+    tears along every rim. The count belongs to the AXIS, not the circle."""
+    from forgekernel.quadric import Cone as QCone
+
+    assert _non_manifold(B.tessellate(B.to_body(QCone(*args)), 0.02)) == 0
+
+
+def test_a_cone_with_equal_radii_is_routed_to_the_cylinder() -> None:
+    """Not a degenerate cone — the apex runs off to infinity and every axial
+    measurement would divide by a zero slope."""
+    from forgekernel.quadric import Cone as QCone
+
+    body = B.to_body(QCone(0, 0, 4, 4, 0, 10))
+    assert {type(f.surface).__name__ for f in body.faces} == {"Plane", "Cylinder"}
+    assert B.volume(body) == PiVal(0, 16 * 10)

@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from forgekernel.body import (Body, Circle, Cylinder, Line, Plane, SphereS,
-                              dot, sub)
+from forgekernel.body import (Body, Circle, Cone, Cylinder, Line, Plane,
+                              SphereS, dot, sub)
 from forgekernel.stepio import _dec, _perp, _real, _unit3
 
 
@@ -231,6 +231,18 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
         if isinstance(s, SphereS):
             return emit(f"SPHERICAL_SURFACE('',"
                         f"#{placement(s.c, (0, 0, 1), (1, 0, 0))},{fnum(s.r)})")
+        if isinstance(s, Cone):
+            # AP214 places a cone by a REFERENCE circle, not by its apex: the
+            # placement origin sits where the radius equals `radius`, and
+            # semi_angle opens from there along the axis. The apex itself is
+            # the radius-0 reference, which is always exact and always on the
+            # surface, so use it.
+            import math as _m
+            (dx, dy, dz), _ = _unit3(s.d)
+            return emit(
+                f"CONICAL_SURFACE('',"
+                f"#{placement(s.p, s.d, _perp((dx, dy, dz)))},"
+                f"{fnum(0)},{fnum(_m.atan(float(s.tan_half)))})")
         raise ValueError(
             f"STEP export of a {type(s).__name__} face is not implemented yet "
             "— spherical and conical surfaces arrive with K3.7")
@@ -265,6 +277,56 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
             faces.append(advanced_face(surf, [_reverse(lune)], face.sense))
             continue
         loops = _split_full_circles(face)
+        if isinstance(s, Cone):
+            # A taper is periodic in the same way a tube is, so it also ships
+            # as two half-faces. A TRUE cone closes at its apex: that half-face
+            # is bounded by an arc and two generators meeting at one vertex,
+            # not by two rims — the degenerate rim is a point, not a mistake.
+            rims = []
+            for item in [x for lp in loops for x in lp]:
+                if not isinstance(item[0], Circle):
+                    raise ValueError(
+                        "conical face with a straight edge — a trimmed cone "
+                        "needs general seam handling (K3.7)")
+                rims.append(item)
+            byrim: dict = {}
+            for item in rims:
+                byrim.setdefault((_key(item[0].c), item[0].r), []).append(item)
+            groups = [v for _, v in sorted(
+                byrim.items(),
+                key=lambda kv: float(dot(sub(kv[1][0][0].c, s.p), s.d)))]
+            if not groups or any(len(g) != 2 for g in groups) or len(groups) > 2:
+                raise ValueError(
+                    "conical face without one or two whole circular rims "
+                    "(K3.7)")
+            groups = [sorted(g, key=lambda x: x[3]) for g in groups]
+            surf = surface_of(s)
+            if len(groups) == 1:                      # cone: rim + apex point
+                apex = tuple(s.p)
+                # The apex is the degenerate OTHER rim, so the real rim plays
+                # whichever role the apex does not. Traversing it forward when
+                # it is the upper rim makes it run the same way as the cap that
+                # shares it, and the two faces stop closing the shell.
+                upper = dot(sub(groups[0][0][0].c, s.p), s.d) > 0
+                for bc, b0, b1, bh in groups[0]:
+                    arc = (bc, b1, b0, bh) if upper else (bc, b0, b1, bh)
+                    x, y = (b0, b1) if upper else (b1, b0)
+                    faces.append(advanced_face(surf, [[
+                        arc,
+                        (Line(x, sub(apex, x)), x, apex, None),
+                        (Line(apex, sub(y, apex)), apex, y, None),
+                    ]], face.sense))
+            else:
+                for bottom, top in zip(groups[0], groups[1]):
+                    bc, b0, b1, bh = bottom
+                    tc, t0, t1, th = top
+                    faces.append(advanced_face(surf, [[
+                        (bc, b0, b1, bh),
+                        (Line(b1, sub(t1, b1)), b1, t1, None),
+                        (tc, t1, t0, th),
+                        (Line(t0, sub(b0, t0)), t0, b0, None),
+                    ]], face.sense))
+            continue
         if isinstance(s, Cylinder):
             # a tube is periodic: split it into two half-faces bounded by the
             # rim half-arcs plus the two seam lines, so no bound wraps the

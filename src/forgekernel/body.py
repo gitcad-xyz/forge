@@ -435,8 +435,49 @@ def _face_volume_term(face: Face):
     if isinstance(s, SphereS):
         # x·n̂ = r + c·n̂, and ∮ c·n̂ dA = 0 over the whole sphere: (1/3)r·4πr².
         return PiVal(0, _exact(sgn * 4 * s.r ** 3 / 3, "sphere"))
+    if isinstance(s, Cone):
+        # Every point of a cone satisfies (x − apex)·n̂ = 0, so x·n̂ = p·n̂ and
+        # ∮x·n̂ dA = p·∮n̂ dA. The radial part of ∮n̂ dA cancels round the band,
+        # leaving (p·d̂)·n̂_ax·Area — and n̂_ax carries 1/√(1+t²) while Area
+        # carries the slant's √(1+t²), so the root CANCELS and the term stays
+        # in ℚ[π]. No approximation is needed for a taper.
+        (ua, ra), (ub, rb) = _cone_rims(face, s)
+        ln = _rational_sqrt(dot(s.d, s.d))
+        if ln is None:
+            raise ValueError(
+                "cone axis with irrational length — outside ℚ[π] (K3.7)")
+        su = 1 if ua + ub > 0 else -1
+        nax_area = -su * s.tan_half * (ra + rb) * abs(ub - ua)
+        return PiVal(0, _exact(sgn * dot(s.p, s.d) / ln * nax_area / 3,
+                               "cone band"))
     raise ValueError(
         f"no exact volume term for {type(s).__name__} yet (K3.7)")
+
+
+def _cone_rims(face: Face, cone: Cone):
+    """The face's two rims as (axial distance from the APEX, radius), ordered.
+
+    A true cone closes at its apex, where the rim degenerates to a point — so
+    a face with a single circular rim is not malformed, it is a cone rather
+    than a frustum, and the missing rim is (0, 0).
+    """
+    ln = _rational_sqrt(dot(cone.d, cone.d))
+    if ln is None:
+        raise ValueError("cone axis with irrational length — outside ℚ[π] (K3.7)")
+    rims = []
+    for lp in face.loops:
+        for e in lp.edges:
+            if isinstance(e.curve, Circle):
+                u = dot(sub(e.curve.c, cone.p), cone.d) / ln
+                rims.append((u, e.curve.r))
+    rims = sorted(set(rims))
+    if len(rims) == 1:
+        rims = sorted(rims + [(F(0), F(0))])
+    if len(rims) != 2:
+        raise ValueError(
+            "conical face without one or two circular rims — a trimmed cone "
+            "needs general seam handling (K3.7)")
+    return rims[0], rims[1]
 
 
 def _band_height(face: Face, cyl: Cylinder) -> Fraction:
@@ -578,6 +619,23 @@ def centroid(body: Body):
             v = 4 / 3 * math.pi * float(s.r) ** 3
             for k in range(3):
                 m[k] += sgn * v * float(s.c[k])
+        elif isinstance(s, Cone):
+            # (1/4)∮x(x·n̂)dA with x·n̂ = p·n̂. Integrating round φ kills the
+            # lone-N̂ terms and turns N̂N̂ᵀ into π(I − d̂d̂ᵀ), leaving an integral
+            # in u (axial distance from the apex) with ρ = t·u.
+            (ua, ra), (ub, rb) = _cone_rims(f, s)
+            d = _unit(tuple(float(x) for x in s.d))
+            p = tuple(float(x) for x in s.p)
+            pd = sum(p[k] * d[k] for k in range(3))
+            t = float(s.tan_half)
+            a, b2 = float(ua), float(ub)
+            i2 = (b2 ** 2 - a ** 2) / 2
+            i3 = (b2 ** 3 - a ** 3) / 3
+            for k in range(3):
+                perp = p[k] - pd * d[k]
+                val = (-2 * math.pi * t * t * pd * (p[k] * i2 + d[k] * i3)
+                       + math.pi * t * t * perp * i3)
+                m[k] += sgn * 0.25 * val
         else:
             raise ValueError(
                 f"centroid of a {type(s).__name__} face is not implemented "
@@ -660,10 +718,28 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             ib, ic = ic, ib
         tris.append([ia, ib, ic])
 
+    def _segs_for(r: float) -> int:
+        if r <= deflection:
+            return 24
+        return max(24, int(math.ceil(
+            math.pi / math.acos(max(-1.0, 1 - deflection / r)))))
+
+    # ONE segment count per AXIS, taken from the widest circle on it. Deriving
+    # it per circle tears every taper: a frustum's r=2 and r=5 rims want
+    # different counts, so the wall and the caps stop sharing vertices. Coaxial
+    # bores in a counterbore have the same problem.
+    axis_segs: dict = {}
+    for f in body.faces:
+        for lp in f.loops:
+            for e in lp.edges:
+                if isinstance(e.curve, Circle):
+                    k = _line_key(e.curve.c, e.curve.n)
+                    axis_segs[k] = max(axis_segs.get(k, 0),
+                                       _segs_for(float(e.curve.r)))
+
     def circle_pts(c: Circle, n=None):
         r = float(c.r)
-        segs = n or max(24, int(math.ceil(
-            math.pi / math.acos(max(-1.0, 1 - deflection / r))))) if r > deflection else 24
+        segs = n or axis_segs.get(_line_key(c.c, c.n)) or _segs_for(r)
         u = _unit(tuple(float(x) for x in c.ref))
         w = _unit(_cross_f(tuple(float(x) for x in c.n), u))
         cc = tuple(float(x) for x in c.c)
@@ -729,6 +805,34 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                 out = radial if face.sense else tuple(-x for x in radial)
                 tri(pa[i], pa[j], pb[j], out)
                 tri(pa[i], pb[j], pb[i], out)
+        elif isinstance(s, Cone):
+            circs = [e.curve for lp in face.loops for e in lp.edges
+                     if isinstance(e.curve, Circle)]
+            if not circs:
+                continue
+            ax = tuple(float(x) for x in s.p)
+            ad = _unit(tuple(float(x) for x in s.d))
+            lo = circs[0]
+            pa, segs = circle_pts(lo)
+            if len(circs) > 1:
+                pb, _ = circle_pts(circs[-1], segs)
+            else:
+                pb = [ax] * segs            # a true cone closes at the apex
+            for i in range(segs):
+                j = (i + 1) % segs
+                mid = tuple((pa[i][t] + pa[j][t]) / 2 for t in range(3))
+                rel = tuple(mid[t] - ax[t] for t in range(3))
+                axl = sum(rel[t] * ad[t] for t in range(3))
+                radial = _unit(tuple(rel[t] - axl * ad[t] for t in range(3)))
+                # the surface normal tilts off radial by the half-angle: the
+                # generator runs from the apex, so the outward normal is
+                # radial minus tan_half along the axis (times the opening sign)
+                tw = float(s.tan_half) * (1.0 if axl > 0 else -1.0)
+                nrm = _unit(tuple(radial[t] - tw * ad[t] for t in range(3)))
+                out = nrm if face.sense else tuple(-x for x in nrm)
+                tri(pa[i], pa[j], pb[j], out)
+                if len(circs) > 1:
+                    tri(pa[i], pb[j], pb[i], out)
         elif isinstance(s, SphereS):
             c = tuple(float(x) for x in s.c)
             r = float(s.r)
@@ -865,6 +969,18 @@ def faces_info(body: Body) -> list[dict]:
             out.append({"surface": "sphere", "radius": float(s.r),
                         "centroid": [float(x) for x in s.c],
                         "area": 4 * math.pi * float(s.r) ** 2})
+        elif isinstance(s, Cone):
+            (ua, ra), (ub, rb) = _cone_rims(f, s)
+            axis = _unit(tuple(float(x) for x in s.d))
+            apex = tuple(float(x) for x in s.p)
+            t = float(s.tan_half)
+            slant = math.hypot(float(ub - ua), float(rb - ra))
+            umid = float(ua + ub) / 2
+            out.append({"surface": "cone", "half_angle_tan": t,
+                        "axis_dir": list(axis), "apex": list(apex),
+                        "radii": [float(ra), float(rb)],
+                        "area": math.pi * (float(ra) + float(rb)) * slant,
+                        "centroid": [apex[i] + axis[i] * umid for i in range(3)]})
         else:
             out.append({"surface": type(s).__name__.lower()})
     return out
@@ -1209,15 +1325,60 @@ def from_sphere(s) -> Body:
     return Body((Face(SphereS((F(s.cx), F(s.cy), F(s.cz)), F(s.r)), (), True),))
 
 
+def from_cone(cone) -> Body:
+    """A quadric ``Cone`` frustum (r1 at z0, r2 at z1) as canonical faces.
+
+    Equal radii is a CYLINDER, not a degenerate cone: the apex runs off to
+    infinity and ``tan_half`` would be zero, so every axial measurement
+    divides by nothing. Route it to the cylinder converter rather than emit a
+    surface whose apex does not exist.
+    """
+    r1, r2 = F(cone.r1), F(cone.r2)
+    z0, z1 = F(cone.z0), F(cone.z1)
+    cx, cy = F(cone.cx), F(cone.cy)
+    if z1 < z0:
+        z0, z1, r1, r2 = z1, z0, r2, r1
+    if r1 == r2:
+        from forgekernel.quadric import Cyl
+
+        return from_cyl(Cyl(cx, cy, r1, z0, z1))
+
+    slope = (r2 - r1) / (z1 - z0)               # dr/dz, exact
+    z_apex = z0 - r1 / slope
+    axis = (F(0), F(0), F(1))
+    apex = (cx, cy, z_apex)
+    t = slope if slope > 0 else -slope
+
+    faces = []
+    for z, r, up in ((z0, r1, False), (z1, r2, True)):
+        if r == 0:
+            continue                            # the cone closes to a point
+        n = (F(0), F(0), F(1) if up else F(-1))
+        loop = Loop((Edge(_circle_at(cx, cy, z, r),
+                          (cx + r, cy, z), (cx + r, cy, z)),))
+        faces.append(Face(Plane(n, z if up else -z), (loop,), True))
+
+    rims = []
+    for z, r in ((z0, r1), (z1, r2)):
+        if r != 0:
+            rims.append(Edge(_circle_at(cx, cy, z, r),
+                             (cx + r, cy, z), (cx + r, cy, z)))
+    faces.append(Face(Cone(apex, axis, t), (Loop(tuple(rims)),), True))
+    return Body(tuple(faces))
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
-    from forgekernel.quadric import Cyl, DisjointUnion, DrilledSolid, Sphere
+    from forgekernel.quadric import (Cone as QCone, Cyl, DisjointUnion,
+                                     DrilledSolid, Sphere)
 
     if isinstance(shape, Body):
         return shape
     if isinstance(shape, Solid):
         return from_solid(shape)
+    if isinstance(shape, QCone):
+        return from_cone(shape)
     if isinstance(shape, Cyl):
         return from_cyl(shape)
     if isinstance(shape, DrilledSolid):
