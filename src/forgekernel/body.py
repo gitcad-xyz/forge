@@ -327,18 +327,27 @@ def _circle_frame(c: Circle):
     """The circle's exact orthonormal frame (u, w). Refuses unless both are
     exactly unit and perpendicular — a quarter position has to be EXACT or
     none of the trimmed-quadric arithmetic below is."""
-    if dot(c.n, c.n) != 1 or dot(c.ref, c.ref) != 1 or dot(c.ref, c.n) != 0:
+    ln, lr = _rational_sqrt(dot(c.n, c.n)), _rational_sqrt(dot(c.ref, c.ref))
+    if not ln or not lr or dot(c.ref, c.n) != 0:
         raise ValueError(
             "circle frame is not exactly orthonormal — a trimmed quadric "
             "needs exact quarter positions (K3.7)")
-    return c.ref, cross(c.n, c.ref)
+    # NORMALISE rather than demand unit length. A uniform scale maps n and ref
+    # through Affine.direction, which does not normalise, so a scaled body
+    # carries |n| = |ref| = k — and refusing there lost the volume AND the
+    # MESH, gating a display property on an exactness predicate.
+    n, u = tuple(x / ln for x in c.n), tuple(x / lr for x in c.ref)
+    return u, cross(n, u)
 
 
 def _quarter_depth(r: float, deflection: float) -> int:
     """Subdivision depth for a quarter arc, shared by trimmed bands and corner
     octants so that they agree vertex for vertex along the arcs they share."""
+    # No cap: capping at 128 segments made a rounded box and a bare cylinder
+    # disagree about what a deflection MEANS (at r=4999, deflection=0.01 the
+    # true sagitta was 9.4x the request). The untrimmed path has no cap.
     d = 1
-    while d < 7 and r * (1 - math.cos(math.pi / 4 / (2 ** d))) > deflection:
+    while r * (1 - math.cos(math.pi / 4 / (2 ** d))) > deflection:
         d += 1
     return d
 
@@ -350,6 +359,8 @@ def _quarter_index(c: Circle, p):
     0 and ±1. Anywhere else the band's ∫n̂ dθ term is a transcendental that
     leaves the field, so this is the predicate that decides exact-or-refuse.
     """
+    if c.r == 0:
+        return None                 # a degenerate circle has no quarters
     u, w = _circle_frame(c)
     rel = sub(p, c.c)
     for k, v in enumerate((u, w, tuple(-x for x in u), tuple(-x for x in w))):
@@ -508,17 +519,7 @@ def _face_volume_term(face: Face):
         arcs = _band_arc(face)
         if arcs is None:
             return PiVal(0, _exact(sgn * 2 * s.r * s.r * h / 3, "cylinder band"))
-        if len({sp for _c, _k, sp in arcs}) != 1:
-            raise ValueError(
-                "a trimmed band whose rims sweep different angles is not one "
-                "face (K3.7)")
-        # read the sweep off the rim whose normal runs WITH the axis: the
-        # other rim carries -n, because an Edge on a Circle is CCW about that
-        # circle's own normal and the two rims run opposite ways
-        forward = [x for x in arcs if dot(x[0].n, s.d) > 0]
-        circ, k0, span = (forward or arcs)[0]
-        vint = sub(_quarter_antiderivative(circ, k0 + span),
-                   _quarter_antiderivative(circ, k0))
+        span, vint = _band_sweep(arcs, s)
         rat = sgn * s.r * h * dot(s.p, vint) / 3
         pi = sgn * s.r * h * s.r * Fraction(span, 2) / 3          # Δθ = span·π/2
         return PiVal(_exact(rat, "trimmed band offset"),
@@ -583,6 +584,48 @@ def _cone_rims(face: Face, cone: Cone):
     return rims[0], rims[1]
 
 
+def _quarter_ends(c: Circle, k0: int, span: int):
+    """The two endpoints of the arc starting at quarter k0 and sweeping span."""
+    u, w = _circle_frame(c)
+    dirs = (u, w, tuple(-x for x in u), tuple(-x for x in w))
+    return (tuple(c.c[i] + c.r * dirs[k0 % 4][i] for i in range(3)),
+            tuple(c.c[i] + c.r * dirs[(k0 + span) % 4][i] for i in range(3)))
+
+
+def _band_sweep(arcs, cyl: Cylinder):
+    """Total swept angle (in quarter turns) and ∫n̂ dθ for a trimmed band.
+
+    Reading these off ONE arc was wrong twice over. A whole rim SPLIT into
+    four quarter arcs — which survives a text round trip and which
+    ``_loop_is_circle`` does not recognise unless every arc carries an
+    identical ``Circle`` — looks like a trim, and taking the first arc read a
+    Ø10×12 cylinder as 471.24 against a true 942.48. And a band whose rims are
+    BOTH written the wrong way round passed the per-arc span check while
+    reporting 3× its volume. Summing every arc on the chosen rim fixes both,
+    and a sweep beyond a full turn is refused rather than wrapped.
+    """
+    fwd = [x for x in arcs if dot(x[0].n, cyl.d) > 0]
+    if not fwd:
+        raise ValueError(
+            "no rim of this band runs with the axis — an Edge on a Circle is "
+            "counter-clockwise about that circle's own normal, so a band's "
+            "two rims must carry opposite normals (K3.7)")
+    back = [x for x in arcs if x not in fwd]
+    total, vint = 0, (F(0), F(0), F(0))
+    for circ, k0, span in fwd:
+        total += span
+        v = sub(_quarter_antiderivative(circ, k0 + span),
+                _quarter_antiderivative(circ, k0))
+        vint = tuple(vint[i] + v[i] for i in range(3))
+    if total > 4:
+        raise ValueError("a rim sweeping more than a full turn (K3.7)")
+    if back and sum(sp for _c, _k, sp in back) != total:
+        raise ValueError(
+            "a trimmed band whose two rims sweep different angles is not one "
+            "face (K3.7)")
+    return total, vint
+
+
 def _sphere_octant(face: Face):
     """The octant's outward sign vector, or None for a whole sphere.
 
@@ -598,17 +641,18 @@ def _sphere_octant(face: Face):
         raise ValueError(
             "a spherical patch that is not a whole sphere or an octant is "
             "outside ℚ[π] (K3.7)")
-    c = face.surface.c
-    acc = [F(0), F(0), F(0)]
-    for q in pts:
-        for i in range(3):
-            acc[i] += q[i] - c[i]
-    out = tuple(F(1) if x > 0 else (F(-1) if x < 0 else F(0)) for x in acc)
-    if 0 in out or any(abs(a) != face.surface.r for a in acc):
-        raise ValueError(
-            "spherical patch corners are not on the signed axes — not an "
-            "octant (K3.7)")
-    return out
+    c, r = face.surface.c, face.surface.r
+    vs = [sub(q, c) for q in pts]
+    # Summing the corners and reading off signs accepted 143 different trios of
+    # rational unit vectors that are NOT the signed axes — one of them measured
+    # 2.68x its true term. An octant is three mutually PERPENDICULAR radii;
+    # test that directly, which is also frame-free, so a rotated corner works.
+    for i in range(3):
+        if dot(vs[i], vs[i]) != r * r or dot(vs[i], vs[(i + 1) % 3]) != 0:
+            raise ValueError(
+                "spherical patch corners are not three mutually perpendicular "
+                "radii — not an octant (K3.7)")
+    return tuple(sum(v[i] for v in vs) / r for i in range(3))
 
 
 def _band_height(face: Face, cyl: Cylinder) -> Fraction:
@@ -742,14 +786,55 @@ def centroid(body: Body):
             t = (min(ts) + max(ts)) / 2
             mid = tuple(q[k] + t * d[k] for k in range(3))       # axis midpoint
             md = sum(mid[k] * d[k] for k in range(3))
-            r2h = math.pi * float(s.r) ** 2 * h
+            rr = float(s.r)
+            arcs = _band_arc(f)
+            if arcs is None:
+                A, vn = 2 * math.pi, (0.0, 0.0, 0.0)
+                mm = tuple(math.pi * (mid[k] - md * d[k]) for k in range(3))
+            else:
+                # A TRIMMED band sweeps less than a full turn, so neither
+                # ∫n̂dθ nor ∫n̂(n̂·p)dθ vanishes. Both are rational at quarter
+                # turns: ∫cos² = ∫sin² = Δθ/2 and ∫cos·sin = (sin²θ1−sin²θ0)/2.
+                span, vint = _band_sweep(arcs, s)
+                A = span * math.pi / 2
+                vn = tuple(float(x) for x in vint)
+                circ, k0, _sp = min(
+                    (x for x in arcs if dot(x[0].n, s.d) > 0), key=lambda x: x[1])
+                u, w = (tuple(float(x) for x in v)
+                        for v in _circle_frame(circ))
+                sq = lambda kk: (0.0, 1.0, 0.0, 1.0)[kk % 4]
+                S = (sq(k0 + span) - sq(k0)) / 2
+                pu = sum(mid[i] * u[i] for i in range(3))
+                pw = sum(mid[i] * w[i] for i in range(3))
+                mm = tuple((A / 2) * (mid[k] - md * d[k])
+                           + S * (u[k] * pw + w[k] * pu) for k in range(3))
+            pv = sum(mid[k] * vn[k] for k in range(3))
             for k in range(3):
-                perp = mid[k] - md * d[k]
-                m[k] += sgn * 0.25 * r2h * (2 * mid[k] + perp)
+                val = rr * h * ((mid[k]) * (pv + rr * A)
+                                + rr * (mm[k] + rr * vn[k]))
+                m[k] += sgn * 0.25 * val
         elif isinstance(s, SphereS):
-            v = 4 / 3 * math.pi * float(s.r) ** 3
-            for k in range(3):
-                m[k] += sgn * v * float(s.c[k])
+            rr = float(s.r)
+            cc = tuple(float(x) for x in s.c)
+            oct_ = _sphere_octant(f)
+            if oct_ is None:
+                v = 4 / 3 * math.pi * rr ** 3
+                for k in range(3):
+                    m[k] += sgn * v * cc[k]
+            else:
+                # one OCTANT, not a whole sphere: area πr²/2, ∮n̂dA = (πr²/4)s,
+                # ∫n_i n_j dA = πr²/6 on the diagonal and s_i s_j r²/3 off it
+                sv = [float(x) for x in oct_]
+                cs = sum(cc[k] * sv[k] for k in range(3))
+                for k in range(3):
+                    mk = math.pi * rr * rr / 6 * cc[k] + sum(
+                        sv[k] * sv[j] * rr * rr / 3 * cc[j]
+                        for j in range(3) if j != k)
+                    val = (cc[k] * math.pi * rr * rr / 4 * cs
+                           + rr * cc[k] * math.pi * rr * rr / 2
+                           + rr * mk
+                           + rr * rr * math.pi * rr * rr / 4 * sv[k] / rr)
+                    m[k] += sgn * 0.25 * val
         elif isinstance(s, Cone):
             # (1/4)∮x(x·n̂)dA with x·n̂ = p·n̂. Integrating round φ kills the
             # lone-N̂ terms and turns N̂N̂ᵀ into π(I − d̂d̂ᵀ), leaving an integral
@@ -925,7 +1010,8 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             # normal runs with the axis (the other carries -n by contract)
             arcs = _band_arc(face)
             fwd = [x for x in arcs if dot(x[0].n, s.d) > 0] or arcs
-            circ, k0, span = fwd[0]
+            span, _v = _band_sweep(arcs, s)
+            circ, k0, _sp = min(fwd, key=lambda x: x[1])
             u, w = (tuple(float(x) for x in v) for v in _circle_frame(circ))
             rr = float(s.r)
             # a trimmed band and the corner octants next to it SHARE their
@@ -1076,15 +1162,45 @@ def edges_info(body: Body) -> list[dict]:
             for e in lp.edges:
                 if isinstance(e.curve, Circle):
                     c = e.curve
+                    # NORMALISE the axis in the key: a band rim and the octant
+                    # arc beside it are the SAME arc, but from_rounded_box
+                    # builds the octant's circle from a cross product whose
+                    # length is r^2, so (0,0,1) and (0,0,9) never collided and
+                    # a rounded box reported 48 arcs where it has 24.
+                    axis = _unit(tuple(float(y) for y in c.n))
+                    whole = _key3(e.v0) == _key3(e.v1)
+                    ends = tuple(sorted((tuple(float(x) for x in e.v0),
+                                         tuple(float(x) for x in e.v1))))
+                    # ...and canonicalise its SIGN: the same geometric circle
+                    # is carried with +n by one face and -n by the other,
+                    # because an Edge is CCW about its own circle's normal
+                    lead = next((v for v in axis if abs(v) > 1e-12), 1.0)
+                    if lead < 0:
+                        axis_key = tuple(round(-v, 12) for v in axis)
+                    else:
+                        axis_key = tuple(round(v, 12) for v in axis)
                     key = ("circle", tuple(float(x) for x in c.c),
-                           tuple(float(x) for x in c.n), float(c.r))
+                           axis_key, float(c.r), ends)
                     if key in seen:
                         continue
                     seen.add(key)
+                    span = 4 if whole else _arc_quarters(c, e.v0, e.v1)[1]
+                    frac = span / 4
+                    if whole:
+                        cen = [float(x) for x in c.c]
+                    else:
+                        # the centroid of an ARC is on the arc, not at the
+                        # circle centre — a dimension anchored to the old value
+                        # pointed at a spot strictly inside the solid
+                        pts = _arc_pts(c, e.v0, e.v1, float(c.r) / 64) + [
+                            tuple(float(x) for x in e.v1)]
+                        cen = [sum(q[i] for q in pts) / len(pts)
+                               for i in range(3)]
                     out.append({"curve": "circle", "radius": float(c.r),
-                                "centroid": [float(x) for x in c.c],
-                                "length": 2 * math.pi * float(c.r),
-                                "axis": list(_unit(tuple(float(y) for y in c.n)))})
+                                "centroid": cen,
+                                "length": 2 * math.pi * float(c.r) * frac,
+                                "sweep_quarters": span,
+                                "axis": list(axis)})
                 else:
                     a = tuple(float(x) for x in e.v0)
                     b = tuple(float(x) for x in e.v1)
@@ -1157,14 +1273,41 @@ def faces_info(body: Body) -> list[dict]:
                 h = 0.0
             axis = _unit(tuple(float(x) for x in s.d))
             base = tuple(float(x) for x in s.p)
+            arcs = _band_arc(f)
+            span = 4 if arcs is None else _band_sweep(arcs, s)[0]
+            mid = [base[i] + axis[i] * h / 2 for i in range(3)]
+            if arcs is not None:
+                # a TRIMMED band's surface centroid is out on the swept sector,
+                # not on the axis: reporting the axis point made a rounded box
+                # claim 5247.50 mm2 of surface against a true 2080.78
+                circ, k0, _sp = min(
+                    (x for x in arcs if dot(x[0].n, s.d) > 0), key=lambda x: x[1])
+                pts = _arc_pts(circ, *_quarter_ends(circ, k0, span),
+                               float(s.r) / 64)
+                bar = [sum(q[i] for q in pts) / len(pts) for i in range(3)]
+                off = sum((bar[i] - base[i]) * axis[i] for i in range(3))
+                mid = [bar[i] - axis[i] * off + axis[i] * (h / 2) for i in range(3)]
             out.append({"surface": "cylinder", "radius": float(s.r),
                         "axis_dir": list(axis), "axis_origin": list(base),
-                        "area": 2 * math.pi * float(s.r) * h,
-                        "centroid": [base[i] + axis[i] * h / 2 for i in range(3)]})
+                        "area": 2 * math.pi * float(s.r) * h * span / 4,
+                        "sweep_quarters": span,
+                        "centroid": mid})
         elif isinstance(s, SphereS):
-            out.append({"surface": "sphere", "radius": float(s.r),
-                        "centroid": [float(x) for x in s.c],
-                        "area": 4 * math.pi * float(s.r) ** 2})
+            oct_ = _sphere_octant(f)
+            rr = float(s.r)
+            cc = [float(x) for x in s.c]
+            if oct_ is None:
+                out.append({"surface": "sphere", "radius": rr,
+                            "centroid": cc, "area": 4 * math.pi * rr ** 2})
+            else:
+                sv = [float(x) for x in oct_]
+                # an octant is an EIGHTH of the sphere, and its surface
+                # centroid sits out on the patch at 3r/4 along each axis
+                out.append({"surface": "sphere", "radius": rr,
+                            "octant": sv,
+                            "centroid": [cc[i] + sv[i] * 3 * rr / 4
+                                         for i in range(3)],
+                            "area": 4 * math.pi * rr ** 2 / 8})
         elif isinstance(s, Cone):
             (ua, ra), (ub, rb) = _cone_rims(f, s)
             axis = _unit(tuple(float(x) for x in s.d))

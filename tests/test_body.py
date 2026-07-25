@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from fractions import Fraction as F
 
 import pytest
 
@@ -890,3 +891,117 @@ def test_a_rounded_box_survives_a_rigid_transform_exactly() -> None:
     for m in (B.Affine.translation(3, -7, 11), B.Affine.mirror("x"),
               B.Affine.rotation((0, 0, 1), 90)):
         assert B.volume(body.transformed(m)) == exact
+
+
+@pytest.mark.parametrize("label,args", ROUNDED, ids=[r[0] for r in ROUNDED])
+def test_a_rounded_boxs_centre_of_mass_is_its_centre(label, args) -> None:
+    """centroid used the FULL-band and WHOLE-sphere moments for trimmed faces,
+    so a quarter band contributed four times its share. It did not refuse: a
+    12-cube's centre of mass came back at (48,48,48), four radii outside its
+    own bounding box, with an exact volume underneath it."""
+    from forgekernel.quadric import RoundedBox
+
+    rb = RoundedBox(*args)
+    want = (float(rb.a) / 2, float(rb.b) / 2, float(rb.c) / 2)
+    assert B.centroid(B.to_body(rb)) == pytest.approx(want, abs=1e-9)
+
+
+def test_a_rounded_boxs_centroid_rides_along_with_a_rotation() -> None:
+    """Symmetry alone is a weak oracle for a symmetric solid — check the
+    formula in a GENERAL frame too."""
+    from forgekernel.quadric import RoundedBox
+
+    body = B.to_body(RoundedBox(30, 20, 10, 2, origin=(5, -3, 7)))
+    base = B.centroid(body)
+    for axis, deg in (((0, 0, 1), 90), ((1, 0, 0), 90), ((0, 0, 1), 45),
+                      ((0, 1, 0), 30)):
+        m = B.Affine.rotation(axis, deg)
+        want = m.point(tuple(F(x).limit_denominator(10 ** 9) for x in base))
+        got = B.centroid(body.transformed(m))
+        assert got == pytest.approx([float(x) for x in want], abs=1e-6)
+
+
+def test_trimmed_faces_report_their_own_area_not_a_whole_turns() -> None:
+    """faces_info reported 2pi r h for a QUARTER band and 4 pi r^2 for an
+    octant: a rounded box claimed 5247.50 mm2 of surface against a true
+    2080.78, and edges_info returned 48 arcs where the solid has 24 (a band
+    rim and the octant arc beside it are the SAME arc, but the dedup key used
+    a raw normal whose length was r^2)."""
+    from forgekernel.quadric import RoundedBox
+
+    body = B.to_body(RoundedBox(20, 20, 20, 3))
+    p = q = s = 14
+    steiner = (2 * (p * q + q * s + s * p)
+               + 2 * math.pi * 3 * (p + q + s) + 4 * math.pi * 9)
+    assert sum(f["area"] for f in B.faces_info(body)) == pytest.approx(steiner)
+
+    arcs = [e for e in B.edges_info(body) if e["curve"] == "circle"]
+    assert len(arcs) == 24
+    assert sum(e["length"] for e in arcs) == pytest.approx(24 * math.pi * 3 / 2)
+    # an arc's centroid is ON the arc, not at the circle centre (which for a
+    # rounded box is a point strictly inside the solid)
+    for e in arcs:
+        d = math.dist(e["centroid"], [0, 0, 0])
+        assert e["sweep_quarters"] == 1
+
+
+def test_a_rim_split_into_quarter_arcs_is_still_a_whole_cylinder() -> None:
+    """_band_arc reads any non-whole-circle loop as a TRIM, and a rim split
+    into four arcs that each carry their own ref is exactly that. Taking the
+    sweep from one arc read a d=10 x 12 cylinder as 471.24 against 942.48 —
+    half, silently — and the split survives a text round trip."""
+    from fractions import Fraction as Q
+
+    r, z0, z1 = Q(5), Q(0), Q(12)
+    axis = (Q(0), Q(0), Q(1))
+    dirs = [(Q(1), Q(0), Q(0)), (Q(0), Q(1), Q(0)),
+            (Q(-1), Q(0), Q(0)), (Q(0), Q(-1), Q(0))]
+
+    def rim(z, n):
+        pts = [tuple(r * d[i] + (z if i == 2 else Q(0)) for i in range(3))
+               for d in dirs]
+        order = range(4) if n == axis else range(3, -1, -1)
+        idx = list(order)
+        return tuple(B.Edge(B.Circle((Q(0), Q(0), z), n, dirs[idx[k]], r),
+                            pts[idx[k]], pts[idx[(k + 1) % 4]])
+                     for k in range(4))
+
+    wall = B.Face(B.Cylinder((Q(0), Q(0), Q(0)), axis, r),
+                  (B.Loop(rim(z0, axis) + rim(z1, tuple(-x for x in axis))),),
+                  True)
+    caps = [f for f in B.to_body(Cyl(0, 0, 5, 0, 12)).faces
+            if isinstance(f.surface, B.Plane)]
+    assert B.volume(B.Body(tuple(caps) + (wall,))) == PiVal(0, 300)
+
+
+def test_a_spherical_patch_that_is_not_an_octant_refuses() -> None:
+    """Summing three corners and reading off signs accepted 143 trios of
+    rational unit vectors that are not the signed axes; one measured 2.68x its
+    true term, and reversing the loop named the complementary 7/8 patch and
+    read identically."""
+    from fractions import Fraction as Q
+
+    c = (Q(3), Q(-5), Q(7))
+    rels = [(Q(0), Q(0), Q(1)), (Q(1, 3), Q(2, 3), Q(2, 3)),
+            (Q(2, 3), Q(1, 3), Q(-2, 3))]
+    pts = [tuple(c[i] + v[i] for i in range(3)) for v in rels]
+    edges = tuple(B.Edge(B.Circle(c, (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(1)),
+                         pts[k], pts[(k + 1) % 3]) for k in range(3))
+    face = B.Face(B.SphereS(c, Q(1)), (B.Loop(edges),), True)
+    with pytest.raises(ValueError, match="perpendicular radii"):
+        B.volume(B.Body((face,)))
+
+
+def test_a_uniform_scale_of_a_rounded_box_no_longer_refuses() -> None:
+    """Affine.direction does not normalise, so a scaled body carries
+    |n| = |ref| = k. Demanding EXACTLY unit length lost the volume and — worse
+    — the MESH, gating a display property on an exactness predicate."""
+    from forgekernel.quadric import RoundedBox
+
+    body = B.to_body(RoundedBox(20, 20, 20, 3))
+    exact = B.volume(body)
+    for k in (2, 3):
+        scaled = body.transformed(B.Affine.scaling(k, k, k))
+        assert B.volume(scaled) == PiVal(exact.a * k ** 3,
+                                         exact.b * k ** 3)
+        assert _non_manifold(B.tessellate(scaled, 0.2)) == 0
