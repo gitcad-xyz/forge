@@ -674,3 +674,54 @@ def test_a_tubes_bore_faces_inward() -> None:
              if isinstance(f.surface, B.Cylinder)}
     assert walls == {6.0: True, 3.0: False}
     assert B.volume(body) == PiVal(0, (36 - 9) * 10)
+
+
+# --- native text format for the canonical B-rep (ADR-0004/0021) ------------
+
+SERIALIZE = [
+    ("drilled plate",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])),
+    ("counterbore", lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 2, 0, 10)).cut(Cyl(15, 15, 4, 7, 10))),
+    ("boss", lambda: DisjointUnion([Solid.box(30, 30, 3), Cyl(15, 15, 4, 3, 9)])),
+    ("sphere", lambda: Sphere(1, 2, 3, 6)),
+    # a ROTATED solid carries Q[sqrt d] coordinates, which a num/den-only
+    # format cannot describe at all
+    ("45-degree box",
+     lambda: __import__("forgekernel.kernel", fromlist=["rotate"]).rotate(
+         Solid.box(10, 6, 4), (0, 0, 1), 45)),
+]
+
+
+@pytest.mark.parametrize("label,build", SERIALIZE, ids=[s[0] for s in SERIALIZE])
+def test_the_canonical_form_round_trips_through_text_exactly(label, build) -> None:
+    """Text is source, geometry is a build artifact (ADR-0004): the round trip
+    must be BIT-exact and the bytes canonical, or two equal solids stop
+    hashing equal and a git diff stops meaning anything."""
+    from forgekernel import io
+
+    body = B.to_body(build())
+    text = io.dumps_body(body)
+    back = io.loads_body(text)
+    assert B.volume(back) == B.volume(body)
+    assert len(back.faces) == len(body.faces)
+    assert io.dumps_body(back) == text          # byte-canonical
+
+
+def test_the_text_says_what_the_shape_IS_not_how_it_was_faceted() -> None:
+    """A bore serialises as a cylinder with an exact radius. Facets would make
+    every revision diff look like a change even when the geometry is
+    identical."""
+    from forgekernel import io
+
+    text = io.dumps_body(B.to_body(
+        DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])))
+    assert '"kind":"cylinder"' in text and '"r":"4/1"' in text
+    assert '"kind":"circle"' in text
+
+
+def test_an_unknown_schema_is_refused_rather_than_guessed() -> None:
+    from forgekernel import io
+
+    with pytest.raises(ValueError, match="unsupported body schema"):
+        io.loads_body('{"schema":"forge/body@99","faces":[]}')
