@@ -72,6 +72,28 @@ class Cone:
 
 
 @dataclass(frozen=True)
+class Torus:
+    """Tube of minor radius ``a`` about the circle of major radius ``R`` that
+    lies in the plane through ``c`` perpendicular to ``d``.
+
+    A fillet on a lathed rim sweeps one of these, and it is the first surface
+    whose volume needs π² — Pappus gives V = 2πR·πa². ``PiVal`` (a + bπ)
+    cannot hold that, which is why ``polypi.PiPoly`` exists.
+    """
+    c: Vec
+    d: Vec
+    R: Fraction
+    a: Fraction
+    k0: int = 0
+    span: int = 4
+
+    def transformed(self, m):
+        return Torus(m.point(self.c), m.direction(self.d),
+                     m.scale_len(self.R), m.scale_len(self.a),
+                     self.k0, self.span)
+
+
+@dataclass(frozen=True)
 class SphereS:
     c: Vec
     r: Fraction
@@ -456,11 +478,19 @@ def _rational_sqrt(x):
 def volume(body: Body):
     """Exact signed volume by the divergence theorem, V = (1/3)∮ x·n̂ dA,
     evaluated per face in CLOSED FORM. Returns a ``PiVal`` (ℚ + ℚ·π)."""
+    from forgekernel.polypi import PiPoly
     from forgekernel.quadric import PiVal
 
-    total = PiVal(0, 0)
+    total = PiPoly.rational(0)
     for face in body.faces:
-        total = total + _face_volume_term(face)
+        term = _face_volume_term(face)
+        total = total + (term if isinstance(term, PiPoly)
+                         else PiPoly.from_pival(term))
+    # Hand back the legacy a + b*pi whenever the answer fits in it: every
+    # existing caller and test compares against PiVal, and a torus is the only
+    # thing that needs the wider ring.
+    if total.degree <= 1:
+        return PiVal(total[0], total[1])
     return total
 
 
@@ -554,8 +584,54 @@ def _face_volume_term(face: Face):
         nax_area = -su * s.tan_half * (ra + rb) * abs(ub - ua)
         return PiVal(0, _exact(sgn * dot(s.p, s.d) / ln * nax_area / 3,
                                "cone band"))
+    if isinstance(s, Torus):
+        # x·n̂ = c·n̂ + R cos(phi) + a on the tube, and dA = a(R + a cos phi),
+        # so the phi integral carries cos and cos^2 terms. At quarter turns
+        # those evaluate to rationals plus rational*phi, and phi is a multiple
+        # of pi/2 -- so the term lands in Q[pi] with a pi^2 piece. Over a WHOLE
+        # tube it collapses to Pappus: (1/3)(6 pi^2 a^2 R) = 2 pi^2 a^2 R.
+        from forgekernel.polypi import PiPoly
+
+        k0, span = _torus_sweep(face, s)
+        # integral over phi of (R cos + a)(R + a cos) d phi
+        #   = R^2 sin + a R (phi/2 + sin2phi/4) + a R phi + a^2 sin
+        sin_ = lambda k: (0, 1, 0, -1)[k % 4]
+        cos_ = lambda k: (1, 0, -1, 0)[k % 4]
+        d_sin = sin_(k0 + span) - sin_(k0)
+        d_cos = cos_(k0 + span) - cos_(k0)
+        d_sin2 = sin_(k0 + span) ** 2 - sin_(k0) ** 2
+        rat = (s.R * s.R + s.a * s.a) * d_sin
+        # phi terms: aR*(phi/2) + aR*phi = (3/2) aR phi, phi = span*pi/2
+        phi_coeff = Fraction(3, 2) * s.a * s.R * Fraction(span, 2)
+        inner = PiPoly([rat, phi_coeff])            # rational + rational*pi
+        total = PiPoly.term(2 * s.a, 1) * inner / 3
+        # ...plus the axis-OFFSET term. Over a whole tube it vanishes, which is
+        # why Pappus alone looks sufficient; over a swept sector it does not,
+        # and a fillet's torus is centred on the core corner rather than the
+        # origin, so dropping it would be wrong for every real blend.
+        ln = _rational_sqrt(dot(s.d, s.d))
+        if ln is None:
+            raise ValueError(
+                "torus axis with irrational length — outside ℚ[π] (K3.7)")
+        cd = dot(s.c, s.d) / ln
+        offset = 2 * s.a * cd * (-s.R * d_cos + s.a * Fraction(d_sin2, 2)) / 3
+        return (total + PiPoly.term(offset, 1)) * sgn
     raise ValueError(
         f"no exact volume term for {type(s).__name__} yet (K3.7)")
+
+
+def _torus_sweep(face: Face, tor: Torus):
+    """(start quarter, quarter span) of the tube's CROSS-SECTION sweep.
+
+    Unlike a trimmed cylinder, this cannot be read off the face's edges: a
+    torus band's rims are full circles of revolution, and the sector that the
+    tube's cross-section sweeps is a different angle entirely. It is carried
+    on the surface instead — the trim is part of what the surface IS here, not
+    a property of its boundary.
+    """
+    if tor.span < 1 or tor.span > 4:
+        raise ValueError("a torus sweeping outside one full turn (K3.7)")
+    return tor.k0, tor.span
 
 
 def _cone_rims(face: Face, cone: Cone):
@@ -852,6 +928,45 @@ def centroid(body: Body):
                 val = (-2 * math.pi * t * t * pd * (p[k] * i2 + d[k] * i3)
                        + math.pi * t * t * perp * i3)
                 m[k] += sgn * 0.25 * val
+        elif isinstance(s, Torus):
+            # (1/4)∮x(x·n̂)dA. Integrating round θ first kills every lone N̂ and
+            # turns N̂N̂ᵀ into π(I − d̂d̂ᵀ), leaving trig monomials in φ of degree
+            # at most three — each with an exact antiderivative, so the FORMULA
+            # is closed even though the arithmetic here is float (a centre of
+            # mass is a ratio and leaves the field anyway).
+            k0, span = _torus_sweep(f, s)
+            RR, aa = float(s.R), float(s.a)
+            cc = tuple(float(x) for x in s.c)
+            ax = _unit(tuple(float(x) for x in s.d))
+            S = sum(cc[t] * ax[t] for t in range(3))
+            cperp = tuple(cc[t] - S * ax[t] for t in range(3))
+            p0 = k0 * math.pi / 2
+            p1 = (k0 + span) * math.pi / 2
+
+            def I(f_anti):
+                return f_anti(p1) - f_anti(p0)
+
+            i_1 = I(lambda x: x)
+            i_c = I(math.sin)
+            i_s = I(lambda x: -math.cos(x))
+            i_cc = I(lambda x: x / 2 + math.sin(2 * x) / 4)
+            i_ss = I(lambda x: x / 2 - math.sin(2 * x) / 4)
+            i_sc = I(lambda x: math.sin(x) ** 2 / 2)
+            i_scc = I(lambda x: -math.cos(x) ** 3 / 3)
+            i_css = I(lambda x: math.sin(x) ** 3 / 3)
+            i_ccc = I(lambda x: math.sin(x) - math.sin(x) ** 3 / 3)
+
+            rhoA = RR * RR * i_c + aa * RR * i_1 + aa * RR * i_cc + aa * aa * i_c
+            rho_s = RR * i_s + aa * i_sc
+            rho_sA = (RR * RR * i_sc + aa * RR * i_s + aa * RR * i_scc
+                      + aa * aa * i_sc)
+            rho_ss = RR * i_ss + aa * i_css
+            rho2c = RR * RR * i_c + 2 * aa * RR * i_cc + aa * aa * i_ccc
+            for k in range(3):
+                val = (2 * math.pi * aa * (rhoA * cc[k] + S * rho_s * cc[k])
+                       + 2 * math.pi * aa * aa * ax[k] * (rho_sA + S * rho_ss)
+                       + math.pi * aa * rho2c * cperp[k])
+                m[k] += sgn * 0.25 * val
         else:
             raise ValueError(
                 f"centroid of a {type(s).__name__} face is not implemented "
@@ -946,6 +1061,13 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
     # bores in a counterbore have the same problem.
     axis_segs: dict = {}
     for f in body.faces:
+        if isinstance(f.surface, Torus):
+            # a torus shares its axis with the cylinders and disks it blends
+            # between, so it has to sit in the SAME bucket or the fillet tears
+            # away from the wall it is supposed to be tangent to
+            k = _line_key(f.surface.c, f.surface.d)
+            axis_segs[k] = max(axis_segs.get(k, 0),
+                               _segs_for(float(f.surface.R + f.surface.a)))
         for lp in f.loops:
             for e in lp.edges:
                 if isinstance(e.curve, Circle):
@@ -1042,6 +1164,34 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                 outn = radial if face.sense else tuple(-x for x in radial)
                 tri(pa, pb, qb, outn)
                 tri(pa, qb, qa, outn)
+        elif isinstance(s, Torus):
+            k0, span = _torus_sweep(face, s)
+            RR, aa = float(s.R), float(s.a)
+            cc = tuple(float(x) for x in s.c)
+            ax = _unit(tuple(float(x) for x in s.d))
+            u0 = _unit(_perp_f(ax))
+            w0 = _cross_f(ax, u0)
+            nth = axis_segs.get(_line_key(s.c, s.d)) or _segs_for(RR + aa)
+            nph = max(4, 2 ** _quarter_depth(aa, deflection)) * span
+            def pt(i, j):
+                th = 2 * math.pi * i / nth
+                ph = (k0 + span * j / nph) * math.pi / 2
+                rad = RR + aa * math.cos(ph)
+                N = tuple(math.cos(th) * u0[t] + math.sin(th) * w0[t]
+                          for t in range(3))
+                return tuple(cc[t] + rad * N[t] + aa * math.sin(ph) * ax[t]
+                             for t in range(3)), N, ph
+            for i in range(nth):
+                for j in range(nph):
+                    (pa, Na, pha) = pt(i, j)
+                    (pb, _n, _p) = pt(i + 1, j)
+                    (pc, _n, _p) = pt(i + 1, j + 1)
+                    (pd, _n, _p) = pt(i, j + 1)
+                    nrm = _unit(tuple(math.cos(pha) * Na[t]
+                                      + math.sin(pha) * ax[t] for t in range(3)))
+                    outn = nrm if face.sense else tuple(-x for x in nrm)
+                    tri(pa, pb, pc, outn)
+                    tri(pa, pc, pd, outn)
         elif isinstance(s, SphereS) and face.loops:
             oct_ = _sphere_octant(face)
             rr = float(s.r)

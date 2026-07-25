@@ -1005,3 +1005,45 @@ def test_a_uniform_scale_of_a_rounded_box_no_longer_refuses() -> None:
         assert B.volume(scaled) == PiVal(exact.a * k ** 3,
                                          exact.b * k ** 3)
         assert _non_manifold(B.tessellate(scaled, 0.2)) == 0
+
+
+# --- torus: the surface a blend sweeps (needs pi^2) ------------------------
+
+def test_a_whole_torus_is_pappus_exactly() -> None:
+    """V = 2 pi R * pi a^2. This is the first volume that does NOT fit in
+    PiVal's a + b*pi, which is why Q[pi] became a polynomial ring."""
+    from forgekernel.polypi import PiPoly
+
+    t = B.Face(B.Torus((F(0), F(0), F(0)), (F(0), F(0), F(1)), F(10), F(2)),
+               (), True)
+    assert B.volume(B.Body((t,))) == PiPoly.term(2 * 4 * 10, 2)
+
+
+def test_a_whole_torus_is_centred_on_its_own_centre() -> None:
+    for c in ((0, 0, 0), (3, -4, 7)):
+        t = B.Face(B.Torus(tuple(F(x) for x in c), (F(0), F(0), F(1)),
+                           F(10), F(2)), (), True)
+        assert B.centroid(B.Body((t,))) == pytest.approx(c, abs=1e-9)
+
+
+def test_a_filleted_cylinder_matches_green_by_hand() -> None:
+    """A fillet lives on the (r, z) PROFILE, so the whole solid's volume is
+    Green's pi * contour integral of r^2 dz. For a d=10 x 12 cylinder rounded
+    1 mm the arcs contribute 2pi + 50/3 each and the wall 250, giving
+    pi(850/3) + 4 pi^2 — the pi^2 term being the torus."""
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(
+        "C:/Users/danie/cad-dev/packages/gitcad-mech/src")))
+    from gitcad.kernel.ref import _fillet_profile, _lathe_body
+    from forgekernel.polypi import PiPoly
+
+    prof = [(F(0), F(0)), (F(5), F(0)), (F(5), F(12)), (F(0), F(12))]
+    body = _lathe_body(_fillet_profile(prof, F(1)), F(0), F(0))
+    assert B.volume(body) == PiPoly([0, F(850, 3), 4])
+
+
+def test_a_torus_sweeping_past_a_full_turn_refuses() -> None:
+    t = B.Face(B.Torus((F(0), F(0), F(0)), (F(0), F(0), F(1)), F(10), F(2),
+                       0, 5), (), True)
+    with pytest.raises(ValueError, match="full turn"):
+        B.volume(B.Body((t,)))
