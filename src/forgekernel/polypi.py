@@ -30,7 +30,7 @@ from fractions import Fraction as F
 _PI_DIGITS = (
     "3141592653589793238462643383279502884197169399375105820974944592307816"
     "40628620899862803482534211706798214808651328230664709384460955058223172"
-    "5359408128481117450284102701938521105559644622948954930382"
+    "535940812848111745028410270193852110555964462294895493038"
 )
 
 
@@ -50,6 +50,11 @@ class PiPoly:
     def __init__(self, coeffs) -> None:
         if isinstance(coeffs, (int, F)):
             coeffs = [F(coeffs)]
+        for x in coeffs:
+            if isinstance(x, float) and x != int(x):
+                raise ValueError(
+                    f"a float ({x!r}) cannot enter ℚ[π] — pass a Fraction, or "
+                    "the exactness the ring exists for is already gone")
         c = [F(x) for x in coeffs]
         while len(c) > 1 and c[-1] == 0:
             c.pop()
@@ -79,6 +84,12 @@ class PiPoly:
             return o
         if isinstance(o, (int, F)):
             return PiPoly([F(o)])
+        # PiVal (a + b*pi) names a SUBSET of these numbers, and volume() now
+        # returns whichever fits — so the two meet constantly. Without this,
+        # comparing a filleted part's volume with an unfilleted one raised
+        # TypeError on two values that are perfectly comparable.
+        if hasattr(o, "a") and hasattr(o, "b") and not hasattr(o, "c"):
+            return PiPoly.from_pival(o)
         return NotImplemented
 
     def __add__(self, o):
@@ -155,7 +166,9 @@ class PiPoly:
         return NotImplemented if o is NotImplemented else self.c == o.c
 
     def __hash__(self) -> int:
-        return hash(self.c)
+        # equal values must hash equally: PiPoly.rational(3) == 3 is True, so
+        # a set or dict keyed on one must find the other
+        return hash(self.c[0]) if self.is_rational() else hash(self.c)
 
     # -- order needs evaluation, and narrows until the sign is decided --------
 
@@ -196,7 +209,8 @@ class PiPoly:
                 return -1
             digits *= 2
         raise ArithmeticError(
-            "could not decide the sign of a ℚ[π] value within 100 digits of π "
+            "could not decide the sign of a ℚ[π] value within the stored "
+            "digits of π "
             "— it is indistinguishable from zero at that precision")
 
     def __lt__(self, o) -> bool:

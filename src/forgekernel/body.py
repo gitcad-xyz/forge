@@ -613,7 +613,10 @@ def _face_volume_term(face: Face):
         if ln is None:
             raise ValueError(
                 "torus axis with irrational length — outside ℚ[π] (K3.7)")
-        cd = dot(s.c, s.d) / ln
+        # _exact() is what every other surface term uses: after a rigid map
+        # these coordinates are SurdVal (with a zero surd part), and handing
+        # one to Fraction() is a bare TypeError rather than a refusal
+        cd = _exact(dot(s.c, s.d) / ln, "torus axis offset")
         offset = 2 * s.a * cd * (-s.R * d_cos + s.a * Fraction(d_sin2, 2)) / 3
         return (total + PiPoly.term(offset, 1)) * sgn
     raise ValueError(
@@ -982,6 +985,27 @@ def bbox(body: Body):
     lo = [math.inf] * 3
     hi = [-math.inf] * 3
     for f in body.faces:
+        if isinstance(f.surface, Torus):
+            # A torus carries no loops either, so it contributed NOTHING. When
+            # a fillet eats the whole adjacent face the extreme lives only on
+            # the torus and was lost — and part.interference uses the AABB as
+            # a pre-filter, so two filleted barrels that physically interlock
+            # by 1.5 mm came back as a clean bill of health.
+            t = f.surface
+            k0, span = _torus_sweep(f, t)
+            ks = range(k0, k0 + span + 1)
+            cs = [(1, 0, -1, 0)[k % 4] for k in ks]
+            sn = [(0, 1, 0, -1)[k % 4] for k in ks]
+            ax = _unit(tuple(float(x) for x in t.d))
+            cen = tuple(float(x) for x in t.c)
+            RR, aa = float(t.R), float(t.a)
+            radmax = RR + aa * max(cs)
+            for i in range(3):
+                perp = radmax * math.sqrt(max(0.0, 1 - ax[i] ** 2))
+                axl = [aa * v * ax[i] for v in (min(sn), max(sn))]
+                lo[i] = min(lo[i], cen[i] - perp + min(axl))
+                hi[i] = max(hi[i], cen[i] + perp + max(axl))
+            continue
         if isinstance(f.surface, SphereS):      # a whole sphere carries no loops
             c, r = f.surface.c, float(f.surface.r)
             for i in range(3):
@@ -1169,7 +1193,24 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             RR, aa = float(s.R), float(s.a)
             cc = tuple(float(x) for x in s.c)
             ax = _unit(tuple(float(x) for x in s.d))
-            u0 = _unit(_perp_f(ax))
+            # take the reference direction from a COAXIAL circle, the same
+            # source circle_pts uses. Building an independent frame agreed
+            # unrotated (both (1,0,0)) and was 90 degrees out after a
+            # z-rotation, interleaving the two rings and tearing the seam.
+            ref = None
+            for g in body.faces:
+                for lp in g.loops:
+                    for e in lp.edges:
+                        if (isinstance(e.curve, Circle)
+                                and _line_key(e.curve.c, e.curve.n)
+                                == _line_key(s.c, s.d)):
+                            ref = e.curve.ref
+                            break
+                    if ref is not None:
+                        break
+                if ref is not None:
+                    break
+            u0 = _unit(tuple(float(x) for x in ref)) if ref else _unit(_perp_f(ax))
             w0 = _cross_f(ax, u0)
             nth = axis_segs.get(_line_key(s.c, s.d)) or _segs_for(RR + aa)
             nph = max(4, 2 ** _quarter_depth(aa, deflection)) * span
@@ -1475,6 +1516,19 @@ def faces_info(body: Body) -> list[dict]:
                         "radii": [float(ra), float(rb)],
                         "area": math.pi * (float(ra) + float(rb)) * slant,
                         "centroid": [apex[i] + axis[i] * umid for i in range(3)]})
+        elif isinstance(s, Torus):
+            k0, span = _torus_sweep(f, s)
+            RR, aa = float(s.R), float(s.a)
+            cc = [float(x) for x in s.c]
+            ax = list(_unit(tuple(float(x) for x in s.d)))
+            sin_ = lambda k: (0, 1, 0, -1)[k % 4]
+            dphi = span * math.pi / 2
+            dsin = sin_(k0 + span) - sin_(k0)
+            out.append({"surface": "torus", "major_radius": RR,
+                        "minor_radius": aa, "axis_dir": ax, "centre": cc,
+                        "sweep_quarters": span,
+                        "area": 2 * math.pi * aa * (RR * dphi + aa * dsin),
+                        "centroid": cc})
         else:
             out.append({"surface": type(s).__name__.lower()})
     return out
@@ -2017,9 +2071,21 @@ def lathe_body(segs, cx, cy) -> Body:
             a = max(abs(p0[0] - cen[0]), abs(p0[1] - cen[1]))
             def quarter(pt):
                 co, si = (pt[0] - cen[0]) / a, (pt[1] - cen[1]) / a
-                return {(1, 0): 0, (0, 1): 1, (-1, 0): 2, (0, -1): 3}[(co, si)]
+                q = {(1, 0): 0, (0, 1): 1, (-1, 0): 2, (0, -1): 3}.get((co, si))
+                if q is None:
+                    raise ValueError(
+                        "a lathe arc that does not start and end on a quarter "
+                        "turn is outside ℚ[π] (K3.7)")
+                return q
             k0 = quarter(p0)
             span = (quarter(p1) - k0) % 4 or 4
+            if span == 3:
+                # a CLOCKWISE quarter reads as three counter-clockwise ones.
+                # fillet never produces it (RevolveSolid normalises winding),
+                # but lathe_body is public API and must not guess.
+                raise ValueError(
+                    "a lathe arc traversed clockwise about its own centre is "
+                    "ambiguous — carry it counter-clockwise (K3.7)")
             faces.append(Face(
                 Torus((cx, cy, cen[1]), axis, cen[0], a, k0, span), (), True))
             continue

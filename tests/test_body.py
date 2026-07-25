@@ -1051,3 +1051,80 @@ def test_a_torus_sweeping_past_a_full_turn_refuses() -> None:
                        0, 5), (), True)
     with pytest.raises(ValueError, match="full turn"):
         B.volume(B.Body((t,)))
+
+
+def _filleted_cylinder():
+    segs = [("line", (F(0), F(0)), (F(4), F(0))),
+            ("arc", (F(4), F(1)), (F(4), F(0)), (F(5), F(1))),
+            ("line", (F(5), F(1)), (F(5), F(11))),
+            ("arc", (F(4), F(11)), (F(5), F(11)), (F(4), F(12))),
+            ("line", (F(4), F(12)), (F(0), F(12)))]
+    return B.lathe_body(segs, F(0), F(0))
+
+
+TRANSFORMS = [
+    ("translate", lambda: B.Affine.translation(1, 2, 3)),
+    ("rotate z90", lambda: B.Affine.rotation((0, 0, 1), 90)),
+    ("rotate z45", lambda: B.Affine.rotation((0, 0, 1), 45)),
+    ("rotate x90", lambda: B.Affine.rotation((1, 0, 0), 90)),
+    ("mirror x", lambda: B.Affine.mirror("x")),
+]
+
+
+@pytest.mark.parametrize("label,make", TRANSFORMS, ids=[t[0] for t in TRANSFORMS])
+def test_a_filleted_lathe_survives_a_rigid_transform(label, make) -> None:
+    """The Torus term was the only one not pushing its coordinate-derived
+    scalar through _exact(). After any rigid map those coordinates are SurdVal
+    (with a zero surd part), and handing one to Fraction() is a bare TypeError
+    — so EVERY transform of a filleted part crashed."""
+    body = _filleted_cylinder()
+    assert B.volume(body.transformed(make())) == B.volume(body)
+
+
+def test_a_torus_contributes_to_the_bounding_box() -> None:
+    """A torus carries no loops, so it contributed NOTHING to the bound. When
+    a fillet consumes the whole adjacent face the extreme lives only on the
+    torus — and part.interference uses the AABB as a PRE-FILTER, so two
+    filleted barrels that physically interlock came back clean."""
+    body = _filleted_cylinder()
+    lo, hi = B.bbox(body)
+    assert (lo[2], hi[2]) == pytest.approx((0.0, 12.0))
+    assert (lo[0], hi[0]) == pytest.approx((-5.0, 5.0))
+
+
+@pytest.mark.parametrize("deflection", [0.2, 0.05, 0.02, 0.01, 0.005, 0.002])
+def test_a_rotated_fillet_still_meets_the_wall_it_blends(deflection) -> None:
+    """The torus built its own theta reference while every coaxial ring uses
+    circle.ref. Identical unrotated — both (1,0,0) — and 90 degrees apart
+    after a z-rotation, which interleaved the two rings and tore the seam at
+    some deflections but not others."""
+    body = _filleted_cylinder().transformed(B.Affine.rotation((0, 0, 1), 90))
+    assert _non_manifold(B.tessellate(body, deflection)) == 0
+
+
+def test_a_torus_face_reports_its_own_area() -> None:
+    """faces_info emitted a bare {"surface": "torus"} — an 18% under-report to
+    anyone summing areas, and nothing for a dimension to anchor to."""
+    info = B.faces_info(_filleted_cylinder())
+    tori = [f for f in info if f["surface"] == "torus"]
+    assert len(tori) == 2
+    # a quarter tube: 2*pi*a*(R*phi + a*dsin) with R=4, a=1, phi=pi/2
+    assert all(t["area"] == pytest.approx(2 * math.pi * (4 * math.pi / 2 + 1))
+               for t in tori)
+    assert sum(f["area"] for f in info) == pytest.approx(506.2134, rel=1e-4)
+
+
+def test_a_clockwise_lathe_arc_refuses_rather_than_reading_three_quarters() -> None:
+    """span = (k1 - k0) % 4 assumes counter-clockwise, so a CW quarter reads
+    as three. fillet never produces one, but lathe_body is public API."""
+    segs = [("line", (F(0), F(0)), (F(4), F(0))),
+            ("arc", (F(4), F(1)), (F(5), F(1)), (F(4), F(0))),
+            ("line", (F(4), F(0)), (F(0), F(0)))]
+    with pytest.raises(ValueError, match="clockwise"):
+        B.lathe_body(segs, F(0), F(0))
+
+
+def test_a_lathe_arc_off_a_quarter_turn_refuses_by_name() -> None:
+    segs = [("arc", (F(0), F(0)), (F(5), F(0)), (F(3), F(4)))]
+    with pytest.raises(ValueError, match="quarter turn"):
+        B.lathe_body(segs, F(0), F(0))

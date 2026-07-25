@@ -110,3 +110,47 @@ def test_trailing_zero_coefficients_do_not_change_identity() -> None:
 def test_float_is_only_the_reporting_boundary() -> None:
     v = PiPoly([1, 2, 3])
     assert float(v) == pytest.approx(1 + 2 * math.pi + 3 * math.pi ** 2)
+
+
+def test_it_meets_the_legacy_type_in_both_directions() -> None:
+    """volume() returns PiVal when the answer fits and PiPoly when it needs
+    pi^2, so the two meet constantly. Neither could coerce the other, and
+    comparing a filleted part's volume with an unfilleted one raised TypeError
+    on two values that name the same number."""
+    from forgekernel.quadric import PiVal
+
+    assert PiPoly([1, 2]) == PiVal(F(1), F(2))
+    assert PiVal(F(1), F(2)) == PiPoly([1, 2])
+    assert PiPoly([1, 2]) + PiVal(F(1), F(2)) == PiPoly([2, 4])
+    assert PiVal(F(1), F(2)) + PiPoly([1, 2]) == PiPoly([2, 4])
+    assert PiPoly([1, 1]) < PiVal(F(1), F(2))
+
+
+def test_equal_values_hash_equally() -> None:
+    """PiPoly.rational(3) == 3 was True while hashing differently, so a set
+    held both and a dict lookup missed."""
+    assert len({PiPoly.rational(3), 3}) == 1
+    assert {PiPoly.rational(3): "x"}.get(3) == "x"
+
+
+def test_a_float_cannot_enter_the_exact_ring() -> None:
+    with pytest.raises(ValueError, match="float"):
+        PiPoly([0.1])
+    PiPoly([2.0])                       # integral floats are unambiguous
+
+
+def test_the_stored_digits_really_do_enclose_pi() -> None:
+    """The last stored digit was ROUNDED UP, so at full precision `lo` was
+    ABOVE pi and the 'enclosure' excluded it. Unreachable from sign() as the
+    loop is written, but the file's whole claim is rigour."""
+    import decimal
+    from forgekernel.polypi import _PI_DIGITS, _pi_bounds
+
+    decimal.getcontext().prec = len(_PI_DIGITS) + 20
+    pi = decimal.Decimal(
+        "3.14159265358979323846264338327950288419716939937510582097494459230"
+        "78164062862089986280348253421170679821480865132823066470938446095505"
+        "8223172535940812848111745028410270193852110555964462294895493038196")
+    lo, hi = _pi_bounds(len(_PI_DIGITS))
+    d = lambda q: decimal.Decimal(q.numerator) / decimal.Decimal(q.denominator)
+    assert d(lo) <= pi <= d(hi)

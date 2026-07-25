@@ -31,18 +31,36 @@ class PiVal:
     def __init__(self, a=0, b=0) -> None:
         self.a, self.b = F(a), F(b)
 
+    def _co(self, o):
+        """Coerce, or DEFER. Constructing PiVal(anything) here meant that
+        meeting a wider exact type — a ℚ[π] polynomial, which names the same
+        numbers and more — raised TypeError instead of letting Python reflect
+        to the other operand. volume() returns whichever type fits, so the two
+        meet constantly."""
+        if isinstance(o, PiVal):
+            return o
+        if isinstance(o, (int, Fraction)):
+            return PiVal(o)
+        return NotImplemented
+
     def __add__(self, o: "PiVal | int | Fraction") -> "PiVal":
-        o = o if isinstance(o, PiVal) else PiVal(o)
+        o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         return PiVal(self.a + o.a, self.b + o.b)
 
     __radd__ = __add__
 
     def __sub__(self, o: "PiVal | int | Fraction") -> "PiVal":
-        o = o if isinstance(o, PiVal) else PiVal(o)
+        o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         return PiVal(self.a - o.a, self.b - o.b)
 
     def __eq__(self, o: object) -> bool:
-        o = o if isinstance(o, PiVal) else PiVal(o)
+        o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         return self.a == o.a and self.b == o.b
 
     def __float__(self) -> float:
