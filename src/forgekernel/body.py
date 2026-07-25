@@ -446,6 +446,11 @@ def _face_volume_term(face: Face):
         if ln is None:
             raise ValueError(
                 "cone axis with irrational length — outside ℚ[π] (K3.7)")
+        if ua < 0 < ub:
+            raise ValueError(
+                "a conical face spanning BOTH nappes is not one face — its "
+                "two halves have opposite normals, so no single sign is "
+                "right (K3.7)")
         su = 1 if ua + ub > 0 else -1
         nax_area = -su * s.tan_half * (ra + rb) * abs(ub - ua)
         return PiVal(0, _exact(sgn * dot(s.p, s.d) / ln * nax_area / 3,
@@ -975,7 +980,12 @@ def faces_info(body: Body) -> list[dict]:
             apex = tuple(float(x) for x in s.p)
             t = float(s.tan_half)
             slant = math.hypot(float(ub - ua), float(rb - ra))
-            umid = float(ua + ub) / 2
+            # the lateral-area centroid sits at 2/3 of the height for a full
+            # cone, NOT at the axial midpoint: area grows with the radius, so
+            # the wide end carries more of it
+            fa, fb = float(ua), float(ub)
+            umid = ((2 / 3) * (fb ** 3 - fa ** 3) / (fb ** 2 - fa ** 2)
+                    if fb ** 2 != fa ** 2 else (fa + fb) / 2)
             out.append({"surface": "cone", "half_angle_tan": t,
                         "axis_dir": list(axis), "apex": list(apex),
                         "radii": [float(ra), float(rb)],
@@ -1338,6 +1348,10 @@ def from_cone(cone) -> Body:
     cx, cy = F(cone.cx), F(cone.cy)
     if z1 < z0:
         z0, z1, r1, r2 = z1, z0, r2, r1
+    if z0 == z1:
+        raise ValueError(
+            "a cone of zero height has no apex and no slope — refuse rather "
+            "than divide by it")
     if r1 == r2:
         from forgekernel.quadric import Cyl
 
@@ -1402,7 +1416,10 @@ def from_revolve(rev) -> Body:
                      for r, z in ((r1, z1), (r2, z2)) if r > 0)
         sense = z2 > z1
         if r1 == r2:
-            surf = Cylinder((cx, cy, F(0)), (F(0), F(0), F(1)), r1)
+            # anchor the axis origin at the band, not at z=0: faces_info reads
+            # the centroid as origin + axis*h/2, so a band from z=5..9 on a
+            # z=0 origin reported z=2 instead of 7
+            surf = Cylinder((cx, cy, min(z1, z2)), (F(0), F(0), F(1)), r1)
         else:
             slope = (r2 - r1) / (z2 - z1)
             apex = (cx, cy, z1 - r1 / slope)

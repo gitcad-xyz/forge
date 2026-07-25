@@ -176,6 +176,7 @@ class DrilledSolid:
         # subtracted from a solid it never touches.
         if not _xy_inside_footprint(self.base, c.cx, c.cy):
             raise ValueError("bore misses the solid in xy (nothing to drill)")
+        _require_uniform_column(self.base, c)
         for o in self.bores:
             if o.cx == c.cx and o.cy == c.cy:
                 continue                       # coaxial stack (counterbore)
@@ -942,6 +943,79 @@ def _classify_pair(a, b) -> None:
         "at K2.3")
 
 
+def _seg_dist2(px, py, ax, ay, bx, by):
+    """Exact squared distance from a point to a segment (rational throughout)."""
+    dx, dy = bx - ax, by - ay
+    den = dx * dx + dy * dy
+    if den == 0:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = ((px - ax) * dx + (py - ay) * dy) / den
+    t = F(0) if t < 0 else (F(1) if t > 1 else t)
+    qx, qy = ax + t * dx, ay + t * dy
+    return (px - qx) ** 2 + (py - qy) ** 2
+
+
+def _require_uniform_column(base: Solid, c: "Cyl") -> None:
+    """The bore's whole DISC must sit over a constant solid z-span.
+
+    ``_bore_union_volume`` removes π r² (z1−z0) — the volume of a full-height
+    barrel — so it is only right when the material really is full height
+    across the entire disc, not merely under its centre. Where it is not, the
+    barrel passes through a chamfer's taper or a shell's cavity without
+    crossing any lateral wall, so both existing checks pass and the removed
+    volume is overstated: a Ø0.5 bore under a 2 mm chamfer removed π/4 where
+    the truth is π/8, and a bore through a hollowed plate removed the full
+    10 mm where only the 2 mm walls carry material.
+
+    A non-horizontal face reaching the disc is exactly the signal that the
+    span varies, and it is an exact rational test.
+    """
+    r2 = c.r * c.r
+    levels = set()
+    for p in base.polys:
+        n = p.plane.n
+        verts = [(v[0], v[1]) for v in p.verts]
+        m = len(verts)
+        if n[0] == 0 and n[1] == 0:
+            # horizontal: it caps the column. TWO levels is a simple slab;
+            # more means the column passes through a cavity — a shelled plate
+            # has an outer top and bottom plus the void's ceiling and floor,
+            # and a full-barrel removal would take material that is not there.
+            inside = False
+            for i in range(m):
+                (x1, y1), (x2, y2) = verts[i], verts[(i + 1) % m]
+                if (y1 > c.cy) != (y2 > c.cy):
+                    if c.cx < x1 + (c.cy - y1) * (x2 - x1) / (y2 - y1):
+                        inside = not inside
+            if inside:
+                levels.add(p.plane.d / n[2])
+            continue
+        hit = False
+        for i in range(m):
+            (ax, ay), (bx, by) = verts[i], verts[(i + 1) % m]
+            if _seg_dist2(c.cx, c.cy, ax, ay, bx, by) < r2:
+                hit = True
+                break
+        if not hit:                             # or the face covers the disc
+            inside = False
+            for i in range(m):
+                (x1, y1), (x2, y2) = verts[i], verts[(i + 1) % m]
+                if (y1 > c.cy) != (y2 > c.cy):
+                    if c.cx < x1 + (c.cy - y1) * (x2 - x1) / (y2 - y1):
+                        inside = not inside
+            hit = inside
+        if hit:
+            raise ValueError(
+                "bore reaches a non-vertical wall, so the solid is not full "
+                "height across the hole — a full-barrel removal would "
+                "overstate it (K2.1)")
+    if len(levels) != 2:
+        raise ValueError(
+            f"bore column meets {len(levels)} horizontal levels, not 2 — the "
+            "solid is not one slab there (a cavity or a step), so a "
+            "full-barrel removal would overstate it (K2.1)")
+
+
 def _exact_bbox(shape):
     """Exact axis-aligned bounds, or None when the representation cannot give
     them without leaving ℚ. Never a float — this decides topology."""
@@ -974,7 +1048,7 @@ def _exact_bbox(shape):
         o = shape.origin
         return (tuple(o), (o[0] + shape.a, o[1] + shape.b, o[2] + shape.c))
     if isinstance(shape, AxisStack):
-        parts = [_exact_bbox(m) for m in shape.members]
+        parts = [_exact_bbox(m) for m in shape.prims]
     elif isinstance(shape, DisjointUnion):
         parts = [_exact_bbox(m) for m in shape.members]
     else:

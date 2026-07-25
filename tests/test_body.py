@@ -725,3 +725,105 @@ def test_an_unknown_schema_is_refused_rather_than_guessed() -> None:
 
     with pytest.raises(ValueError, match="unsupported body schema"):
         io.loads_body('{"schema":"forge/body@99","faces":[]}')
+
+
+def test_a_zero_height_cone_refuses_instead_of_dividing_by_it() -> None:
+    from forgekernel.quadric import Cone as QCone
+
+    with pytest.raises(ValueError, match="zero height"):
+        B.to_body(QCone(0, 0, 2, 5, 3, 3))
+
+
+def test_a_cone_face_spanning_both_nappes_refuses() -> None:
+    """Unreachable through the converters (with r >= 0 the apex is outside the
+    rim span) but a loaded document can carry one, and no single sign of the
+    axial term is right for both halves: it reported -15pi where the truth is
+    -5pi."""
+    from fractions import Fraction as Q
+
+    apex = (Q(0), Q(0), Q(5))
+    axis = (Q(0), Q(0), Q(1))
+    rims = tuple(B.Edge(B.Circle((Q(0), Q(0), Q(z)), axis, (Q(1), Q(0), Q(0)),
+                                 Q(abs(z - 5))),
+                        (Q(abs(z - 5)), Q(0), Q(z)), (Q(abs(z - 5)), Q(0), Q(z)))
+                 for z in (4, 7))
+    face = B.Face(B.Cone(apex, axis, Q(1)), (B.Loop(rims),), True)
+    with pytest.raises(ValueError, match="BOTH nappes"):
+        B.volume(B.Body((face,)))
+
+
+HOSTILE = [
+    ('{"schema":"forge/body@1"}', "missing 'faces'"),
+    ('{"schema":"forge/body@1","faces":3}', "wrong type"),
+    ('{"schema":"forge/body@1","faces":[{"sense":true,"loops":[]}]}',
+     "missing 'surface'"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"sphere","c":'
+     '["0/1","0/1","0/1"],"r":"1/0"},"sense":true,"loops":[]}]}', "zero denominator"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"sphere","c":'
+     '["0/1","0/1","0/1"],"r":"S:1/1:1/1:-2/1"},"sense":true,"loops":[]}]}',
+     "negative radicand"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"plane","n":["1/1"],'
+     '"d":"0/1"},"sense":true,"loops":[]}]}', "one-component normal"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"sphere","c":'
+     '["0/1","0/1","0/1"],"r":"1/1"},"sense":"yes","loops":[]}]}',
+     "sense that is merely truthy"),
+    ('[1,2,3]', "not an object"),
+]
+
+
+@pytest.mark.parametrize("doc,why", HOSTILE, ids=[h[1] for h in HOSTILE])
+def test_a_hostile_body_document_refuses_rather_than_crashing(doc, why) -> None:
+    """A document is UNTRUSTED input (ADR-0006/0007). These escaped as bare
+    KeyError/TypeError/ZeroDivisionError, and some loaded SILENTLY — a negative
+    surd radicand, a one-component normal, a truthy string for `sense` that
+    then reported a volume as fact."""
+    from forgekernel import io
+
+    with pytest.raises(ValueError):
+        io.loads_body(doc)
+
+
+def test_face_order_does_not_change_the_bytes() -> None:
+    from forgekernel import io
+
+    body = B.to_body(DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)]))
+    shuffled = B.Body(tuple(reversed(body.faces)))
+    assert io.dumps_body(shuffled) == io.dumps_body(body)
+
+
+UNIFORM = [
+    # a bore under a chamfer: the barrel crosses no wall and its centre is
+    # inside the footprint, so BOTH existing checks pass while the material is
+    # only half as thick as the removal assumes
+    ("under a chamfer", lambda: __import__(
+        "forgekernel.kernel", fromlist=["chamfer"]).chamfer(
+            Solid.box(20, 20, 4), 2.0), (1.5, 1.0, 0.25), (0, 4), False),
+    ("dead centre of a chamfered plate", lambda: __import__(
+        "forgekernel.kernel", fromlist=["chamfer"]).chamfer(
+            Solid.box(20, 20, 4), 2.0), (10, 10, 2), (0, 4), True),
+    # after hollowing, the bore passes through the CAVITY
+    ("through a shelled plate", lambda: __import__(
+        "forgekernel.kernel", fromlist=["shell"]).shell(
+            Solid.box(20, 20, 10), 2.0), (10, 10, 2), (0, 10), False),
+    ("a plain slab", lambda: Solid.box(40, 20, 5), (20, 10, 4), (0, 5), True),
+    # non-convex but still one slab through the column
+    ("an L-prism", lambda: prism(
+        [(0, 0), (20, 0), (20, 8), (8, 8), (8, 20), (0, 20)], 6),
+     (4, 4, 2), (0, 6), True),
+]
+
+
+@pytest.mark.parametrize("label,build,bore,zs,ok", UNIFORM,
+                         ids=[u[0] for u in UNIFORM])
+def test_a_bore_needs_a_full_height_column_under_its_whole_disc(
+        label, build, bore, zs, ok) -> None:
+    """_bore_union_volume removes pi r^2 (z1-z0) — a FULL barrel — so it is
+    only right where the material really is full height across the entire
+    disc, not merely under its centre."""
+    cx, cy, r = bore
+    cut = DrilledSolid(build(), []).cut
+    if ok:
+        assert cut(Cyl(cx, cy, r, zs[0], zs[1])) is not None
+    else:
+        with pytest.raises(ValueError, match="K2.1"):
+            cut(Cyl(cx, cy, r, zs[0], zs[1]))

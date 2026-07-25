@@ -105,49 +105,112 @@ def dumps_body(body) -> str:
         raise ValueError(
             f"no text encoding for a {type(c).__name__} curve yet (K3.7)")
 
-    doc = {"schema": BODY_SCHEMA, "faces": [
-        {"surface": surface(f.surface), "sense": bool(f.sense),
-         "loops": [[{"curve": curve(e.curve), "v0": _vec(e.v0),
-                     "v1": _vec(e.v1)} for e in lp.edges] for lp in f.loops]}
-        for f in body.faces]}
+    def face_doc(f):
+        # NOTE: (n, d, sense) and (-n, -d, not sense) name the same face, and
+        # this format still admits both. Folding the sign into `sense` alone is
+        # NOT enough — the loops are wound about n, so flipping it inverts
+        # every loop's area and the face reads as having negative area. Doing
+        # it properly means reversing each loop and each circle's normal too;
+        # until that is written and verified, two converters can spell one
+        # plane two ways. Face ORDER, which was the larger half of the
+        # problem, is canonical below.
+        return {"surface": surface(f.surface), "sense": bool(f.sense),
+                "loops": [[{"curve": curve(e.curve), "v0": _vec(e.v0),
+                            "v1": _vec(e.v1)} for e in lp.edges]
+                          for lp in f.loops]}
+
+    # Face ORDER is not geometry either: from_cyl and from_revolve build the
+    # same cylinder's faces in different sequences. Sort by the encoded face,
+    # so equal solids produce equal bytes -- the whole point of the format.
+    doc = {"schema": BODY_SCHEMA,
+           "faces": sorted((face_doc(f) for f in body.faces),
+                           key=lambda d: json.dumps(d, sort_keys=True))}
     return json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def _bad(msg):
+    raise ValueError(f"malformed body document: {msg}")
+
+
 def loads_body(text: str):
+    """Parse a ``forge/body@1`` document.
+
+    A document is UNTRUSTED input (ADR-0006/0007). Every shape error here used
+    to escape as a bare KeyError/TypeError/ZeroDivisionError, and some nonsense
+    loaded SILENTLY — a negative surd radicand, a one-component plane normal,
+    a ``sense`` of ``"yes"`` that is merely truthy and then reported a volume
+    as fact. Validate the shape, then refuse by name.
+    """
     from forgekernel.body import (Body, Circle, Cone, Cylinder, Edge, Face,
                                   Line, Loop, Plane, SphereS)
+    from forgekernel.surd import SurdVal
 
     doc = json.loads(text)
+    if not isinstance(doc, dict):
+        _bad("the document is not an object")
     if doc.get("schema") != BODY_SCHEMA:
         raise ValueError(f"unsupported body schema {doc.get('schema')!r}")
 
-    def vec(v):
-        return tuple(_unnum(x) for x in v)
+    def need(d, key, kind):
+        if not isinstance(d, dict) or key not in d:
+            _bad(f"missing {key!r}")
+        v = d[key]
+        if not isinstance(v, kind) or (kind is not bool and isinstance(v, bool)):
+            _bad(f"{key!r} has the wrong type")
+        return v
+
+    def scalar(raw):
+        if not isinstance(raw, str):
+            _bad("an exact number must be a string")
+        try:
+            out = _unnum(raw)
+        except (ValueError, ZeroDivisionError, IndexError) as exc:
+            _bad(f"unreadable exact number {raw!r} ({exc})")
+        if isinstance(out, SurdVal) and out.d <= 0:
+            _bad(f"a surd radicand must be positive, got {out.d}")
+        return out
+
+    def vec(raw):
+        if not isinstance(raw, list) or len(raw) != 3:
+            _bad("a vector needs exactly 3 components")
+        return tuple(scalar(c) for c in raw)
 
     def surface(s):
-        k = s["kind"]
+        k = need(s, "kind", str)
         if k == "plane":
-            return Plane(vec(s["n"]), _unnum(s["d"]))
+            return Plane(vec(need(s, "n", list)), scalar(need(s, "d", str)))
         if k == "cylinder":
-            return Cylinder(vec(s["p"]), vec(s["d"]), _unnum(s["r"]))
+            return Cylinder(vec(need(s, "p", list)), vec(need(s, "d", list)),
+                            scalar(need(s, "r", str)))
         if k == "cone":
-            return Cone(vec(s["p"]), vec(s["d"]), _unnum(s["tan_half"]))
+            return Cone(vec(need(s, "p", list)), vec(need(s, "d", list)),
+                        scalar(need(s, "tan_half", str)))
         if k == "sphere":
-            return SphereS(vec(s["c"]), _unnum(s["r"]))
+            return SphereS(vec(need(s, "c", list)), scalar(need(s, "r", str)))
         raise ValueError(f"unknown surface kind {k!r}")
 
     def curve(c):
-        if c["kind"] == "line":
-            return Line(vec(c["p"]), vec(c["d"]))
-        return Circle(vec(c["c"]), vec(c["n"]), vec(c["ref"]), _unnum(c["r"]))
+        k = need(c, "kind", str)
+        if k == "line":
+            return Line(vec(need(c, "p", list)), vec(need(c, "d", list)))
+        if k == "circle":
+            return Circle(vec(need(c, "c", list)), vec(need(c, "n", list)),
+                          vec(need(c, "ref", list)), scalar(need(c, "r", str)))
+        raise ValueError(f"unknown curve kind {k!r}")
 
-    return Body(tuple(
-        Face(surface(f["surface"]),
-             tuple(Loop(tuple(Edge(curve(e["curve"]), vec(e["v0"]),
-                                   vec(e["v1"])) for e in lp))
-                   for lp in f["loops"]),
-             f["sense"])
-        for f in doc["faces"]))
+    def loop(lp):
+        if not isinstance(lp, list):
+            _bad("a loop must be a list of edges")
+        return Loop(tuple(Edge(curve(need(e, "curve", dict)),
+                               vec(need(e, "v0", list)),
+                               vec(need(e, "v1", list))) for e in lp))
+
+    def face(f):
+        return Face(surface(need(f, "surface", dict)),
+                    tuple(loop(lp) for lp in need(f, "loops", list)),
+                    need(f, "sense", bool))
+
+    return Body(tuple(face(f) for f in need(doc, "faces", list)))
 
 
 def to_stl(solid: Solid, name: str = "forge") -> str:
