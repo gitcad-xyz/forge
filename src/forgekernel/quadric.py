@@ -816,6 +816,18 @@ class DisjointUnion:
         verts: list = []
         tris: list = []
         for m in self.members:
+            if type(m).__name__ == "Body":
+                # a cut can now leave a canonical Body as a member; asking it
+                # for .cx (via AxisStack) is a bare AttributeError, and the
+                # union becomes unrenderable while still measuring fine
+                from forgekernel.body import tessellate as _btess
+
+                sub = _btess(m, deflection)
+                off = len(verts)
+                verts.extend(sub["vertices"])
+                tris.extend([a + off, b + off, c + off]
+                            for a, b, c in sub["triangles"])
+                continue
             if not hasattr(m, "tessellate"):    # bare Sphere/Cone: via a stack
                 m = AxisStack(m.cx, m.cy, [m])
             try:
