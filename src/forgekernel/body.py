@@ -1280,11 +1280,22 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     tri(pa, pb, pc, outn)
                     tri(pa, pc, pd, outn)
         elif isinstance(s, SphereS) and face.loops:
-            oct_ = _sphere_octant(face)
+            # The corners are the loop's OWN vertices. They used to be rebuilt
+            # as centre + r along each signed GLOBAL axis, reading the octant
+            # vector as if it were a sign triple — which it only is when the
+            # patch happens to be axis-aligned. _sphere_octant returns the SUM
+            # of the three radii (frame-free, which is what the exact volume
+            # needs); for a rotated corner that sum is a diagonal of length
+            # r*sqrt(3), so the mesh subdivided the wrong spherical triangle
+            # entirely. A rounded box rotated 45 degrees about z came out with
+            # 88 of its 170 mesh edges unpaired — an STL full of holes — while
+            # 0 and 90 degrees were clean, and the exact volume was right all
+            # along.
+            _sphere_octant(face)         # still refuses anything but an octant
             rr = float(s.r)
             cc = tuple(float(x) for x in s.c)
-            corners = [tuple(cc[t] + rr * float(oct_[ax]) * (1.0 if ax == t else 0.0)
-                             for t in range(3)) for ax in range(3)]
+            corners = [tuple(float(x) for x in e.v0)
+                       for lp in face.loops for e in lp.edges]
             depth = _quarter_depth(rr, deflection)
 
             def onsphere(q):

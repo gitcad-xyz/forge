@@ -1262,3 +1262,46 @@ def test_an_odd_level_count_still_refuses() -> None:
         Solid.box(20, 20, 4), 2.0)
     with pytest.raises(ValueError, match="K2.1"):
         _column_slabs(ch, Cyl(1.5, 1.0, 0.25, 0, 4))
+
+
+ROTATIONS = [0, 30, 45, 60, 90]
+
+
+@pytest.mark.parametrize("deg", ROTATIONS)
+@pytest.mark.parametrize("deflection", [0.3, 0.05])
+def test_a_rounded_box_meshes_the_same_however_it_is_turned(deg, deflection):
+    """A sphere octant's three corners are the loop's OWN vertices. They used
+    to be rebuilt as centre + r along each signed GLOBAL axis, reading
+    ``_sphere_octant``'s return as if it were a sign triple — which it only is
+    when the patch happens to be axis-aligned. That function returns the SUM of
+    the three radii (frame-free, which is what the exact volume needs), so for
+    a rotated corner it is a diagonal of length r*sqrt(3) and the subdivision
+    meshed the wrong spherical triangle entirely.
+
+    A 20-cube filleted r=3 and turned 45 degrees about z came out with 88 of
+    its 170 mesh edges unpaired — an STL full of holes — while 0 and 90 degrees
+    were clean and the exact volume was right the whole time. Meshing is a
+    display property, so nothing exact caught it.
+
+    Rotation is an isometry: the triangle count, the edge pairing and the mesh
+    volume must all be invariant."""
+    from forgekernel.kernel import fillet_box, rotate
+
+    base = fillet_box(20, 20, 20, 3)
+    shape = base if deg == 0 else B.to_body(base).transformed(
+        B.Affine.rotation((0, 0, 1), deg))
+    body = shape if isinstance(shape, B.Body) else B.to_body(shape)
+    mesh = B.tessellate(body, deflection)
+
+    ec = defaultdict(int)
+    for a, b, c in mesh["triangles"]:
+        for e in ((a, b), (b, c), (c, a)):
+            ec[tuple(sorted(e))] += 1
+    assert [n for n in ec.values() if n != 2] == [], "the mesh is not closed"
+
+    ref = B.tessellate(B.to_body(base), deflection)
+    assert len(mesh["triangles"]) == len(ref["triangles"])
+    assert mesh_volume(mesh) == pytest.approx(mesh_volume(ref), rel=1e-12)
+    # and it converges to the exact volume from inside
+    exact = float(B.volume(body))
+    assert 0 < mesh_volume(mesh) <= exact * (1 + 1e-12)
