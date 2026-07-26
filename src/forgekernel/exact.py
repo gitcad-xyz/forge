@@ -17,12 +17,28 @@ from typing import Iterable
 Vec = tuple[Fraction, Fraction, Fraction]
 
 
-def F(x) -> Fraction:
+def F(x):
     """Exact conversion. Floats convert via Fraction(float) — the exact
     binary value, no decimal guessing and no denominator snapping — so
     every decision made afterward is exact relative to the given inputs.
-    Slow denominators are ref's price for being the spec."""
-    return x if isinstance(x, Fraction) else Fraction(x)
+    Slow denominators are ref's price for being the spec.
+
+    WIDER EXACT FIELDS PASS THROUGH UNTOUCHED. A value already living in
+    ℚ[√d] or ℚ[√d][π] is exact; forcing it to Fraction would either raise or,
+    worse, lose the radical. Solids whose faces meet at an irrational height —
+    a napkin ring's bore circles at z = ±√(R²−r²), a shelled cone's offset
+    profile — cannot be expressed at all while this only admits ℚ.
+
+    The guard that matters is unchanged: a FLOAT still converts to its exact
+    binary Fraction rather than being waved through, so nothing silently
+    becomes inexact. Widening the domain is not the same as dropping the
+    check, and this function is the single place either could happen.
+    """
+    if isinstance(x, Fraction):
+        return x
+    if getattr(x, "is_exact_scalar", False):
+        return x
+    return Fraction(x)
 
 
 def vec(x, y, z) -> Vec:

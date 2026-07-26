@@ -89,6 +89,7 @@ def _coef(x):
 
 
 class PiPoly:
+    is_exact_scalar = True   # exact beyond Q; F() must not coerce it away
     """Exact ``Σ cₖ πᵏ`` over ℚ — or over ℚ[√d], which costs nothing.
 
     π is transcendental over any ALGEBRAIC extension of ℚ, not merely over ℚ,

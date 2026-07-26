@@ -24,6 +24,7 @@ from forgekernel.exact import F, dot
 
 
 class PiVal:
+    is_exact_scalar = True   # exact beyond Q; F() must not coerce it away
     """An exact number a + b·π (a, b rational)."""
 
     __slots__ = ("a", "b")

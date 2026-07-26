@@ -44,6 +44,7 @@ def sqrt_rational(x) -> "SurdVal":
 
 
 class SurdVal:
+    is_exact_scalar = True   # exact beyond Q; F() must not coerce it away
     """a + b·√d, exact. d is square-free (d==1 means purely rational)."""
 
     __slots__ = ("a", "b", "d")
