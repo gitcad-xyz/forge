@@ -2888,8 +2888,17 @@ def lathe_body(segs, cx, cy) -> Body:
                 raise ValueError(
                     "a lathe arc traversed clockwise about its own centre is "
                     "ambiguous — carry it counter-clockwise (K3.7)")
+            # #130: the rims are the face's BOUNDARY, and they must be on the
+            # face. Emitting `()` left every rim circle used by ONE face (the
+            # neighbour), so `manifold_violations` reported every filleted
+            # lathe as open and the answer audit had to exempt any body
+            # carrying a torus — a blanket pardon for exactly the bodies most
+            # likely to be assembled wrong. A rim of radius zero sits ON the
+            # axis: a singular point on no edge (the pointed-cone precedent).
+            rims = tuple(circ(p[1], p[0]) for p in (p0, p1) if p[0] > 0)
             faces.append(Face(
-                Torus((cx, cy, cen[1]), axis, cen[0], a, k0, span), (), True))
+                Torus((cx, cy, cen[1]), axis, cen[0], a, k0, span),
+                (Loop(rims),) if rims else (), True))
             continue
         (r1, z1), (r2, z2) = sg[1], sg[2]
         if r1 == r2 == 0 or (r1 == r2 and z1 == z2):
