@@ -481,6 +481,115 @@ def _planar_loop_area2(loop: Loop, n: Vec):
     return dot(acc, n)
 
 
+def _mixed_loop_area(loop: Loop, n: Vec):
+    """(rational, π-coefficient) signed area of a planar loop mixing Lines and
+    Circle arcs — exact, and the only new geometry #123 needs.
+
+    The loop's chord polygon plus one circular-segment correction per arc:
+    an arc of radius r sweeping θ adds (r²/2)(θ − sin θ) beyond its chord when
+    it runs COUNTER-CLOCKWISE about the face normal, and subtracts it when it
+    runs the other way (which is how the same 90° arc bounds a notch floor of
+    4 − π on one face and a shoulder hole of 4 + 3π on the next).
+
+    ADR-0019: θ is what decides whether this face is measurable at all, so
+    ``_arc_quarters`` decides it — an exact equality against ``r·_twelfth_dir``
+    that returns a span in TWELFTHS or refuses. ``atan2`` would accept a 44.999°
+    trim as a quarter and hand back a confidently exact wrong number; ``sin θ``
+    likewise comes from ``_sin_cos_twelfths`` (0, ±1/2, ±√3/2, ±1) and never
+    from ``math.sin``. Nothing here is a float.
+
+    Returns the two parts separately so the caller can route them through
+    ``_pi_value``: at quarter turns the answer is in ℚ[π], at odd twelfths the
+    sine brings in √3 and it lives in ℚ[√3][π], which ``PiPoly`` holds.
+    """
+    ln = _rational_sqrt(dot(n, n))
+    if ln is None:
+        raise ValueError(
+            "arc/line loop on a plane whose normal has irrational length — "
+            "outside ℚ[π] (K3.7)")
+    rat = _planar_loop_area2(loop, n) / (2 * ln)
+    pi = F(0)
+    for e in loop.edges:
+        if not isinstance(e.curve, Circle):
+            continue
+        # the arc must lie IN the face's plane, or the chord polygon it is
+        # correcting is not the projection of this loop at all
+        axial = dot(e.curve.n, n)
+        if any(x != 0 for x in cross(e.curve.n, n)) or axial == 0:
+            raise ValueError(
+                "an arc on a planar face whose circle is not coplanar with it "
+                "— the face is malformed, not merely unsupported")
+        _k0, span = _arc_quarters(e.curve, e.v0, e.v1)
+        _co, si = _sin_cos_twelfths()[span % 12]
+        s = 1 if axial > 0 else -1
+        rat += s * (-e.curve.r ** 2 * si / 2)
+        pi += s * e.curve.r ** 2 * Fraction(span, 12)
+    return rat, pi
+
+
+def _mixed_loop_area_as_hole(loop: Loop, n: Vec):
+    """A mixed loop's area as a NEGATIVE quantity, whichever way it winds.
+
+    The polygon path takes ``-abs(a2)`` on a rational. A mixed loop's area is a
+    ℚ[π] value — the counterbore shoulder's inner loop is 4 + 3π — and
+    ``abs(float(...))`` there would be a float deciding the sign of a face's
+    area, which decides whether the face refuses (ADR-0019). ``sign()`` narrows
+    a rational enclosure of π until the answer is certain, and copes with a
+    surd coefficient.
+    """
+    from forgekernel.polypi import PiPoly
+
+    a_rat, a_pi = _mixed_loop_area(loop, n)
+    if PiPoly([a_rat, a_pi]).sign() > 0:
+        return -a_rat, -a_pi
+    return a_rat, a_pi
+
+
+def _mixed_loop_area_centroid_f(loop: Loop, nf):
+    """Signed area and area centroid of a mixed arc/line loop, in FLOATS.
+
+    The float counterpart of :func:`_mixed_loop_area`, for the two reporting
+    paths — ``centroid`` and ``faces_info`` — whose answers are ratios that
+    leave ℚ[π] anyway. Floats are legal here and only here (ADR-0019): the
+    arc's SPAN still comes from ``_arc_quarters``, exactly, so the same loops
+    are admitted and refused as on the exact path; only the arithmetic on an
+    already-decided span is floating.
+
+    Chord polygon + one circular segment per arc. A segment of half-angle α has
+    area r²(α − sin α cos α) and its first moment about the circle centre is
+    (2/3)r³sin³α along the chord's outward bisector — so the two combine
+    without ever dividing by a vanishing area.
+    """
+    vs = [tuple(float(x) for x in e.v0) for e in loop.edges]
+    area, cen = _poly_area_centroid_f(vs, nf)
+    acc = [cen[k] * area for k in range(3)]
+    for e in loop.edges:
+        if not isinstance(e.curve, Circle):
+            continue
+        _k0, span = _arc_quarters(e.curve, e.v0, e.v1)
+        r = float(e.curve.r)
+        alpha = span * math.pi / 12.0
+        s = 1.0 if sum(float(e.curve.n[k]) * nf[k] for k in range(3)) > 0 else -1.0
+        a_seg = s * r * r * (alpha - math.sin(alpha) * math.cos(alpha))
+        c = tuple(float(x) for x in e.curve.c)
+        mid = [(float(e.v0[k]) + float(e.v1[k])) / 2 - c[k] for k in range(3)]
+        ln = math.sqrt(sum(x * x for x in mid))
+        if ln == 0:                     # a half turn: the chord midpoint IS the
+            u, w = _circle_frame(e.curve)       # centre, so use the frame
+            th = (_k0 + span / 2.0) * math.pi / 6.0
+            bis = [math.cos(th) * float(u[k]) + math.sin(th) * float(w[k])
+                   for k in range(3)]
+        else:
+            bis = [x / ln for x in mid]
+        d = (2.0 / 3.0) * r ** 3 * math.sin(alpha) ** 3
+        area += a_seg
+        for k in range(3):
+            acc[k] += s * d * bis[k] + a_seg * c[k]
+    if area == 0.0:
+        return 0.0, cen
+    return area, tuple(acc[k] / area for k in range(3))
+
+
 def _as_fraction(x):
     """x as a Fraction if it is rational — including a ``SurdVal`` whose surd
     part is zero, which is what an exact rotation leaves behind (a 45° turn
@@ -578,12 +687,26 @@ def _face_volume_term(face: Face):
         area_rat, area_pi = F(0), F(0)     # for the sanity check below
         for i, lp in enumerate(face.loops):
             circ = _loop_is_circle(lp)
-            if circ is None:
-                if _loop_has_arcs(lp):
+            if circ is None and _loop_has_arcs(lp):
+                # A loop mixing arcs and lines used to refuse outright, because
+                # chording it under-reports the area. It has an exact area —
+                # chord polygon plus one circular-segment term per arc — and
+                # #123's straddled bore is built entirely out of such loops.
+                # The refusal survives where it is still right: an arc off the
+                # twelfth grid leaves every field the kernel has, and
+                # _arc_quarters says so.
+                ln = _rational_sqrt(nn)
+                if ln is None:
                     raise ValueError(
-                        "planar loop mixing arcs and lines (a slot end, a "
-                        "D-profile) — its area is not in ℚ[π] with the chord "
-                        "treatment, so refuse rather than under-report (K3.7)")
+                        "arc/line loop on a plane whose normal has irrational "
+                        "length — outside ℚ[π] (arrives with K3.7)")
+                a_rat, a_pi = (_mixed_loop_area(lp, s.n) if i == 0
+                               else _mixed_loop_area_as_hole(lp, s.n))
+                rat += s.d * a_rat / (3 * ln)
+                pi += s.d * a_pi / (3 * ln)
+                area_rat += a_rat
+                area_pi += a_pi
+            elif circ is None:
                 a2 = _planar_loop_area2(lp, s.n)
                 rat += s.d * (a2 if i == 0 else -abs(a2)) / (6 * nn)
                 ln2 = _rational_sqrt(nn)
@@ -601,13 +724,23 @@ def _face_volume_term(face: Face):
         # A face cannot have negative area. If it does, an inner loop was
         # attached to a face that does not contain it — refuse rather than
         # return a confidently wrong exact volume.
-        if float(_as_fraction(area_rat) or 0) + math.pi * float(
-                _as_fraction(area_pi) or 0) < -1e-12:
+        #
+        # Decided EXACTLY. It used to float both parts through _as_fraction,
+        # which quietly reads a surd as zero — so a face carrying an odd-twelfth
+        # arc would have had the whole π term dropped from the very check that
+        # is supposed to catch a sign error. PiPoly.sign() narrows an enclosure
+        # of π until the answer is certain and takes surd coefficients.
+        from forgekernel.polypi import PiPoly
+
+        if PiPoly([area_rat, area_pi]).sign() < 0:
             raise ValueError(
                 "face has negative area — an inner loop is larger than the "
                 "boundary carrying it (a hole attached to the wrong face)")
-        return PiVal(_exact(sgn * rat, "planar area"),
-                     _exact(sgn * pi, "circular area"))
+        # _pi_value, not _exact: a mixed loop ending on an ODD twelfth has a
+        # √3/2 in its segment term, so the area is in ℚ[√3][π] — exactly the
+        # field the trimmed-band branch below already hands back as a PiPoly.
+        # Both parts rational still returns a PiVal, byte for byte as before.
+        return _pi_value(sgn * rat, sgn * pi, "planar face")
     if isinstance(s, Cylinder):
         # x·n̂ = p·N̂ + r on the surface, so ∮x·n̂ dA = r·h·(p·∫N̂dθ + r·Δθ).
         # Over a FULL band ∫N̂dθ vanishes and this is the familiar
@@ -914,8 +1047,10 @@ def centroid(body: Body):
                 if circ is not None:
                     a = math.pi * float(circ.r) ** 2
                     c = tuple(float(x) for x in circ.c)
+                elif _loop_has_arcs(lp):
+                    a, c = _mixed_loop_area_centroid_f(lp, nf)
+                    a = abs(a)
                 else:
-                    _refuse_arc_loop(lp)
                     vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
                     a, c = _poly_area_centroid_f(vs, nf)
                     a = abs(a)
@@ -1057,12 +1192,84 @@ def centroid(body: Body):
     return tuple(x / v for x in m)
 
 
+def vector_area(body: Body):
+    """Σ over faces of Areaᵢ·n̂ᵢ — exactly zero for ANY closed shell.
+
+    A third oracle, and it sees a class the other two structurally cannot.
+    Edge pairing audits counts, so a face whose loop runs the wrong way round
+    still pairs; the volume is a single number, so a sign error that happens to
+    keep it positive sails through. The vector area is the divergence theorem
+    applied to the constant fields x̂, ŷ, ẑ, so it must vanish on any closed
+    surface whatever its shape — and it does not vanish when one face's
+    orientation disagrees with its neighbours.
+
+    Measured on the #123 counterbore result: the correct 13-face body gives
+    (0,0,0); emitting the tool's fourth wall (the classic mistake, a
+    self-intersecting shell) gives (4, 4, π); flipping the sign of one
+    circular-segment term gives (0, 0, 2π).
+
+    Returns a triple of ``PiPoly``, or ``None`` when the body carries a surface
+    whose ∮n̂ dA this does not compute yet — an unknown answer is not a pass.
+    """
+    from forgekernel.polypi import PiPoly
+
+    out = [PiPoly.rational(0)] * 3
+    for f in body.faces:
+        s, sgn = f.surface, (1 if f.sense else -1)
+        if isinstance(s, Plane):
+            ln = _rational_sqrt(dot(s.n, s.n))
+            if ln is None:
+                return None
+            rat, pi = F(0), F(0)
+            for i, lp in enumerate(f.loops):
+                circ = _loop_is_circle(lp)
+                if circ is not None:
+                    pi += (1 if i == 0 else -1) * circ.r * circ.r
+                elif _loop_has_arcs(lp):
+                    a = (_mixed_loop_area(lp, s.n) if i == 0
+                         else _mixed_loop_area_as_hole(lp, s.n))
+                    rat, pi = rat + a[0], pi + a[1]
+                else:
+                    a2 = _planar_loop_area2(lp, s.n)
+                    rat += (a2 if i == 0 else -abs(a2)) / (2 * ln)
+            for i in range(3):
+                out[i] = out[i] + PiPoly([rat, pi]) * sgn * (s.n[i] / ln)
+        elif isinstance(s, Cylinder):
+            # ∮n̂ dA over a band is r·h·∫N̂dθ, which vanishes over a full turn
+            # and does not over a trimmed one
+            arcs = _band_arc(f)
+            if arcs is None:
+                continue
+            h = _band_height(f, s)
+            vint = _band_sweep(arcs, s)[1]
+            for i in range(3):
+                out[i] = out[i] + PiPoly([h * s.r * vint[i] * sgn, F(0)])
+        else:
+            return None
+    return tuple(out)
+
+
 def _edge_key(e: Edge):
     """A geometric, EXACT, direction-free name for an edge.
 
     Direction-free because the two faces meeting at an edge traverse it
     opposite ways; exact because an edge key that rounded would fuse two
     genuinely distinct edges a micron apart (ADR-0019).
+
+    It also carries the arc's SPAN, and that is not cosmetic. Two arcs on one
+    circle with the same endpoints are the same set only if they sweep the same
+    angle: the 90° arc E→N and the 270° arc N→E share a centre, a radius, an
+    axis and an endpoint pair, so without the span they keyed identically and
+    ``manifold_violations`` — the audit that is supposed to stop a hand-built
+    body lying about what it is — could not see a complemented rim at all. A
+    quarter cylinder (5π) and the 3/4 wedge glued to its flat walls (35π/3) are
+    built from the very same faces and both came back clean.
+
+    Direction-freeness survives, because the span does not depend on which side
+    walks the edge: a face needing the reverse sweep carries the circle with −n
+    (the ``Edge`` contract in ``_arc_pts``), and the same arc measured about −n
+    from the other end has the same span. A CLOSED edge (v0 == v1) is the whole
+    circle from either side and is left alone.
     """
     from forgekernel.brep import _canon_dir
 
@@ -1070,8 +1277,19 @@ def _edge_key(e: Edge):
     if isinstance(e.curve, Circle):
         # sign-invariant axis: a band's rim carries the unit axis while the
         # octant beside it carries a cross product pointing the other way
+        try:
+            span = (12 if _key3(e.v0) == _key3(e.v1)
+                    else _arc_quarters(e.curve, e.v0, e.v1)[1])
+        except ValueError:
+            # an arc off the twelfth grid, or a circle whose frame is not
+            # exactly orthonormal: no exact span exists, so key it as before.
+            # Both faces at the edge compute the same thing, so pairing is
+            # unaffected; such a body cannot be measured exactly anyway.
+            span = None
+        # ends stays LAST: manifold_violations names the offending edge with
+        # k[-1][0], so every key must end with its endpoint pair
         return ("arc", _key3(e.curve.c), e.curve.r,
-                _canon_dir(e.curve.n), ends)
+                _canon_dir(e.curve.n), span, ends)
     return ("line", ends)
 
 
@@ -1220,10 +1438,21 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
         tris.append([ia, ib, ic])
 
     def _segs_for(r: float) -> int:
-        if r <= deflection:
-            return 24
-        return max(24, int(math.ceil(
-            math.pi / math.acos(max(-1.0, 1 - deflection / r)))))
+        """Segments round a whole circle — always 4·2^d, and at least 24.
+
+        DYADIC, and that is the whole point. Three samplers walk the same
+        circles: ``circle_pts`` for a whole rim, the trimmed-band path, and a
+        corner octant's midpoint subdivision. The last two are dyadic by
+        construction (2^d steps per quarter), so a free-form count from
+        ``ceil(π/acos(...))`` gave a full rim 24 points where the band beside it
+        wanted 8 — a shell that tears wherever a trimmed band meets a whole
+        circle on the same axis. Rounding the count up to 4·2^d puts all three
+        on one grid, and rounding UP means no mesh gets coarser than it was.
+        """
+        d = _quarter_depth(r, deflection) if r > 0 else 1
+        while 4 * 2 ** d < 24:
+            d += 1
+        return 4 * 2 ** d
 
     # ONE segment count per AXIS, taken from the widest circle on it. Deriving
     # it per circle tears every taper: a frustum's r=2 and r=5 rims want
@@ -1255,6 +1484,39 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                                    + math.sin(2 * math.pi * k / segs) * w[i])
                       for i in range(3)) for k in range(segs)], segs
 
+    def _per_quarter(c: Circle) -> int:
+        """Sample points per QUARTER turn on this circle's axis — the axis
+        bucket's count divided by four, so a trimmed band, a whole rim and a
+        corner octant on one axis all land on the same points."""
+        n = axis_segs.get(_line_key(c.c, c.n))
+        if n:
+            return n // 4
+        return 2 ** _quarter_depth(float(c.r), deflection)
+
+    def _grid_arc_pts(c: Circle, v0, v1):
+        """One arc's points on the axis grid, v0 up to but excluding v1.
+
+        Falls back to plain deflection sampling only where no grid exists to
+        share — an arc off the twelfth grid, or one whose sweep is not a whole
+        number of quarters, has no trimmed band beside it to agree with (that
+        band refuses to mesh at all).
+        """
+        try:
+            k0, span = _arc_quarters(c, v0, v1)
+            u, w = (tuple(float(x) for x in q) for q in _circle_frame(c))
+        except ValueError:
+            return _arc_pts(c, v0, v1, deflection)
+        if span % 3:
+            return _arc_pts(c, v0, v1, deflection)
+        nseg = _per_quarter(c) * (span // 3)
+        cc = tuple(float(x) for x in c.c)
+        rr = float(c.r)
+        return [tuple(cc[t] + rr * (math.cos((k0 + span * m / nseg) * math.pi / 6)
+                                    * u[t]
+                                    + math.sin((k0 + span * m / nseg) * math.pi / 6)
+                                    * w[t]) for t in range(3))
+                for m in range(nseg)]
+
     for face in body.faces:
         s = face.surface
         if isinstance(s, Plane):
@@ -1283,8 +1545,11 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     for e in lp.edges:
                         # a slot end is an ARC — walking v0 alone chords it
                         if isinstance(e.curve, Circle):
-                            ring.extend(_arc_pts(e.curve, e.v0, e.v1,
-                                                 deflection))
+                            # ...on the axis GRID, not by free deflection. A
+                            # notch floor's 90° arc is the same edge as the bore
+                            # band's rim beside it; sampled independently the
+                            # two disagreed and the shell tore along the seam.
+                            ring.extend(_grid_arc_pts(e.curve, e.v0, e.v1))
                         else:
                             ring.append(tuple(float(x) for x in e.v0))
                     rings.append([to2(p) for p in ring])
@@ -1311,7 +1576,7 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             # chord midpoint onto a circle lands on the ANGULAR midpoint, so a
             # depth-d octant subdivision gives 2^d uniform steps per quarter —
             # match the band to that or the shell tears along every seam.
-            per = 2 ** _quarter_depth(rr, deflection)
+            per = _per_quarter(circ)
             if span % 3:
                 # The exact arithmetic reaches twelfths (30° steps); the MESH
                 # cannot follow yet, and the reason is structural rather than
@@ -1327,9 +1592,16 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     "exact but not yet meshable (K3.7)")
             nseg = per * (span // 3)
             axis = _unit(tuple(float(x) for x in s.d))
-            ends = sorted({sum((float(c.c[t]) - float(s.p[t])) * axis[t]
-                                for t in range(3))
-                           for c, _k, _sp in arcs})
+            # every CIRCULAR rim, not only the trimmed arcs — the same source
+            # _band_height reads. A band whose far rim is a whole circle while
+            # the near one is split into quarters (which is what a bore wall
+            # below a notch is) had ends == {one value}, so it meshed as a
+            # zero-height strip and emitted nothing at all: 5 mm of bore wall
+            # silently missing, and the rings above and below it left open.
+            ends = sorted({sum((float(e.curve.c[t]) - float(s.p[t])) * axis[t]
+                               for t in range(3))
+                           for lp in face.loops for e in lp.edges
+                           if isinstance(e.curve, Circle)})
             base = tuple(float(x) for x in s.p)
             def at(tt, ang):
                 # k0 and ang are both in TWELFTHS of a turn, so the step is
@@ -1412,7 +1684,14 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             cc = tuple(float(x) for x in s.c)
             corners = [tuple(float(x) for x in e.v0)
                        for lp in face.loops for e in lp.edges]
-            depth = _quarter_depth(rr, deflection)
+            # the octant's three quarter arcs are shared with the fillet bands
+            # it blends, so its depth is theirs: 2^depth points per quarter must
+            # equal the band's per-quarter count on the SAME axis, or the corner
+            # peels away from the wall it is tangent to
+            depth = max([_quarter_depth(rr, deflection)] + [
+                (_per_quarter(e.curve)).bit_length() - 1
+                for lp in face.loops for e in lp.edges
+                if isinstance(e.curve, Circle)])
 
             def onsphere(q):
                 v = [q[t] - cc[t] for t in range(3)]
@@ -1616,8 +1895,10 @@ def faces_info(body: Body) -> list[dict]:
                 if circ is not None:
                     a = math.pi * float(circ.r) ** 2
                     c = tuple(float(x) for x in circ.c)
+                elif _loop_has_arcs(lp):
+                    a, c = _mixed_loop_area_centroid_f(lp, nf)
+                    a = abs(a)
                 else:
-                    _refuse_arc_loop(lp)
                     vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
                     a, c = _poly_area_centroid_f(vs, nf)
                     a = abs(a)
