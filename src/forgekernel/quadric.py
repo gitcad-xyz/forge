@@ -1292,6 +1292,221 @@ class RoundedBox:
         return []
 
 
+def _sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def _axis_seg_dist2(a, b):
+    """Exact squared distance between two AXIS-ALIGNED 2D segments (ℚ)."""
+    (ax0, ay0), (ax1, ay1) = a
+    (bx0, by0), (bx1, by1) = b
+    alox, ahix = min(ax0, ax1), max(ax0, ax1)
+    aloy, ahiy = min(ay0, ay1), max(ay0, ay1)
+    blox, bhix = min(bx0, bx1), max(bx0, bx1)
+    bloy, bhiy = min(by0, by1), max(by0, by1)
+    gx = max(F(0), blox - ahix, alox - bhix)
+    gy = max(F(0), bloy - ahiy, aloy - bhiy)
+    return gx * gx + gy * gy
+
+
+class FilletedPrism:
+    """A right prism over a RECTILINEAR simple polygon with EVERY edge
+    filleted at one radius r — exact in ℚ[π], with a π² term wherever the
+    profile has a REENTRANT corner.
+
+    Every edge is axis-aligned and right-angled, so each feature is the one
+    the rounded box already has — with one addition. A convex vertical edge
+    blends as a quarter-cylinder and its cap ends as sphere octants; a
+    REENTRANT vertical edge takes an INSIDE fillet: a quarter-cylinder of
+    ADDED material whose axis sits r along the void diagonal, and where that
+    concave blend meets each cap band the rolling ball's centre traces an arc
+    of radius 2r about the same axis — a quarter-swept TORUS patch (major 2r,
+    minor r). Its swept angle is the quarter the reentrant corner turns, so
+    the volume stays in ℚ[π] and picks up the π² term.
+
+    With δ(t) = r − √(r² − t²) the cap-band cross-section at depth t is the
+    polygon inset by δ, convex corners rounded at r−δ, reentrant corners
+    relieved at r+δ (the torus section), giving
+
+        V = (h−2r)·A_mid + 2·V_cap
+        A_mid = A₀ − (n_cv − n_rf)(1−π/4)r²
+        V_cap = A₀r − P·r²(1−π/4) + 4r³(5/3 − π/2)
+                − n_cv(1−π/4)·2r³/3 + n_rf(1−π/4)·r³(14/3 − π)
+
+    (∫δ = r²(1−π/4), ∫δ² = r³(5/3−π/2), ∫(r−δ)² = 2r³/3,
+    ∫(r+δ)² = r³(14/3−π), each over t ∈ [0, r]).
+
+    Verified before shipping, independently of this code: the L-profile
+    (30×10 + 10×20, h=8, r=1) gives 3752 + 178π/3 + π²/2 both by these slabs
+    and by the boolean decomposition (two rounded boxes + reentrant wedge),
+    whose pieces were pinned by Monte-Carlo membership written straight from
+    the rolling-ball definition — A∩B = 2134/3 + 43π/2 to ±0.009, wedge
+    (1−π/4)(46/3 − 2π) to ±0.001, whole solid to ±0.57 — and the T/H profiles
+    (two and four reentrant corners) to ±0.36 / ±0.16.
+
+    GUARDS (all exact, all refusals): the profile must be rectilinear, simple
+    and non-degenerate; every edge ≥ 2r (corner features consume r at each
+    end); h ≥ 2r; and every NON-ADJACENT edge pair ≥ 2r apart. That last is
+    the local-feature-size bound: every blend, corner square and reentrant
+    wedge lies within r of the boundary element that generates it, so
+    elements 2r apart cannot produce colliding features — an H whose crossbar
+    is thinner than 2r refuses here even though every edge is long enough.
+    """
+
+    def __init__(self, poly, z0, h, r) -> None:
+        self.r, self.z0, self.h = F(r), F(z0), F(h)
+        if self.r <= 0:
+            raise ValueError("fillet wants a positive radius")
+        if self.h < 2 * self.r:
+            raise ValueError("fillet radius exceeds half the prism height")
+        pts = [(F(x), F(y)) for x, y in poly]
+        if len(pts) < 4:
+            raise ValueError("a rectilinear profile has at least 4 vertices")
+        if len(set(pts)) != len(pts):
+            raise ValueError("repeated vertex in the profile")
+        area2 = sum(a[0] * b[1] - b[0] * a[1]
+                    for a, b in zip(pts, pts[1:] + pts[:1]))
+        if area2 == 0:
+            raise ValueError("degenerate (zero-area) profile")
+        if area2 < 0:                       # normalise to CCW
+            pts.reverse()
+            area2 = -area2
+        self.poly = tuple(pts)
+        self.area = area2 / 2
+        n = len(pts)
+        edges = []
+        self.perimeter = F(0)
+        for i in range(n):
+            (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % n]
+            dx, dy = x1 - x0, y1 - y0
+            if (dx == 0) == (dy == 0):
+                raise ValueError(
+                    "profile edge is not axis-aligned — a diagonal edge's "
+                    "blend needs the general engine (K5.2)")
+            length = abs(dx) + abs(dy)
+            if length < 2 * self.r:
+                raise ValueError(
+                    "profile edge shorter than 2r: its two corner blends "
+                    "would overlap (K5.2)")
+            self.perimeter += length
+            edges.append((pts[i], pts[(i + 1) % n]))
+        # vertex classification: diag is the INWARD diagonal at a convex
+        # corner and the VOID diagonal at a reentrant one; shift is how the
+        # vertex moves under a unit inward inset (sum of edge inward normals)
+        self.verts = []
+        for i in range(n):
+            pv, v, nx = pts[(i - 1) % n], pts[i], pts[(i + 1) % n]
+            e0 = (v[0] - pv[0], v[1] - pv[1])
+            e1 = (nx[0] - v[0], nx[1] - v[1])
+            cr = e0[0] * e1[1] - e0[1] * e1[0]
+            if cr == 0:
+                raise ValueError("consecutive collinear profile edges")
+            n0 = (-_sgn(e0[1]), _sgn(e0[0]))          # inward (left) normals
+            n1 = (-_sgn(e1[1]), _sgn(e1[0]))
+            diag = (n0[0] + n1[0], n0[1] + n1[1])
+            if cr > 0:
+                self.verts.append((v, True, diag))
+            else:
+                self.verts.append((v, False, (-diag[0], -diag[1])))
+        self.ncv = sum(1 for _, cv, _ in self.verts if cv)
+        self.nrf = n - self.ncv
+        # local feature size ≥ 2r between all non-adjacent edges. Exact, and
+        # it doubles as the simplicity guard (distance > 0 forbids crossings).
+        rr4 = 4 * self.r * self.r
+        for i in range(n):
+            for j in range(i + 1, n):
+                if j == i + 1 or (i == 0 and j == n - 1):
+                    continue
+                if _axis_seg_dist2(edges[i], edges[j]) < rr4:
+                    raise ValueError(
+                        "two profile edges closer than 2r: their blends "
+                        "would collide mid-wall (K5.2)")
+
+    def volume(self):
+        """Exact: PiVal when the profile is convex (a rectangle — Steiner),
+        PiPoly with the reentrant π² term otherwise."""
+        from forgekernel.polypi import PiPoly
+
+        r, h = self.r, self.h
+        k1 = PiPoly([Fraction(1), Fraction(-1, 4)])                       # 1 − π/4
+        r2, r3 = r * r, r * r * r
+        a_mid = k1 * (-(self.ncv - self.nrf) * r2) + self.area
+        v_cap = (PiPoly([self.area * r])
+                 + k1 * (-self.perimeter * r2)
+                 + PiPoly([Fraction(5, 3) * 4 * r3, Fraction(-1, 2) * 4 * r3])
+                 + k1 * (-self.ncv * Fraction(2, 3) * r3)
+                 + k1 * PiPoly([Fraction(14, 3), Fraction(-1)]) * (self.nrf * r3))
+        v = a_mid * (h - 2 * r) + v_cap * 2
+        if v.degree <= 1:
+            return PiVal(v[0], v[1])
+        return v
+
+    # -- float paths (display/meshing only, ADR-0019) -------------------------
+
+    def _slice_f(self, delta: float):
+        """(area, ∫x dA, ∫y dA) of the cross-section at inset δ — floats."""
+        shifts = [(d[0], d[1]) if cv else (-d[0], -d[1])
+                  for _, cv, d in self.verts]
+        pts = [(float(v[0]) + delta * s[0], float(v[1]) + delta * s[1])
+               for (v, _, _), s in zip(self.verts, shifts)]
+        a = mx = my = 0.0
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+            cr = x0 * y1 - x1 * y0
+            a += cr
+            mx += (x0 + x1) * cr
+            my += (y0 + y1) * cr
+        a, mx, my = a / 2, mx / 6, my / 6
+        r = float(self.r)
+        k = 1 - math.pi / 4
+        xi = (5 / 6 - math.pi / 4) / k        # corner-region centroid ratio
+        for v, cv, d in self.verts:
+            vx, vy = float(v[0]), float(v[1])
+            if cv:
+                rho = r - delta
+                ar = k * rho * rho
+                cx = vx + (delta + xi * rho) * d[0]
+                cy = vy + (delta + xi * rho) * d[1]
+                a -= ar
+                mx -= ar * cx
+                my -= ar * cy
+            else:
+                rho = r + delta
+                ar = k * rho * rho
+                cx = vx + (xi * rho - delta) * d[0]
+                cy = vy + (xi * rho - delta) * d[1]
+                a += ar
+                mx += ar * cx
+                my += ar * cy
+        return a, mx, my
+
+    def centroid_f(self) -> tuple:
+        r, h = float(self.r), float(self.h)
+        a0, mx0, my0 = self._slice_f(0.0)
+        acc = [(h - 2 * r) * a0, (h - 2 * r) * mx0, (h - 2 * r) * my0]
+        # cap bands via t = r·sin(u): the integrand becomes smooth, so
+        # Simpson converges to machine precision (display only, ADR-0019)
+        n = 512
+        step = (math.pi / 2) / n
+        for i in range(n + 1):
+            u = step * i
+            w = 1.0 if i in (0, n) else (4.0 if i % 2 else 2.0)
+            aa, mx, my = self._slice_f(r * (1 - math.cos(u)))
+            jac = w * r * math.cos(u)
+            acc[0] += 2 * aa * jac * step / 3
+            acc[1] += 2 * mx * jac * step / 3
+            acc[2] += 2 * my * jac * step / 3
+        return (acc[1] / acc[0], acc[2] / acc[0], float(self.z0) + h / 2)
+
+    def bbox(self):
+        xs = [float(x) for x, _ in self.poly]
+        ys = [float(y) for _, y in self.poly]
+        return ((min(xs), min(ys), float(self.z0)),
+                (max(xs), max(ys), float(self.z0 + self.h)))
+
+    def watertight_violations(self) -> list:
+        return []
+
+
 class MiteredSweep:
     """A convex profile swept along a polyline with miter joints — exact
     in ℚ[√d]. Volume = profile_area × centerline_length: at a miter the
