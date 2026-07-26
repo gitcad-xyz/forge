@@ -127,8 +127,23 @@ class PiPoly:
 
     @classmethod
     def from_pival(cls, v) -> "PiPoly":
-        """Lift the legacy ``a + bπ`` representation."""
-        return cls([F(v.a), F(v.b)])
+        """Lift the legacy ``a + bπ`` representation.
+
+        The coefficients go through ``_coef`` (via ``__init__``), NOT through
+        the stdlib ``Fraction``. That distinction is the whole bug: ``PiVal``'s
+        own constructor uses the widened ``exact.F``, so since #122 a ``PiVal``
+        can legitimately carry a ℚ[√d] coefficient — a napkin ring's volume is
+        ``(140/3)√35·π``. Forcing it back through ``Fraction`` raised
+        "argument should be a string or a Rational instance", and because
+        ``PiVal._cmp`` swallows ``TypeError`` that surfaced not as an error but
+        as ``NotImplemented``: ``volume(body) <= 0`` in the answer audit became
+        an unorderable-types ``TypeError`` and the audit could not check the
+        one thing it exists to check.
+
+        ``_coef`` admits ℚ and ℚ[√d] and still REFUSES a non-integral float, so
+        this widens the field without opening the door ADR-0019 closes.
+        """
+        return cls([v.a, v.b])
 
     # -- ring -----------------------------------------------------------------
 
