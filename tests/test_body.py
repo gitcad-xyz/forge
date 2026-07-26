@@ -880,7 +880,7 @@ def test_an_arc_off_a_quarter_turn_refuses() -> None:
     from fractions import Fraction as Q
 
     c = B.Circle((Q(0), Q(0), Q(0)), (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(5))
-    with pytest.raises(ValueError, match="quarter turn"):
+    with pytest.raises(ValueError, match="twelfth turn"):
         B._arc_quarters(c, (Q(5), Q(0), Q(0)), (Q(3), Q(4), Q(0)))
 
 
@@ -944,7 +944,7 @@ def test_trimmed_faces_report_their_own_area_not_a_whole_turns() -> None:
     # rounded box is a point strictly inside the solid)
     for e in arcs:
         d = math.dist(e["centroid"], [0, 0, 0])
-        assert e["sweep_quarters"] == 1
+        assert e["sweep_twelfths"] == 3     # a quarter, in twelfths
 
 
 def test_a_rim_split_into_quarter_arcs_is_still_a_whole_cylinder() -> None:
@@ -1127,6 +1127,10 @@ def test_a_clockwise_lathe_arc_refuses_rather_than_reading_three_quarters() -> N
 
 
 def test_a_lathe_arc_off_a_quarter_turn_refuses_by_name() -> None:
+    """Still QUARTERS here, deliberately. A revolved arc sweeps a TORUS whose
+    sector is a property of the surface — set by the fillet profile, never read
+    off an edge — so it did not move to twelfths with the trimmed bands, and
+    `_fillet_profile` only ever emits quarter arcs anyway."""
     segs = [("arc", (F(0), F(0)), (F(5), F(0)), (F(3), F(4)))]
     with pytest.raises(ValueError, match="quarter turn"):
         B.lathe_body(segs, F(0), F(0))
@@ -1305,3 +1309,93 @@ def test_a_rounded_box_meshes_the_same_however_it_is_turned(deg, deflection):
     # and it converges to the exact volume from inside
     exact = float(B.volume(body))
     assert 0 < mesh_volume(mesh) <= exact * (1 + 1e-12)
+
+
+# --- trimmed quadrics at TWELFTHS (30° steps), not just quarters -------------
+
+def _wedge_face(k_twelfths, px=0, r=2, h=5):
+    """A cylinder band sweeping k twelfths of a turn from the +x reference."""
+    up, dn = (F(0), F(0), F(1)), (F(0), F(0), F(-1))
+    rf = (F(1), F(0), F(0))
+    cyl = B.Cylinder((F(px), F(0), F(0)), up, F(r))
+    c0 = B.Circle((F(px), F(0), F(0)), up, rf, F(r))
+    c1 = B.Circle((F(px), F(0), F(h)), dn, rf, F(r))
+    d0, dk = B._twelfth_dir(c0, 0), B._twelfth_dir(c0, k_twelfths)
+    a = tuple(c0.c[i] + F(r) * d0[i] for i in range(3))
+    b = tuple(c0.c[i] + F(r) * dk[i] for i in range(3))
+    at, bt = (a[0], a[1], F(h)), (b[0], b[1], F(h))
+    ln = lambda p, q: B.Edge(B.Line(p, tuple(q[i] - p[i] for i in range(3))), p, q)
+    lp = B.Loop((B.Edge(c0, a, b), ln(b, bt), B.Edge(c1, bt, at), ln(at, a)))
+    return B.Face(cyl, (lp,), True)
+
+
+# 12 is deliberately absent: a full turn CLOSES the loop, so it is the
+# untrimmed case and _band_arc rightly reports no arcs at all
+TWELFTHS = [1, 2, 3, 4, 5, 6, 8, 9, 11]
+
+
+@pytest.mark.parametrize("k", TWELFTHS)
+def test_a_band_can_be_trimmed_to_any_thirty_degree_step(k) -> None:
+    """Quarters needed only sin/cos ∈ {0, ±1}; twelfths additionally need ±1/2
+    and ±√3/2, which live in ℚ[√3]. A hexagonal boss's blends and a 30° sector
+    land on this grid, and none of them were expressible before."""
+    face = _wedge_face(k)
+    span, _v = B._band_sweep(B._band_arc(face), face.surface)
+    assert span == k, "span is measured in twelfths of a turn"
+    # centred on the axis the offset term vanishes, leaving r²·h·Δθ/3
+    assert float(B._face_volume_term(face)) == pytest.approx(
+        4 * 5 * (k * math.pi / 6) / 3)
+
+
+def test_an_odd_twelfth_puts_a_surd_in_the_volume_and_it_stays_exact() -> None:
+    """THE case the field extension was for. Off-axis, the p·∫n̂dθ term does not
+    vanish, and at 60° it carries √3/2 — so the answer leaves ℚ[π] while
+    staying perfectly exact in ℚ[√3][π].
+
+    By hand: r·h·(p·∫n̂dθ + r·Δθ)/3 with r=2, h=5, p=(7,0,0), Δθ=π/3.
+    ∫n̂dθ = (√3/2)u + (1/2)w, so p·∫n̂dθ = 7√3/2 and the term is
+    35√3/3 + 20π/9.
+    """
+    from forgekernel.polypi import PiPoly
+    from forgekernel.surd import SurdVal
+
+    term = B._face_volume_term(_wedge_face(2, px=7))
+    assert isinstance(term, PiPoly)
+    assert term == PiPoly([SurdVal(0, F(35, 3), 3), F(20, 9)])
+    assert float(term) == pytest.approx(35 * math.sqrt(3) / 3 + 20 * math.pi / 9)
+
+
+def test_a_quarter_still_lands_in_the_smaller_field() -> None:
+    """Every existing answer must be byte-identical: at a quarter the sines are
+    0 and ±1, so the term is a PiVal exactly as before, not a PiPoly that
+    merely equals one."""
+    from forgekernel.quadric import PiVal
+
+    for k in (3, 6, 9, 12):
+        assert isinstance(B._face_volume_term(_wedge_face(k, px=7)), PiVal)
+
+
+def test_an_arc_off_a_twelfth_still_refuses() -> None:
+    """The predicate still decides exact-or-refuse — it just says yes three
+    times as often. A 45° endpoint is not on the grid."""
+    import math as _m
+
+    c = B.Circle((F(0), F(0), F(0)), (F(0), F(0), F(1)), (F(1), F(0), F(0)), F(2))
+    assert B._quarter_index(c, (F(2), F(0), F(0))) == 0
+    assert B._quarter_index(c, (F(1), F(0), F(0))) is None      # not on the rim
+    # (√2, √2) is 45°, exactly between two twelfths
+    from forgekernel.surd import SurdVal
+
+    root2 = SurdVal(0, 1, 2)
+    assert B._quarter_index(c, (root2, root2, F(0))) is None
+
+
+def test_a_thirty_degree_band_refuses_to_MESH_and_says_why() -> None:
+    """The exact arithmetic reaches twelfths; the display mesh cannot follow,
+    and the reason is structural rather than unfinished — a corner octant is
+    subdivided dyadically, giving 2^d points per QUARTER, and no power of two
+    divides into thirds. Emitting a torn shell would be the wrong answer, so it
+    says so."""
+    face = _wedge_face(1)
+    with pytest.raises(ValueError, match="twelfths of a turn"):
+        B.tessellate(B.Body((face,)), 0.2)

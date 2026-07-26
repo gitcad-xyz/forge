@@ -374,39 +374,82 @@ def _quarter_depth(r: float, deflection: float) -> int:
     return d
 
 
-def _quarter_index(c: Circle, p):
-    """Which quarter turn from `ref` the point sits at (0..3), or None.
+def _sin_cos_twelfths():
+    """(cos, sin) at every θ = k·π/6, exactly.
 
-    Trimmed quadrics stay in ℚ[π] only at right angles, where sin and cos are
-    0 and ±1. Anywhere else the band's ∫n̂ dθ term is a transcendental that
-    leaves the field, so this is the predicate that decides exact-or-refuse.
+    Quarters need only 0 and ±1; twelfths additionally need ±1/2 and ±√3/2,
+    which live in ℚ[√3]. That is why the unit here is a TWELFTH and not a
+    quarter: a hexagonal boss's blends, a 30° trimmed band and a 60° lune all
+    land on this grid, and the volume they produce stays exact because ℚ[√3][π]
+    holds it (the π coefficient picks up the √3, which is precisely what the
+    field extension was for).
+    """
+    from forgekernel.surd import SurdVal
+
+    h = Fraction(1, 2)
+    r3 = SurdVal(0, Fraction(1, 2), 3)          # √3/2
+    return ((1, 0), (r3, h), (h, r3), (0, 1), (-h, r3), (-r3, h),
+            (-1, 0), (-r3, -h), (-h, -r3), (0, -1), (h, -r3), (r3, -h))
+
+
+def _twelfth_dir(c: Circle, k: int, frame=None):
+    """The unit direction at k·π/6 in the circle's own frame, or None when it
+    is not REPRESENTABLE.
+
+    Computed one k at a time, and that matters: an exactly-rotated body carries
+    ℚ[√2] coordinates, and multiplying those by the √3/2 of an odd twelfth is a
+    mixed radical that ℚ[√d] cannot hold (K3.1). Building all twelve eagerly
+    therefore threw on bodies that only ever needed the four rational ones. A
+    direction that cannot be expressed is simply not a candidate.
+    """
+    u, w = frame if frame is not None else _circle_frame(c)
+    co, si = _sin_cos_twelfths()[k % 12]
+    try:
+        return tuple(co * u[i] + si * w[i] for i in range(3))
+    except ValueError:
+        return None                 # mixed radicals: not representable, so not here
+
+
+def _quarter_index(c: Circle, p):
+    """Which TWELFTH turn from `ref` the point sits at (0..11), or None.
+
+    Trimmed quadrics stay in an exact field only where sin and cos are exact.
+    At quarters those are 0 and ±1 (ℚ); at twelfths they are additionally ±1/2
+    and ±√3/2 (ℚ[√3]). Anywhere else the band's ∫n̂ dθ term is a transcendental
+    that leaves every field the kernel has, so this is still the predicate that
+    decides exact-or-refuse — it just decides YES three times as often.
+
+    The name is kept because the unit is the only thing that changed; a quarter
+    is now index 3.
     """
     if c.r == 0:
         return None                 # a degenerate circle has no quarters
-    u, w = _circle_frame(c)
     rel = sub(p, c.c)
-    for k, v in enumerate((u, w, tuple(-x for x in u), tuple(-x for x in w))):
-        if rel == tuple(c.r * x for x in v):
+    frame = _circle_frame(c)
+    for k in range(12):
+        v = _twelfth_dir(c, k, frame)
+        if v is not None and rel == tuple(c.r * x for x in v):
             return k
     return None
 
 
 def _arc_quarters(c: Circle, v0, v1):
-    """(start index, number of quarter turns) for an arc, counter-clockwise
-    about the circle's normal. A closed edge is the whole four."""
+    """(start index, span) for an arc in TWELFTHS of a turn, counter-clockwise
+    about the circle's normal. A closed edge is the whole twelve."""
     k0, k1 = _quarter_index(c, v0), _quarter_index(c, v1)
     if k0 is None or k1 is None:
         raise ValueError(
-            "arc endpoint is not at a quarter turn — a trimmed quadric is "
-            "exact only at right angles (K3.7)")
-    span = (k1 - k0) % 4
-    return k0, (4 if span == 0 else span)
+            "arc endpoint is not at a twelfth turn — a trimmed quadric is "
+            "exact only at multiples of 30° (K3.7)")
+    span = (k1 - k0) % 12
+    return k0, (12 if span == 0 else span)
 
 
 def _quarter_antiderivative(c: Circle, k: int):
-    """∫n̂ dθ evaluated at θ = k·π/2, i.e. sin(θ)u − cos(θ)w. Rational."""
+    """∫n̂ dθ at θ = k·π/6, i.e. sin(θ)u − cos(θ)w. In ℚ, or ℚ[√3] off the
+    quarters."""
     u, w = _circle_frame(c)
-    sin_, cos_ = ((0, 1), (1, 0), (0, -1), (-1, 0))[k % 4]
+    cos_, sin_ = _sin_cos_twelfths()[k % 12]
     return tuple(sin_ * u[i] - cos_ * w[i] for i in range(3))
 
 
@@ -461,6 +504,32 @@ def _exact(x, what: str) -> Fraction:
             f"{what} volume term left ℚ[π] ({x!r}) — a bigger number field "
             "arrives with K3.7")
     return f
+
+
+def _pi_value(rat, pi, what: str):
+    """A volume term ``rat + pi·π``, in the smallest field that holds it.
+
+    Returns a ``PiVal`` when both parts are rational — which keeps every
+    existing answer byte-identical — and a ``PiPoly`` over ℚ[√d] when a part
+    genuinely carries a surd. A trimmed band ending on a twelfth rather than a
+    quarter is exactly that case: sin and cos bring in √3/2, so the π
+    coefficient leaves ℚ while staying perfectly exact.
+
+    Refusing here (which is what ``_exact`` alone did) would mean the arithmetic
+    could represent the answer and the plumbing threw it away.
+    """
+    from forgekernel.polypi import PiPoly
+    from forgekernel.quadric import PiVal
+
+    fr, fp = _as_fraction(rat), _as_fraction(pi)
+    if fr is not None and fp is not None:
+        return PiVal(fr, fp)
+    for part, name in ((rat, "offset"), (pi, "sweep")):
+        if _as_fraction(part) is None and not hasattr(part, "d"):
+            raise ValueError(
+                f"{what} {name} volume term left ℚ[√d][π] ({part!r}) — a "
+                "bigger number field arrives with K3.1")
+    return PiPoly([rat, pi])
 
 
 def _rational_sqrt(x):
@@ -551,9 +620,8 @@ def _face_volume_term(face: Face):
             return PiVal(0, _exact(sgn * 2 * s.r * s.r * h / 3, "cylinder band"))
         span, vint = _band_sweep(arcs, s)
         rat = sgn * s.r * h * dot(s.p, vint) / 3
-        pi = sgn * s.r * h * s.r * Fraction(span, 2) / 3          # Δθ = span·π/2
-        return PiVal(_exact(rat, "trimmed band offset"),
-                     _exact(pi, "trimmed band sweep"))
+        pi = sgn * s.r * h * s.r * Fraction(span, 6) / 3          # Δθ = span·π/6
+        return _pi_value(rat, pi, "trimmed band")
     if isinstance(s, SphereS):
         # x·n̂ = r + c·n̂. Over the whole sphere ∮c·n̂ dA = 0, leaving
         # (1/3)r·4πr². Over one OCTANT neither term vanishes: the area is
@@ -664,11 +732,15 @@ def _cone_rims(face: Face, cone: Cone):
 
 
 def _quarter_ends(c: Circle, k0: int, span: int):
-    """The two endpoints of the arc starting at quarter k0 and sweeping span."""
-    u, w = _circle_frame(c)
-    dirs = (u, w, tuple(-x for x in u), tuple(-x for x in w))
-    return (tuple(c.c[i] + c.r * dirs[k0 % 4][i] for i in range(3)),
-            tuple(c.c[i] + c.r * dirs[(k0 + span) % 4][i] for i in range(3)))
+    """The two endpoints of the arc starting at twelfth k0 and sweeping span."""
+    frame = _circle_frame(c)
+    a, b = _twelfth_dir(c, k0, frame), _twelfth_dir(c, k0 + span, frame)
+    if a is None or b is None:
+        raise ValueError(
+            "an arc endpoint at an odd twelfth of a rotated circle needs "
+            "ℚ[√2, √3] — a bigger field arrives at K3.1")
+    return (tuple(c.c[i] + c.r * a[i] for i in range(3)),
+            tuple(c.c[i] + c.r * b[i] for i in range(3)))
 
 
 def _band_sweep(arcs, cyl: Cylinder):
@@ -696,7 +768,7 @@ def _band_sweep(arcs, cyl: Cylinder):
         v = sub(_quarter_antiderivative(circ, k0 + span),
                 _quarter_antiderivative(circ, k0))
         vint = tuple(vint[i] + v[i] for i in range(3))
-    if total > 4:
+    if total > 12:
         raise ValueError("a rim sweeping more than a full turn (K3.7)")
     if back and sum(sp for _c, _k, sp in back) != total:
         raise ValueError(
@@ -875,13 +947,18 @@ def centroid(body: Body):
                 # ∫n̂dθ nor ∫n̂(n̂·p)dθ vanishes. Both are rational at quarter
                 # turns: ∫cos² = ∫sin² = Δθ/2 and ∫cos·sin = (sin²θ1−sin²θ0)/2.
                 span, vint = _band_sweep(arcs, s)
-                A = span * math.pi / 2
+                A = span * math.pi / 6                  # Δθ = span·π/6
                 vn = tuple(float(x) for x in vint)
                 circ, k0, _sp = min(
                     (x for x in arcs if dot(x[0].n, s.d) > 0), key=lambda x: x[1])
                 u, w = (tuple(float(x) for x in v)
                         for v in _circle_frame(circ))
-                sq = lambda kk: (0.0, 1.0, 0.0, 1.0)[kk % 4]
+                # sin²(k·π/6), for ∫cos·sin dθ = (sin²θ₁ − sin²θ₀)/2. At
+                # quarters this was (0, 1, 0, 1); the twelfths in between are
+                # 1/4 and 3/4, and leaving them out put a rounded box's centre
+                # of mass 2.09 mm from its own centre.
+                sq = lambda kk: (0.0, .25, .75, 1.0, .75, .25,
+                                 0.0, .25, .75, 1.0, .75, .25)[kk % 12]
                 S = (sq(k0 + span) - sq(k0)) / 2
                 pu = sum(mid[i] * u[i] for i in range(3))
                 pw = sum(mid[i] * w[i] for i in range(3))
@@ -1212,14 +1289,30 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             # depth-d octant subdivision gives 2^d uniform steps per quarter —
             # match the band to that or the shell tears along every seam.
             per = 2 ** _quarter_depth(rr, deflection)
-            nseg = per * span
+            if span % 3:
+                # The exact arithmetic reaches twelfths (30° steps); the MESH
+                # cannot follow yet, and the reason is structural rather than
+                # unfinished. A corner octant is subdivided dyadically, giving
+                # 2^d points per QUARTER, and no power of two divides into
+                # thirds — so a 30° band and the octant beside it have no
+                # common grid and the shell would tear along every seam.
+                # Sampling the octant non-dyadically is the fix; until then say
+                # so rather than emit a torn mesh (K3.7).
+                raise ValueError(
+                    f"a band spanning {span} twelfths of a turn cannot share a "
+                    "mesh grid with dyadic corner octants — 30° trims are "
+                    "exact but not yet meshable (K3.7)")
+            nseg = per * (span // 3)
             axis = _unit(tuple(float(x) for x in s.d))
             ends = sorted({sum((float(c.c[t]) - float(s.p[t])) * axis[t]
                                 for t in range(3))
                            for c, _k, _sp in arcs})
             base = tuple(float(x) for x in s.p)
             def at(tt, ang):
-                th = (k0 + ang) * math.pi / 2
+                # k0 and ang are both in TWELFTHS of a turn, so the step is
+                # π/6. It was π/2 while the unit was quarters, and leaving it
+                # behind put every band a factor of three round the cylinder.
+                th = (k0 + ang) * math.pi / 6
                 return tuple(base[t] + tt * axis[t]
                              + rr * (math.cos(th) * u[t] + math.sin(th) * w[t])
                              for t in range(3))
@@ -1432,8 +1525,9 @@ def edges_info(body: Body) -> list[dict]:
                     if key in seen:
                         continue
                     seen.add(key)
-                    span = 4 if whole else _arc_quarters(c, e.v0, e.v1)[1]
-                    frac = span / 4
+                    # spans are TWELFTHS of a turn now (a quarter is 3)
+                    span = 12 if whole else _arc_quarters(c, e.v0, e.v1)[1]
+                    frac = span / 12
                     if whole:
                         cen = [float(x) for x in c.c]
                     else:
@@ -1447,7 +1541,7 @@ def edges_info(body: Body) -> list[dict]:
                     out.append({"curve": "circle", "radius": float(c.r),
                                 "centroid": cen,
                                 "length": 2 * math.pi * float(c.r) * frac,
-                                "sweep_quarters": span,
+                                "sweep_twelfths": span,
                                 "axis": list(axis)})
                 else:
                     a = tuple(float(x) for x in e.v0)
@@ -1522,7 +1616,7 @@ def faces_info(body: Body) -> list[dict]:
             axis = _unit(tuple(float(x) for x in s.d))
             base = tuple(float(x) for x in s.p)
             arcs = _band_arc(f)
-            span = 4 if arcs is None else _band_sweep(arcs, s)[0]
+            span = 12 if arcs is None else _band_sweep(arcs, s)[0]
             mid = [base[i] + axis[i] * h / 2 for i in range(3)]
             if arcs is not None:
                 # a TRIMMED band's surface centroid is out on the swept sector,
@@ -1537,8 +1631,8 @@ def faces_info(body: Body) -> list[dict]:
                 mid = [bar[i] - axis[i] * off + axis[i] * (h / 2) for i in range(3)]
             out.append({"surface": "cylinder", "radius": float(s.r),
                         "axis_dir": list(axis), "axis_origin": list(base),
-                        "area": 2 * math.pi * float(s.r) * h * span / 4,
-                        "sweep_quarters": span,
+                        "area": 2 * math.pi * float(s.r) * h * span / 12,
+                        "sweep_twelfths": span,
                         "centroid": mid})
         elif isinstance(s, SphereS):
             oct_ = _sphere_octant(f)
@@ -1583,7 +1677,7 @@ def faces_info(body: Body) -> list[dict]:
             dsin = sin_(k0 + span) - sin_(k0)
             out.append({"surface": "torus", "major_radius": RR,
                         "minor_radius": aa, "axis_dir": ax, "centre": cc,
-                        "sweep_quarters": span,
+                        "sweep_twelfths": span,
                         "area": 2 * math.pi * aa * (RR * dphi + aa * dsin),
                         "centroid": cc})
         else:
