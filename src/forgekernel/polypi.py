@@ -66,6 +66,8 @@ def _coef_bounds(x, digits: int) -> tuple[F, F]:
     """
     if isinstance(x, F):
         return x, x
+    if hasattr(x, "bounds"):                     # BiSurd (and any wider field)
+        return x.bounds(digits)                  # provides its own proven hook
     if getattr(x, "b", 0) == 0:
         return F(x.a), F(x.a)
     lo, hi = _sqrt_bounds(x.d, digits)
@@ -83,6 +85,12 @@ def _coef(x):
         return F(int(x))
     if isinstance(x, (int, F)):
         return F(x)
+    if hasattr(x, "demote"):                     # BiSurd: a + b√p + c√q + e√pq
+        x = x.demote()                           # smallest field that holds it
+        if isinstance(x, F):
+            return x
+        if not hasattr(x, "d"):
+            return x                             # a genuinely biquadratic value
     if hasattr(x, "a") and hasattr(x, "d"):      # SurdVal: a + b√d
         return F(x.a) if x.b == 0 else x         # collapse a pure rational
     raise ValueError(f"{type(x).__name__} is not an exact coefficient for ℚ[π]")
@@ -106,7 +114,8 @@ class PiPoly:
     __slots__ = ("c",)
 
     def __init__(self, coeffs) -> None:
-        if isinstance(coeffs, (int, F)) or hasattr(coeffs, "d"):
+        if (isinstance(coeffs, (int, F)) or hasattr(coeffs, "d")
+                or getattr(coeffs, "is_exact_scalar", False)):
             coeffs = [coeffs]
         c = [_coef(x) for x in coeffs]
         while len(c) > 1 and c[-1] == 0:

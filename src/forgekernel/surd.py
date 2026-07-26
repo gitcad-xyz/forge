@@ -69,8 +69,19 @@ class SurdVal:
         self.a, self.b = F(a), F(b)
         self.d = 1 if self.b == 0 else int(d)
 
-    def _co(self, o: "SurdVal | int | Fraction") -> "SurdVal":
-        return o if isinstance(o, SurdVal) else SurdVal(o, 0, 1)
+    def _co(self, o: "SurdVal | int | Fraction"):
+        """Coerce a plain number, or DEFER. Wrapping ``SurdVal(o, 0, 1)``
+        around ANY object silently nested wider exact types (a ``BiSurd``, a
+        ``PiVal``) inside the rational slot — ``F()`` passes exact scalars
+        through, so ``self.a`` became a non-Fraction and every predicate
+        downstream lied. Returning ``NotImplemented`` instead lets Python
+        reflect to the wider type's own arithmetic, which knows how to hold a
+        ``SurdVal`` — or raises an honest ``TypeError`` when nothing does."""
+        if isinstance(o, SurdVal):
+            return o
+        if isinstance(o, (int, float, Fraction)):
+            return SurdVal(o, 0, 1)
+        return NotImplemented
 
     def _radical(self, o: "SurdVal") -> int:
         if self.b == 0:
@@ -85,19 +96,26 @@ class SurdVal:
 
     def __add__(self, o) -> "SurdVal":
         o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         return SurdVal(self.a + o.a, self.b + o.b, self._radical(o))
 
     __radd__ = __add__
 
     def __sub__(self, o) -> "SurdVal":
         o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         return SurdVal(self.a - o.a, self.b - o.b, self._radical(o))
 
     def __rsub__(self, o) -> "SurdVal":     # o − self, for rational/int on the left
-        return self._co(o) - self
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else o - self
 
     def __mul__(self, o) -> "SurdVal":
         o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         if self.b == 0 or o.b == 0:
             d = self._radical(o)
             return SurdVal(self.a * o.a, self.a * o.b + self.b * o.a, d)
@@ -128,6 +146,8 @@ class SurdVal:
             r = F(o)
             return SurdVal(self.a / r, self.b / r, self.d)
         o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         if o.b == 0:                             # divide by a rational
             return SurdVal(self.a / o.a, self.b / o.a, self.d)
         # divide by (c+e√d) via the conjugate: ·(c−e√d)/(c²−e²d)
@@ -136,7 +156,8 @@ class SurdVal:
         return SurdVal(num.a / denom, num.b / denom, num.d)
 
     def __rtruediv__(self, o) -> "SurdVal":
-        return self._co(o) / self
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else o / self
 
     def _sign(self) -> int:
         """Exact sign of a + b√d (d ≥ 1, √d > 0) — decides comparisons."""
@@ -155,19 +176,25 @@ class SurdVal:
         return sa if da > db else sb
 
     def __lt__(self, o) -> bool:
-        return (self - self._co(o))._sign() < 0
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else (self - o)._sign() < 0
 
     def __le__(self, o) -> bool:
-        return (self - self._co(o))._sign() <= 0
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else (self - o)._sign() <= 0
 
     def __gt__(self, o) -> bool:
-        return (self - self._co(o))._sign() > 0
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else (self - o)._sign() > 0
 
     def __ge__(self, o) -> bool:
-        return (self - self._co(o))._sign() >= 0
+        o = self._co(o)
+        return NotImplemented if o is NotImplemented else (self - o)._sign() >= 0
 
     def __eq__(self, o: object) -> bool:
         o = self._co(o)
+        if o is NotImplemented:
+            return NotImplemented
         if self.b == 0 and o.b == 0:
             return self.a == o.a
         return self.a == o.a and self.b == o.b and self.d == o.d

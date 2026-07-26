@@ -1507,6 +1507,115 @@ class FilletedPrism:
         return []
 
 
+class FilletedChamferedBox:
+    """``chamfer(box, d)`` with EVERY edge blended at one radius r — exact in
+    ℚ(√2,√3)[π], the biquadratic field (BiSurd's first consumer).
+
+    The solid is convex, so ``fillet(all, r)`` is the OPENING ``P₋ᵣ ⊕ B_r``:
+    the union of every r-ball inside the chamfered box. Eroding offsets each
+    face plane inward by r; the √2-normal chamfer planes move their constant
+    by r√2, so ``P₋ᵣ`` is the chamfered box of dims (A−2r, B−2r, C−2r) with
+    setback ``t' = d − (2−√2)r`` — combinatorics preserved exactly when
+    t' > 0 and every axis facet stays nonempty. Steiner then gives
+
+        V = V(P₋ᵣ) + S(P₋ᵣ)·r + (r²/2)·Σ L_e·α_e + (4π/3)r³
+
+    with α = π/4 on the 24 axis–chamfer edges (dihedral 3π/4) and α = π/3 on
+    the 24 chamfer–chamfer edges (cos(dihedral) = −1/2 EXACTLY, so 2π/3 by
+    Niven — verified on the solid, not assumed). Where each surd comes from:
+    √2 rides in on t'; √3 enters as the ch-ch edge length (√3/2)t' times its
+    π/3 sweep, surfacing as 2√6·π for the probe cell. Probe (20³, d=2, r=1):
+
+        V = 8040 − 456√2 + (166/3 − 6√2 + 2√6)π = 7557.6867093895…
+
+    qhull-checked pieces (≤1e-12) and MC membership at three seeds — the
+    record lives in tests/golden/test_fillet_chamfered_box.py (gitcad).
+
+    THE TRAP, banked from the derivation: the 32 corner patches are
+    individually TRANSCENDENTAL over ℚ[√d][π] — type A carries arccos(1/3),
+    type B arccos(1/√3), and neither is a rational multiple of π. They cancel
+    only in aggregate (8Ω_A + 24Ω_B = 4π, a convex body's patches sum to one
+    ball). So the volume MUST be assembled by this Steiner/opening
+    decomposition; a per-corner-patch accumulation cannot stay in the field.
+
+    GUARDS (all exact, all refusals):
+
+    * ``d > 0``, ``r > 0``, ``2d < min(A,B,C)`` — the base chamfered box must
+      itself be valid;
+    * ``t' = d − (2−√2)r > 0`` — otherwise the ball BRIDGES the chamfer facet
+      (the eroded polytope loses it) and adjacent edge blends collide; the
+      kernel refuses collision regimes rather than switching semantics (the
+      FilletedPrism precedent). With rational d, r the boundary t' = 0 is
+      unreachable (it would force r = 0), so `>` vs `≥` costs nothing;
+    * ``X − 2d − (2√2−2)r > 0`` per axis — the eroded axis facet stays
+      nonempty; equally unreachable at equality for rational inputs.
+    """
+
+    def __init__(self, lo, dims, d, r) -> None:
+        from forgekernel.surd import SurdVal
+
+        self.lo = tuple(F(v) for v in lo)
+        self.dims = tuple(F(v) for v in dims)
+        self.d, self.r = F(d), F(r)
+        if any(v <= 0 for v in self.dims):
+            raise ValueError("chamfered box wants positive dimensions")
+        if self.d <= 0:
+            raise ValueError("chamfered box wants a positive setback")
+        if self.r <= 0:
+            raise ValueError("fillet wants a positive radius")
+        if 2 * self.d >= min(self.dims):
+            raise ValueError(
+                "chamfer setback consumes a whole face (2d ≥ min dimension)")
+        tp = SurdVal(self.d - 2 * self.r, self.r, 2)     # t' = d − (2−√2)r
+        if tp._sign() <= 0:
+            raise ValueError(
+                "fillet(chamfered box): the ball bridges the chamfer facet — "
+                "d ≤ (2−√2)r erodes it away and the three edge blends at each "
+                "corner collide (K5.2)")
+        for x in self.dims:
+            # eroded axis facet nonempty: X' − 2t' = X − 2d + (2 − 2√2)r > 0
+            if SurdVal(x - 2 * self.d + 2 * self.r, -2 * self.r, 2)._sign() <= 0:
+                raise ValueError(
+                    "fillet(chamfered box): blends from opposite edges meet "
+                    "across the face — needs X − 2d − (2√2−2)r > 0 on every "
+                    "axis (K5.2)")
+
+    def volume(self):
+        """Exact ℚ(√2,√3)[π], by the Steiner/opening decomposition ONLY (see
+        the class docstring for why per-corner patches are forbidden)."""
+        from forgekernel.bisurd import BiSurd
+        from forgekernel.polypi import PiPoly
+
+        r = self.r
+        ea, eb, ec = (x - 2 * r for x in self.dims)      # eroded dims, rational
+        s = ea + eb + ec
+        t = BiSurd(self.d - 2 * r, r, 0, 0, 2, 3)        # t' = (d−2r) + r√2
+        sqrt2 = BiSurd(0, 1, 0, 0, 2, 3)
+        sqrt3 = BiSurd(0, 0, 1, 0, 2, 3)
+        # V(P₋ᵣ): chamfered box of dims (ea, eb, ec), setback t'
+        v0 = ea * eb * ec - 2 * t * t * s + 6 * t * t * t
+        # S(P₋ᵣ): 6 axis rectangles + 12 chamfer hexagons √2(ℓt' − (3/2)t'²)
+        s0 = (2 * ((ea - 2 * t) * (eb - 2 * t) + (eb - 2 * t) * (ec - 2 * t)
+                   + (ea - 2 * t) * (ec - 2 * t))
+              + 4 * sqrt2 * t * s - 18 * sqrt2 * t * t)
+        # edge term (r²/2)ΣLα: 8 axis–chamfer edges per axis, length X'−2t',
+        # α = π/4; 24 chamfer–chamfer edges, length (√3/2)t', α = π/3
+        pi1 = (r * r * (s - 6 * t) + 2 * sqrt3 * r * r * t
+               + Fraction(4, 3) * r * r * r)             # + one full ball
+        return PiPoly([v0 + s0 * r, pi1])
+
+    def centroid_f(self) -> tuple:
+        # the solid is centrally symmetric about the box centre — exact
+        return tuple(float(self.lo[i] + self.dims[i] / 2) for i in range(3))
+
+    def bbox(self):
+        # the blend spheres touch the original box faces: erode r, dilate r
+        return (self.lo, tuple(self.lo[i] + self.dims[i] for i in range(3)))
+
+    def watertight_violations(self) -> list:
+        return []
+
+
 class MiteredSweep:
     """A convex profile swept along a polyline with miter joints — exact
     in ℚ[√d]. Volume = profile_area × centerline_length: at a miter the
