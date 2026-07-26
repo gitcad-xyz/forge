@@ -327,12 +327,59 @@ def _slot_face():
     return B.Face(B.Plane(up, Q(0)), (B.Loop(edges),), True)
 
 
-def test_a_loop_mixing_arcs_and_lines_refuses_rather_than_chord_them() -> None:
-    """Walking a loop's v0 vertices turns every arc into a chord. For this
-    slot that silently drops both semicircular ends — 9π mm² of 60+9π, a 32%
-    under-report presented as an exact value."""
-    with pytest.raises(ValueError, match="mixing arcs and lines"):
-        B.volume(B.Body((_slot_face(),)))
+def test_a_loop_mixing_arcs_and_lines_is_measured_not_chorded() -> None:
+    """Walking a loop's v0 vertices turns every arc into a chord. For this slot
+    that silently drops both semicircular ends — 9π mm² of 60+9π, a 32%
+    under-report presented as an exact value — so it used to refuse outright.
+
+    It now has its exact area instead: the chord polygon plus one circular
+    segment per arc. The refusal was never about this loop being unmeasurable,
+    only about the chord treatment being wrong."""
+    up = (F(0), F(0), F(1))
+    assert B._mixed_loop_area(_slot_face().loops[0], up) == (F(60), F(9))
+    # the slot outline lies IN z=0, so its cone back to the origin is flat
+    assert B.volume(B.Body((_slot_face(),))) == PiVal(0, 0)
+
+
+def test_the_two_senses_of_one_arc_give_the_notch_and_the_shoulder() -> None:
+    """The sign of a segment term is the whole trap in #123: the SAME 90° arc
+    of the bore bounds a notch floor of 4 − π from one side and, from the other,
+    a shoulder hole of 4 + 3π. Get it backwards and the volume is confidently
+    exact, plausible, and wrong."""
+    up, dn, xr = (F(0), F(0), F(1)), (F(0), F(0), F(-1)), (F(1), F(0), F(0))
+
+    def P(x, y):
+        return (F(x), F(y), F(0))
+
+    def ln(a, b):
+        return B.Edge(B.Line(a, tuple(b[i] - a[i] for i in range(3))), a, b)
+
+    c = B.Circle(P(15, 15), dn, xr, F(2))
+    n5, e5, k5 = P(15, 17), P(17, 15), P(17, 17)
+    notch = B.Loop((B.Edge(c, n5, e5), ln(e5, k5), ln(k5, n5)))
+    shoulder = B.Loop((B.Edge(c, e5, n5), ln(n5, k5), ln(k5, e5)))
+    assert B._mixed_loop_area(notch, up) == (F(4), F(-1))          # 4 − π
+    assert B._mixed_loop_area(shoulder, up) == (F(-4), F(-3))      # −(4 + 3π)
+    # a hole is negative whichever way it winds, decided by sign(), not float()
+    assert B._mixed_loop_area_as_hole(shoulder, up) == (F(-4), F(-3))
+    assert B._mixed_loop_area_as_hole(notch, up) == (F(-4), F(1))
+
+
+def test_an_arc_loop_off_the_twelfth_grid_still_refuses() -> None:
+    """The measure is new; the exact-or-refuse boundary is not. An arc ending
+    at 45° leaves ℚ[√3][π], and _arc_quarters is still the predicate that says
+    so — never atan2."""
+    from forgekernel.surd import SurdVal
+
+    up, xr = (F(0), F(0), F(1)), (F(1), F(0), F(0))
+    h = SurdVal(0, 1, 2)                       # √2, i.e. the 45° point of r=2
+    c = B.Circle((F(0), F(0), F(0)), up, xr, F(2))
+    a, b = (F(2), F(0), F(0)), (h, h, F(0))
+    loop = B.Loop((B.Edge(c, a, b),
+                   B.Edge(B.Line(b, (F(0), F(0), F(0))), b, (F(0), F(0), F(0))),
+                   B.Edge(B.Line((F(0), F(0), F(0)), a), (F(0), F(0), F(0)), a)))
+    with pytest.raises(ValueError, match="twelfth turn"):
+        B._mixed_loop_area(loop, up)
 
 
 def test_the_display_mesh_still_follows_the_arcs() -> None:
@@ -371,14 +418,26 @@ def test_a_lone_arc_is_not_mistaken_for_a_whole_circle() -> None:
     assert B._loop_is_circle(whole) == c
 
 
-def test_faces_info_declines_the_same_loops_the_exact_path_declines() -> None:
+def test_faces_info_agrees_with_the_exact_path_on_a_mixed_loop() -> None:
     """Two measurement paths must not give two answers for one face: the exact
     volume refused a mixed arc/line loop while faces_info walked its vertices
-    as a polygon and reported 0.5 for a quarter disc of true 0.785."""
+    as a polygon and reported 0.5 for a quarter disc of true 0.785.
+
+    Both were made to refuse, which agreed at the cost of answering. They now
+    agree on a NUMBER, which is the property that was actually wanted — and a
+    strictly harder one to satisfy, since a sign error in one and not the other
+    shows up here."""
     body = B.Body((_slot_face(),))
-    with pytest.raises(ValueError, match="mixing arcs and lines"):
-        B.faces_info(body)
-    with pytest.raises(ValueError, match="mixing arcs and lines"):
+    up = (F(0), F(0), F(1))
+    a_rat, a_pi = B._mixed_loop_area(_slot_face().loops[0], up)
+    exact = float(a_rat) + math.pi * float(a_pi)
+    info = B.faces_info(body)[0]
+    assert info["area"] == pytest.approx(exact)
+    assert info["area"] == pytest.approx(60 + 9 * math.pi)
+    # the slot is symmetric about x=5, y=0 — a chorded end would pull it in
+    assert info["centroid"] == pytest.approx([5.0, 0.0, 0.0])
+    # centroid() divides by a volume, and this open face has none
+    with pytest.raises(ValueError, match="zero-volume"):
         B.centroid(body)
 
 
@@ -1399,3 +1458,148 @@ def test_a_thirty_degree_band_refuses_to_MESH_and_says_why() -> None:
     face = _wedge_face(1)
     with pytest.raises(ValueError, match="twelfths of a turn"):
         B.tessellate(B.Body((face,)), 0.2)
+
+
+# -- the arc oracle: a complementary arc is a DIFFERENT edge ------------------
+#
+# #123 (a prism straddling a bore) is built out of trimmed bands whose rims are
+# proper arcs. The audit that is supposed to make a hand-built body safe —
+# manifold_violations, "every edge used by exactly two faces" — could not tell a
+# 90° arc from the 270° arc on the same circle with the same endpoints, because
+# _edge_key carried no span. That blindness is survivable only while the exact
+# area of a mixed arc/line loop refuses; the moment that measure lands, a
+# complemented rim becomes a silent wrong number that passes every check.
+
+def _quarter_cylinder(complement_the_band: bool):
+    """A quarter cylinder r=2 over z 0..5 — and the SAME five faces with the
+    band's two rims complemented, which is the 3/4 wedge glued to the quarter's
+    flat walls: a body that is not a solid at all."""
+    def P(x, y, z):
+        return (F(x), F(y), F(z))
+
+    up, dn, xr = P(0, 0, 1), P(0, 0, -1), P(1, 0, 0)
+    o0, e0, n0 = P(0, 0, 0), P(2, 0, 0), P(0, 2, 0)
+    o5, e5, n5 = P(0, 0, 5), P(2, 0, 5), P(0, 2, 5)
+
+    def ln(a, b):
+        return B.Edge(B.Line(a, tuple(b[i] - a[i] for i in range(3))), a, b)
+
+    c0, c5 = B.Circle(o0, dn, xr, F(2)), B.Circle(o5, up, xr, F(2))
+    b0 = B.Circle(o0, up if complement_the_band else dn, xr, F(2))
+    b5 = B.Circle(o5, dn if complement_the_band else up, xr, F(2))
+    return B.Body((
+        B.Face(B.Plane(dn, F(0)),
+               (B.Loop((ln(o0, n0), B.Edge(c0, n0, e0), ln(e0, o0))),), True),
+        B.Face(B.Plane(up, F(5)),
+               (B.Loop((ln(o5, e5), B.Edge(c5, e5, n5), ln(n5, o5))),), True),
+        B.Face(B.Plane(P(0, -1, 0), F(0)),
+               (B.Loop((ln(o0, e0), ln(e0, e5), ln(e5, o5), ln(o5, o0))),), True),
+        B.Face(B.Plane(P(-1, 0, 0), F(0)),
+               (B.Loop((ln(o0, o5), ln(o5, n5), ln(n5, n0), ln(n0, o0))),), True),
+        B.Face(B.Cylinder(o0, up, F(2)),
+               (B.Loop((B.Edge(b0, n0, e0), ln(e0, e5), B.Edge(b5, e5, n5),
+                        ln(n5, n0))),), True)))
+
+
+def test_an_arc_and_its_complement_are_not_the_same_edge() -> None:
+    """_edge_key is direction-free by design — the two faces at an edge walk it
+    opposite ways. It was SPAN-free by accident, so the 90° arc E→N and the
+    270° arc N→E on one circle keyed identically."""
+    c = B.Circle((F(0), F(0), F(0)), (F(0), F(0), F(1)), (F(1), F(0), F(0)), F(2))
+    e, n = (F(2), F(0), F(0)), (F(0), F(2), F(0))
+    assert B._arc_quarters(c, e, n)[1] == 3
+    assert B._arc_quarters(c, n, e)[1] == 9
+    assert B._edge_key(B.Edge(c, e, n)) != B._edge_key(B.Edge(c, n, e))
+
+
+def test_the_same_arc_from_either_side_is_still_one_edge() -> None:
+    """...and the span must not break the pairing it exists to protect. A face
+    needing the reverse sweep carries the circle with −n (the Edge contract in
+    _arc_pts), which is the SAME 90° arc walked backwards."""
+    up, dn = (F(0), F(0), F(1)), (F(0), F(0), F(-1))
+    ref = (F(1), F(0), F(0))
+    ca = B.Circle((F(0), F(0), F(0)), up, ref, F(2))
+    cb = B.Circle((F(0), F(0), F(0)), dn, ref, F(2))
+    e, n = (F(2), F(0), F(0)), (F(0), F(2), F(0))
+    assert B._arc_quarters(cb, n, e)[1] == 3
+    assert B._edge_key(B.Edge(ca, e, n)) == B._edge_key(B.Edge(cb, n, e))
+
+
+def test_the_audit_rejects_a_band_whose_rims_were_complemented() -> None:
+    """The whole point of manifold_violations is that a hand-built body cannot
+    lie about what it is. Complementing the band's rims turns a quarter cylinder
+    (5π) into a self-intersecting 3/4 wedge (35π/3) out of the very same five
+    faces and the very same vertices — and the audit saw nothing wrong."""
+    assert B.manifold_violations(_quarter_cylinder(False)) == []
+    bad = B.manifold_violations(_quarter_cylinder(True))
+    assert bad, "a complemented rim must not pair with the cap arc beside it"
+    assert all("arc" in m for m in bad)
+
+
+def test_the_quarter_cylinder_measures_five_pi() -> None:
+    """The mixed planar loop is load-bearing for the volume, so pin it against
+    the closed form: a quarter of πr²h with r=2, h=5."""
+    assert B.volume(_quarter_cylinder(False)) == PiVal(0, 5)
+
+
+def test_the_vector_area_of_a_closed_shell_is_zero() -> None:
+    """Σ Areaᵢ·n̂ᵢ = 0 is the divergence theorem applied to the constant fields
+    x̂, ŷ, ẑ, so it holds for any closed surface whatever its shape."""
+    assert all(c.sign() == 0 for c in B.vector_area(_quarter_cylinder(False)))
+
+
+def test_the_vector_area_catches_what_edge_pairing_cannot() -> None:
+    """The third oracle earns its keep on exactly one class: a face oriented
+    against its neighbours. Edge pairing audits COUNTS, so flipping a face's
+    sense leaves it perfectly happy; and flipping a face that lies IN a plane
+    through the origin leaves the volume untouched too, because its divergence
+    term is d·Area/3 with d = 0. Only the vector area sees it.
+
+    The bottom cap here is the quarter disc at z=0: area π, normal −ẑ, so
+    flipping it moves the sum by 2π along z and by nothing else.
+    """
+    good = _quarter_cylinder(False)
+    flipped = B.Body(tuple(
+        B.Face(f.surface, f.loops, not f.sense) if i == 0 else f
+        for i, f in enumerate(good.faces)))
+    assert B.manifold_violations(flipped) == []          # blind, by design
+    assert B.volume(flipped) == B.volume(good) > 0       # blind too
+    x, y, z = B.vector_area(flipped)
+    assert x.sign() == 0 and y.sign() == 0
+    assert float(z) == pytest.approx(2 * math.pi)
+
+
+def test_the_vector_area_declines_to_guess_at_a_surface_it_cannot_integrate():
+    """An unknown answer is not a pass. A body carrying a sphere comes back
+    None rather than 'zero', so a caller cannot read silence as a clean bill."""
+    sph = B.Body((B.Face(B.SphereS((F(0), F(0), F(0)), F(3)), (), True),))
+    assert B.vector_area(sph) is None
+
+
+def test_a_band_with_one_whole_rim_and_one_split_rim_still_meshes() -> None:
+    """A bore wall below a notch is exactly this: a full turn whose far rim is
+    a whole circle while the near one is split into quarters. The trimmed-band
+    mesher read its two heights off the ARCS only, so this band had a single
+    height, came out zero-tall, and emitted no triangles at all — 5 mm of wall
+    silently missing and the rings above and below it left open."""
+    def P(x, y, z):
+        return (F(x), F(y), F(z))
+
+    up, dn, xr = P(0, 0, 1), P(0, 0, -1), P(1, 0, 0)
+    c0 = B.Circle(P(0, 0, 0), up, xr, F(2))
+    c5 = B.Circle(P(0, 0, 5), up, xr, F(2))
+    qs = [P(2, 0, 5), P(0, 2, 5), P(-2, 0, 5), P(0, -2, 5)]
+    band = B.Face(B.Cylinder(P(0, 0, 0), up, F(2)), (B.Loop(
+        (B.Edge(c0, P(2, 0, 0), P(2, 0, 0)),)
+        + tuple(B.Edge(c5, qs[i], qs[(i + 1) % 4]) for i in range(4))),), True)
+    mesh = B.tessellate(B.Body((band,)), 0.2)
+    assert mesh["triangles"], "the band emitted nothing"
+    zs = {round(v[2], 6) for v in mesh["vertices"]}
+    assert zs == {0.0, 5.0}
+    # ...and the ring it produces must be the one a whole circle beside it gets
+    disc = B.Face(B.Plane(dn, F(0)), (B.Loop((B.Edge(c0, P(2, 0, 0),
+                                                    P(2, 0, 0)),)),), True)
+    both = B.tessellate(B.Body((band, disc)), 0.2)
+    ring_band = len([v for v in mesh["vertices"] if round(v[2], 6) == 0.0])
+    ring_all = len([v for v in both["vertices"] if round(v[2], 6) == 0.0])
+    assert ring_band == ring_all, "the band and the disc do not share a rim"
