@@ -274,6 +274,28 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
         entity, and the one that runs against the stored direction gets a .F.
         ORIENTED_EDGE.
         """
+        if isinstance(curve, Circle) and half is not None:
+            # CANONICALISE the stored direction by the half tag.
+            #
+            # A STEP file has no `half` field. A reader sees only (v0, v1,
+            # CIRCLE), and for a HALF circle both halves share those two
+            # endpoints — so the stored ORDER, read as increasing parameter
+            # from the circle's own ref, is the only thing that names which arc
+            # is meant. The writer's tag has to be pushed into that order here
+            # or it is lost on the way out.
+            #
+            # It was being lost. `_reverse` swaps endpoints and keeps the tag,
+            # so after a bound was rewound the tag no longer matched the
+            # geometry, and each bore-wall face ended up pairing the BOTTOM
+            # rim's [0,π] half with the TOP rim's [π,2π] half: a face that
+            # wraps instead of a clean half-cylinder, spanning 360° of the
+            # surface's period and therefore delimiting no region at all. The
+            # shell still passed its own edge audit — every edge used twice,
+            # once each way — because the pairing was right and only the
+            # GEOMETRY was wrong. Every exported bore, lathe and cone carried
+            # it.
+            p, q = _seam_points(curve)
+            a, b = (p, q) if half == 0 else (q, p)
         ends = tuple(sorted((_key(a), _key(b)), key=repr))
         if isinstance(curve, Circle):
             # Identify the arc by its GEOMETRIC circle. Two faces meeting at

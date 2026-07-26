@@ -300,3 +300,82 @@ def test_the_arc_key_is_exact_not_a_rounded_float_axis() -> None:
     unit = Circle((Q(0),) * 3, (Q(0), Q(0), Q(1)), (Q(1), Q(0), Q(0)), Q(1))
     scaled = Circle((Q(0),) * 3, (Q(0), Q(0), Q(-49)), (Q(1), Q(0), Q(0)), Q(1))
     assert _canon_dir(unit.n) == _canon_dir(scaled.n)
+
+
+def _arc_halves_per_face(text):
+    """For each curved face, which angular halves of a SPLIT circle its rim
+    arcs name. A clean half-cylinder names exactly one."""
+    pts = {i: tuple(float(x) for x in v.split(","))
+           for i, v in re.findall(
+               r"#(\d+) = CARTESIAN_POINT\('',\((.*?)\)\)", text)}
+    vp = dict(re.findall(r"#(\d+) = VERTEX_POINT\(.*?#(\d+)\)", text))
+    ecu = {i: (a, b) for i, a, b in re.findall(
+        r"#(\d+) = EDGE_CURVE\(.*?#(\d+),#(\d+),#\d+,", text)}
+    circles = {i for i, _ in re.findall(r"#(\d+) = (CIRCLE)", text)}
+    geom = dict(re.findall(r"#(\d+) = EDGE_CURVE\(.*?#\d+,#\d+,#(\d+),", text))
+    oriented = {i: (r, s) for i, r, s in re.findall(
+        r"#(\d+) = ORIENTED_EDGE\(.*?#(\d+),(\.[TF]\.)\)", text)}
+    loops = {i: re.findall(r"#(\d+)", a) for i, a in re.findall(
+        r"#(\d+) = EDGE_LOOP\(.*?\((.*?)\)\)", text)}
+    bnd = dict(re.findall(r"#(\d+) = FACE_(?:OUTER_)?BOUND\(.*?#(\d+),", text))
+    out = []
+    for m in re.finditer(
+            r"#(\d+) = ADVANCED_FACE\('',\((.*?)\),#(\d+),\.[TF]\.\)", text):
+        fid, bl, surf = m.groups()
+        if f"#{surf} = CYLINDRICAL_SURFACE" not in text:
+            continue
+        for b in re.findall(r"#(\d+)", bl):
+            halves = set()
+            for o in loops[bnd[b]]:
+                ref, _s = oriented[o]
+                if geom.get(ref) not in circles:
+                    continue
+                a, bv = ecu[ref]
+                pa, pb = pts[vp[a]], pts[vp[bv]]
+                # a SPLIT half shares both endpoints with its twin, so the two
+                # differ only in stored order — that order is the half
+                if pa[:2] != pb[:2]:
+                    halves.add(tuple(sorted((pa[:2], pb[:2]))) < (pa[:2],))
+            out.append((fid, halves))
+    return out
+
+
+def test_a_split_circle_names_the_SAME_half_on_both_rims() -> None:
+    """A STEP file has no `half` field. A reader sees only (v0, v1, CIRCLE),
+    and for a HALF circle both halves share those endpoints — so the stored
+    ORDER, read as increasing parameter from the circle's ref, is the only
+    thing naming which arc is meant.
+
+    That was being lost. `_reverse` swaps endpoints and keeps the writer's tag,
+    so once a bound was rewound the tag no longer matched the geometry, and
+    each bore-wall face paired the BOTTOM rim's [0,π] half with the TOP rim's
+    [π,2π] half: a face that wraps rather than a clean half-cylinder, spanning
+    the surface's whole period and delimiting no region.
+
+    The shell still passed its own edge audit — every edge used twice, once
+    each way — because the PAIRING was right and only the geometry was wrong.
+    Every exported bore, lathe and cone carried it."""
+    plate = DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])
+    for fid, halves in _arc_halves_per_face(write_step_body(B.to_body(plate))):
+        assert len(halves) <= 1, (
+            f"face #{fid} pairs two different halves of its circle — it wraps "
+            "the surface instead of bounding half of it")
+
+
+BORED = [
+    ("drilled plate",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)])),
+    ("blind hole",
+     lambda: DrilledSolid(Solid.box(30, 30, 10), [Cyl(15, 15, 3, 4, 10)])),
+    ("counterbore",
+     lambda: DrilledSolid(Solid.box(30, 30, 10), [])
+     .cut(Cyl(15, 15, 2, 0, 10)).cut(Cyl(15, 15, 4, 7, 10))),
+    ("bare cylinder", lambda: Cyl(0, 0, 5, 0, 12)),
+    ("boss", lambda: DisjointUnion([Solid.box(30, 30, 3), Cyl(15, 15, 4, 3, 9)])),
+]
+
+
+@pytest.mark.parametrize("label,build", BORED, ids=[b[0] for b in BORED])
+def test_every_bored_shape_exports_clean_half_faces(label, build) -> None:
+    for fid, halves in _arc_halves_per_face(write_step_body(B.to_body(build()))):
+        assert len(halves) <= 1, f"{label}: face #{fid} wraps its surface"
