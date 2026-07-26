@@ -2330,3 +2330,38 @@ def to_body(shape) -> Body:
     raise ValueError(
         f"no canonical-B-rep converter for {type(shape).__name__} yet "
         "(ADR-0021 converters land per representation)")
+
+
+def vector_area_defect(body: "Body"):
+    """Closed-shell orientation check: sum of face vector areas must be zero.
+
+    ``manifold_violations`` counts how many faces use each edge. It does not
+    look at DIRECTION, so a face whose loop is traversed the wrong way still
+    reports every edge used exactly twice — measured, not assumed: reversing
+    one face of a box gives 0 violations and this function gives (0, 0, 800).
+
+    The identity is Gauss': for a closed surface, sum over faces of the vector
+    area is the zero vector. Vector area is a BOUNDARY integral,
+    ``(1/2) * contour integral of r x dr``, so it needs only the loop — no
+    surface parametrisation, no area formula per surface type, and it is exact
+    in Q for straight edges.
+
+    Returns ``None`` when the check does not apply, and the caller must treat
+    that as "not checked" rather than "passed". Today that means any body
+    carrying a circular edge: the arc term is
+    ``(1/2)[c x (p1 - p0) + r^2 * dtheta * n_hat]``, derived and exact in Q[pi]
+    via the twelfth span, but it is NOT implemented here yet, and a partial sum
+    would be worse than no sum — it would be nonzero for a perfectly good
+    solid. So a body with any arc is skipped WHOLE.
+    """
+    total = [F(0), F(0), F(0)]
+    for f in body.faces:
+        sgn = 1 if getattr(f, "sense", 1) in (1, True) else -1
+        for lp in f.loops:
+            for e in lp.edges:
+                if isinstance(e.curve, Circle):
+                    return None              # see docstring: skip whole, not part
+                c = cross(e.v0, e.v1)
+                for i in range(3):
+                    total[i] += sgn * F(c[i]) / 2
+    return tuple(total)
