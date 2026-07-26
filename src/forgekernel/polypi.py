@@ -42,20 +42,72 @@ def _pi_bounds(digits: int) -> tuple[F, F]:
     return lo, lo + F(1, scale)
 
 
+def _sqrt_bounds(d: int, digits: int) -> tuple[F, F]:
+    """A rational interval containing √d, to `digits` decimal places.
+
+    By integer square root, so the enclosure is PROVEN rather than believed —
+    no float is consulted anywhere in it.
+    """
+    import math
+
+    scale = 10 ** digits
+    root = math.isqrt(int(d) * scale * scale)    # floor(√d · 10^digits)
+    return F(root, scale), F(root + 1, scale)
+
+
+def _coef_bounds(x, digits: int) -> tuple[F, F]:
+    """A rational enclosure of a coefficient, whatever field it lives in.
+
+    A ``Fraction`` is its own enclosure. A ``SurdVal`` ``a + b√d`` is bracketed
+    from a proven enclosure of √d, ends swapped when b is negative. This is the
+    ONLY place ℚ[√d] costs anything here: equality and arithmetic on the ring
+    are already exact over it, because π is transcendental over any algebraic
+    extension of ℚ just as it is over ℚ itself.
+    """
+    if isinstance(x, F):
+        return x, x
+    if getattr(x, "b", 0) == 0:
+        return F(x.a), F(x.a)
+    lo, hi = _sqrt_bounds(x.d, digits)
+    return ((x.a + x.b * lo, x.a + x.b * hi) if x.b > 0
+            else (x.a + x.b * hi, x.a + x.b * lo))
+
+
+def _coef(x):
+    """Accept a coefficient into the ring: ℚ as a Fraction, ℚ[√d] as itself."""
+    if isinstance(x, float):
+        if x != int(x):
+            raise ValueError(
+                f"a float ({x!r}) cannot enter ℚ[π] — pass a Fraction, or "
+                "the exactness the ring exists for is already gone")
+        return F(int(x))
+    if isinstance(x, (int, F)):
+        return F(x)
+    if hasattr(x, "a") and hasattr(x, "d"):      # SurdVal: a + b√d
+        return F(x.a) if x.b == 0 else x         # collapse a pure rational
+    raise ValueError(f"{type(x).__name__} is not an exact coefficient for ℚ[π]")
+
+
 class PiPoly:
-    """Exact ``Σ cₖ πᵏ`` with rational coefficients."""
+    """Exact ``Σ cₖ πᵏ`` over ℚ — or over ℚ[√d], which costs nothing.
+
+    π is transcendental over any ALGEBRAIC extension of ℚ, not merely over ℚ,
+    so the ring stays free when the coefficients are surds: equality is still
+    coefficient equality and zero is still all-coefficients-zero, with no
+    numerics. Only ORDER has to look at values, and it brackets each coefficient
+    from a proven enclosure of its radical.
+
+    That widening is what a napkin ring needs — a sphere bored coaxially has
+    volume (140/3)π√35 — and what a cone's chamfer needs, since its slant is
+    irrational.
+    """
 
     __slots__ = ("c",)
 
     def __init__(self, coeffs) -> None:
-        if isinstance(coeffs, (int, F)):
-            coeffs = [F(coeffs)]
-        for x in coeffs:
-            if isinstance(x, float) and x != int(x):
-                raise ValueError(
-                    f"a float ({x!r}) cannot enter ℚ[π] — pass a Fraction, or "
-                    "the exactness the ring exists for is already gone")
-        c = [F(x) for x in coeffs]
+        if isinstance(coeffs, (int, F)) or hasattr(coeffs, "d"):
+            coeffs = [coeffs]
+        c = [_coef(x) for x in coeffs]
         while len(c) > 1 and c[-1] == 0:
             c.pop()
         self.c = tuple(c)
@@ -195,12 +247,14 @@ class PiPoly:
             v0 = v1 = F(0)
             plo = phi = F(1)
             for coeff in self.c:
-                if coeff >= 0:
-                    v0 += coeff * plo
-                    v1 += coeff * phi
-                else:
-                    v0 += coeff * phi
-                    v1 += coeff * plo
+                # each coefficient contributes an INTERVAL: exact for a
+                # rational, a proven bracket for a surd. Combining interval
+                # coefficients with interval powers needs all four corners,
+                # because either can be negative.
+                clo, chi = _coef_bounds(coeff, digits)
+                ends = (clo * plo, clo * phi, chi * plo, chi * phi)
+                v0 += min(ends)
+                v1 += max(ends)
                 plo *= lo
                 phi *= hi
             if v0 > 0:

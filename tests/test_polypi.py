@@ -197,3 +197,98 @@ def test_pival_sign_agrees_with_pipoly() -> None:
     for a, b in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (-22, 7), (22, -7)):
         v = PiVal(F(a), F(b))
         assert v.sign() == PiPoly.from_pival(v).sign()
+
+
+# --- ℚ[√d][π]: π is transcendental over ALGEBRAIC extensions too -------------
+
+def _s(a, b, d):
+    from forgekernel.surd import SurdVal
+
+    return SurdVal(F(a), F(b), d)
+
+
+def test_a_napkin_ring_volume_lives_in_the_ring() -> None:
+    """A sphere bored coaxially is a napkin ring: V = (π/6)h³ with
+    h = 2√(R²−r²). For R=6, r=1 that is (140/3)π√35 — a π coefficient that is
+    NOT rational, which is precisely what ℚ[π] could not hold."""
+    v = PiPoly([F(0), _s(0, F(140, 3), 35)])
+    assert v.degree == 1
+    assert float(v) == pytest.approx(math.pi / 6 * (2 * math.sqrt(35)) ** 3)
+    assert v.sign() == 1 and v > 0
+
+
+def test_equality_stays_exact_with_no_numerics() -> None:
+    """The ring is still FREE. π is transcendental over any algebraic extension
+    of ℚ, not merely over ℚ, so equality is coefficient equality and zero is
+    all-coefficients-zero — the property the whole type exists for."""
+    a = PiPoly([F(0), _s(0, F(140, 3), 35)])
+    assert a == PiPoly([F(0), _s(0, F(140, 3), 35)])
+    assert (a - a).sign() == 0
+    # (140/3)√35 = 276.0837…, and a rational that close must NOT compare equal
+    assert a != PiPoly([F(0), F(276)])
+    assert a != PiPoly([F(0), F(2760837232113, 10 ** 10)])
+
+
+SURD_ORDER = [
+    ("above a rational just below it", F(276), 1),
+    ("below a rational just above it", F(277), -1),
+    ("above a very close rational", F(2760837232113, 10 ** 10), 1),
+    ("below a very close rational", F(2760837232114, 10 ** 10), -1),
+]
+
+
+@pytest.mark.parametrize("label,rhs,want", SURD_ORDER,
+                         ids=[s[0] for s in SURD_ORDER])
+def test_order_brackets_the_radical_until_it_is_certain(label, rhs, want) -> None:
+    """Order is the only operation that looks at values, and the bracket comes
+    from an integer square root — proven, not believed. These rationals differ
+    from (140/3)√35 in the tenth decimal."""
+    a = PiPoly([F(0), _s(0, F(140, 3), 35)])
+    assert (a - PiPoly([F(0), rhs])).sign() == want
+
+
+def test_the_sqrt_enclosure_really_does_enclose() -> None:
+    """The file's whole claim is rigour, so check the bracket rather than
+    trusting isqrt's off-by-one."""
+    import decimal
+
+    from forgekernel.polypi import _sqrt_bounds
+
+    decimal.getcontext().prec = 60
+    for d in (2, 3, 5, 35, 109, 12345):
+        lo, hi = _sqrt_bounds(d, 25)
+        assert lo * lo <= d <= hi * hi
+        exact = decimal.Decimal(d).sqrt()
+        assert decimal.Decimal(lo.numerator) / lo.denominator <= exact
+        assert exact <= decimal.Decimal(hi.numerator) / hi.denominator
+
+
+def test_a_negative_surd_coefficient_brackets_the_other_way() -> None:
+    """b < 0 swaps the ends of the interval. Getting this backwards would give
+    a confidently wrong sign, which is the failure mode the ring must not have."""
+    v = PiPoly([F(0), _s(0, -1, 2)])            # −√2·π
+    assert v.sign() == -1 and v < 0
+    assert PiPoly([_s(3, -2, 2)]).sign() == 1   # 3 − 2√2 = 0.1715…
+    assert PiPoly([_s(1, -1, 2)]).sign() == -1  # 1 − √2 = −0.414…
+
+
+def test_a_surd_that_is_really_rational_collapses() -> None:
+    """SurdVal(3, 0, 1) IS 3, and must hash and compare as 3 — otherwise a set
+    holds both and a dict lookup misses."""
+    assert PiPoly([_s(3, 0, 1)]) == PiPoly([F(3)])
+    assert hash(PiPoly([_s(3, 0, 1)])) == hash(PiPoly([F(3)]))
+    assert len({PiPoly([_s(3, 0, 1)]), PiPoly([F(3)]), 3}) == 1
+
+
+def test_mixed_radicals_still_refuse() -> None:
+    """ℚ[√2, √3] is a bigger field than either, and inventing it silently is
+    exactly what the charter forbids (K3.1)."""
+    with pytest.raises(ValueError, match="mixed radicals"):
+        PiPoly([_s(0, 1, 2)]) * PiPoly([_s(0, 1, 3)])
+
+
+def test_a_float_still_cannot_enter() -> None:
+    with pytest.raises(ValueError, match="float"):
+        PiPoly([0.1])
+    with pytest.raises(ValueError, match="not an exact coefficient"):
+        PiPoly(["7/2"])
