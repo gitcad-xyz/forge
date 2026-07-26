@@ -1058,7 +1058,7 @@ def _column_slabs(base: Solid, c: "Cyl") -> list:
     span varies, and it is an exact rational test.
     """
     r2 = c.r * c.r
-    levels = set()
+    levels = []
     for p in base.polys:
         n = p.plane.n
         verts = [(v[0], v[1]) for v in p.verts]
@@ -1075,7 +1075,14 @@ def _column_slabs(base: Solid, c: "Cyl") -> list:
                     if c.cx < x1 + (c.cy - y1) * (x2 - x1) / (y2 - y1):
                         inside = not inside
             if inside:
-                levels.add(p.plane.d / n[2])
+                # ORIENTATION, not just height. A down-facing cap (n·ẑ < 0) is
+                # where material STARTS going up; an up-facing one is where it
+                # ends. Recording z alone in a set collapsed the two caps of a
+                # shared interface — three stacked plates drilled through
+                # reported two bores instead of three and billed 5853.39 for a
+                # true 5811.50, while `union` of the same three plates gave the
+                # right answer. Multiplicity matters too: keep a list.
+                levels.append((p.plane.d / n[2], -1 if n[2] < 0 else 1))
             continue
         hit = False
         for i in range(m):
@@ -1096,18 +1103,33 @@ def _column_slabs(base: Solid, c: "Cyl") -> list:
                 "bore reaches a non-vertical wall, so the solid is not full "
                 "height across the hole — a full-barrel removal would "
                 "overstate it (K2.1)")
-    zs = sorted(levels)
-    if len(zs) < 2 or len(zs) % 2:
-        raise ValueError(
-            f"bore column meets {len(zs)} horizontal levels — an odd count "
-            "cannot be a stack of closed slabs, so the material over the disc "
-            "is not decidable here (K2.1)")
     # No lateral face reaches the disc (checked above), so the cross-section is
-    # CONSTANT over the whole disc and the column is a clean stack of slabs:
-    # the lowest level is the first slab's floor, the next its ceiling, and so
-    # on alternating. A shelled plate is two slabs — its outer top and bottom
-    # plus the void's ceiling and floor — which used to refuse outright.
-    return [(zs[i], zs[i + 1]) for i in range(0, len(zs), 2)]
+    # CONSTANT over the whole disc, and the column is decided by SWEEPING the
+    # caps in z with a depth counter: a down-facing cap opens material, an
+    # up-facing one closes it, and a shared interface contributes both and
+    # cancels. Alternating a sorted SET of heights assumed every level flips
+    # the state, which is only true when no two bodies touch.
+    if not levels:
+        raise ValueError(
+            "bore column meets no horizontal cap — the material over the disc "
+            "is not decidable here (K2.1)")
+    slabs, depth, start = [], 0, None
+    for z, delta in sorted(levels):
+        was = depth
+        depth += -delta          # -1 opens (down-facing), +1 closes
+        if depth < 0:
+            raise ValueError(
+                "bore column's caps do not nest — more ceilings than floors "
+                "over the disc, so the material is not decidable (K2.1)")
+        if was == 0 and depth > 0:
+            start = z
+        elif was > 0 and depth == 0:
+            slabs.append((start, z))
+    if depth != 0 or not slabs:
+        raise ValueError(
+            "bore column is not closed over the disc — a floor without its "
+            "ceiling means the material is not decidable here (K2.1)")
+    return slabs
 
 
 def _exact_bbox(shape):
