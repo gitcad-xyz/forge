@@ -1661,3 +1661,99 @@ def test_a_band_with_one_whole_rim_and_one_split_rim_still_meshes() -> None:
     ring_band = len([v for v in mesh["vertices"] if round(v[2], 6) == 0.0])
     ring_all = len([v for v in both["vertices"] if round(v[2], 6) == 0.0])
     assert ring_band == ring_all, "the band and the disc do not share a rim"
+
+# --- io hardening: a document is UNTRUSTED input (ADR-0006/0007) ------------
+#
+# Round-9 docket W13 + R3: `loads_body` validated schema and types but never
+# GEOMETRY, so a tampered document loaded clean and `volume()` BLENDED the
+# contradiction into one confident number — the lateral sweep term comes from
+# the surface record while the cap terms come from the rim circles. A cone
+# whose tan_half was edited 3/10 -> 9/10 reported +171.4% with zero manifold
+# violations; a sphere radius edited 6 -> -6 reported volume -904.78 and an
+# INVERTED bbox (lo > hi on every axis), which defeats every interference
+# pre-filter downstream. The consistency questions are exact rational
+# arithmetic — no tolerance, no float — so the load can refuse by name.
+
+TAMPERED = [
+    # W13: the cone surface contradicts its own rim circles (r=6 and r=3 are
+    # still in the document); used to load and report 1790.7 vs the true
+    # 210*pi = 659.7
+    ("cone tan_half vs its rims",
+     lambda: Cone(0, 0, 6, 3, 0, 10), '"tan_half":"3/10"', '"tan_half":"9/10"'),
+    # the bore's surface AND rim circles retuned together, but the rim
+    # VERTICES still sit at radius 4 — endpoint-on-curve catches it
+    ("bore radius vs its rim vertices",
+     lambda: DrilledSolid(Solid.box(40, 20, 5), [Cyl(20, 10, 4, 0, 5)]),
+     '"r":"4/1"', '"r":"7/1"'),
+    # R3: the cubic term of the sphere flips sign; cylinder/circle radii were
+    # only ACCIDENTALLY harmless (their quadratic terms cancel)
+    ("negative sphere radius", lambda: Sphere(0, 0, 0, 6),
+     '"r":"6/1"', '"r":"-6/1"'),
+]
+
+
+@pytest.mark.parametrize("label,build,old,new", TAMPERED,
+                         ids=[t[0] for t in TAMPERED])
+def test_a_tampered_document_refuses_rather_than_blending(
+        label, build, old, new) -> None:
+    from forgekernel import io
+
+    text = io.dumps_body(B.to_body(build()))
+    bad = text.replace(old, new)
+    assert bad != text, "tamper pattern not found in the dump"
+    with pytest.raises(ValueError):
+        io.loads_body(bad)
+
+
+HOSTILE_GEOMETRY = [
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"sphere","c":'
+     '["0/1","0/1","0/1"],"r":"-1/1"},"sense":true,"loops":[]}]}',
+     "negative sphere radius"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"cylinder","p":'
+     '["0/1","0/1","0/1"],"d":["0/1","0/1","1/1"],"r":"0/1"},"sense":true,'
+     '"loops":[]}]}', "zero cylinder radius"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"cone","p":'
+     '["0/1","0/1","0/1"],"d":["0/1","0/1","1/1"],"tan_half":"-3/10"},'
+     '"sense":true,"loops":[]}]}', "negative cone tan_half"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"cylinder","p":'
+     '["0/1","0/1","0/1"],"d":["0/1","0/1","0/1"],"r":"2/1"},"sense":true,'
+     '"loops":[]}]}', "zero cylinder axis"),
+    ('{"schema":"forge/body@1","faces":[{"surface":{"kind":"plane","n":'
+     '["0/1","0/1","0/1"],"d":"1/1"},"sense":true,"loops":[]}]}',
+     "zero plane normal"),
+]
+
+
+@pytest.mark.parametrize("doc,why", HOSTILE_GEOMETRY,
+                         ids=[h[1] for h in HOSTILE_GEOMETRY])
+def test_degenerate_surface_parameters_refuse_at_load(doc, why) -> None:
+    """The schema pass already refused malformed SHAPES; these are well-formed
+    documents describing degenerate GEOMETRY (r <= 0, a zero axis) that used to
+    load silently — the sphere one into a negative volume."""
+    from forgekernel import io
+
+    with pytest.raises(ValueError):
+        io.loads_body(doc)
+
+
+# --- io canonicality: SurdVal(a, 0, d) IS the rational a (docket S1) --------
+
+def test_a_rational_valued_surd_spells_as_the_rational_it_equals() -> None:
+    """ADR-0004 (byte-canonical text): a rigid map leaves coordinates
+    SurdVal-TYPED even when the surd part is zero, and `_num` used to branch on
+    the TYPE — so a 360-degree rotation respelled every number `S:a/1:0/1:1/1`
+    and rewrote the whole committed file (16838 -> 30998 bytes) for a no-op."""
+    from forgekernel import io
+    from forgekernel.surd import SurdVal
+
+    assert io._num(SurdVal(F(3, 2), 0, 2)) == "3/2"
+    assert io._num(SurdVal(0, F(1, 2), 2)) == "S:0/1:1/2:2/1"   # real surds keep S:
+
+
+def test_a_full_turn_does_not_change_the_bytes_of_a_dump() -> None:
+    from forgekernel import io
+    from forgekernel.kernel import rotate
+
+    s = Solid.box(10, 6, 4)
+    assert (io.dumps_body(B.to_body(rotate(s, (0, 0, 1), 360)))
+            == io.dumps_body(B.to_body(s)))
