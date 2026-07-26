@@ -81,3 +81,98 @@ def _is_square(x) -> bool:
         return False
     r = math.isqrt(n.numerator)
     return r * r == n.numerator
+
+
+class NapkinRing:
+    """A sphere with a COAXIAL cylindrical bore drilled clean through it.
+
+    Two faces, and that is the whole solid: one spherical ZONE (the sphere's
+    surface between the two circles where the bore exits) and one cylindrical
+    bore wall. There are no flat annular caps — the bore removes the sphere's
+    polar caps entirely, so nothing planar survives. A rectangle-shaped mental
+    model of the profile gets this wrong and invents two caps that are not
+    there; the volume it produces is plausible and incorrect.
+
+    Exact in ℚ[√d][π] via `contour_r2_dz` — see this module's docstring. The
+    volume famously depends only on the band height, not on R and r
+    separately, which makes it an unusually good oracle: two different
+    (R, r) pairs with the same R²−r² must give the SAME answer, and that is
+    checked in the tests.
+    """
+
+    __slots__ = ("R", "r", "cx", "cy", "cz")
+
+    def __init__(self, R, r, cx=0, cy=0, cz=0) -> None:
+        from fractions import Fraction as F
+
+        self.R, self.r = F(R), F(r)
+        self.cx, self.cy, self.cz = F(cx), F(cy), F(cz)
+        if not (0 <= self.r < self.R):
+            raise ValueError(
+                f"napkin ring needs 0 <= bore {self.r} < sphere {self.R}")
+
+    # --- exact -------------------------------------------------------------
+    def _half_height(self):
+        from forgekernel.surd import SurdVal
+
+        return SurdVal(0, 1, int(self.R * self.R - self.r * self.r))
+
+    def volume(self):
+        from forgekernel.quadric import PiVal
+
+        v3 = contour_r2_dz(napkin_ring_contour(self.R, self.r))
+        try:                       # rational band height → stays a PiVal
+            return PiVal(0, __import__("fractions").Fraction(v3))
+        except (TypeError, ValueError):
+            from forgekernel.polypi import PiPoly
+
+            return PiPoly([0, v3])          # a + b·π with b in ℚ[√d]
+
+    def centroid(self):
+        """EXACT, and exactly the centre — a napkin ring is symmetric about
+        its own centre in all three axes, so no integral is needed and none
+        should be invented."""
+        return (self.cx, self.cy, self.cz)
+
+    def centroid_f(self) -> tuple[float, float, float]:
+        return (float(self.cx), float(self.cy), float(self.cz))
+
+    def bbox(self):
+        """The RING's extent, not the sphere's. In z the solid stops at the
+        band height ±√(R²−r²), because the polar caps are gone — reporting the
+        sphere's ±R here would be a loose bound, and reporting ±r would be an
+        unsound one."""
+        h = float(self._half_height())
+        R, cx, cy, cz = float(self.R), float(self.cx), float(self.cy), float(self.cz)
+        return ((cx - R, cy - R, cz - h), (cx + R, cy + R, cz + h))
+
+    def translated(self, x, y, z) -> "NapkinRing":
+        return NapkinRing(self.R, self.r,
+                          self.cx + x, self.cy + y, self.cz + z)
+
+    # --- display -----------------------------------------------------------
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """Floats are legal here — this is meshing (ADR-0019).
+
+        The profile is a LENS: the meridian arc from (r, −h) up over the bulge
+        and back to (r, +h), closed by the straight bore wall. Both arc
+        endpoints land exactly on r = the bore radius, because
+        √(R² − h²) = r by construction — so the loop closes with no cap.
+        """
+        import math
+
+        from forgekernel.tess import lathe
+
+        R, r0 = float(self.R), float(self.r)
+        h = float(self._half_height())
+        # sample the arc finely enough that its sagitta is under `deflection`
+        span = 2 * math.asin(min(1.0, h / R)) if R else 0.0
+        n = max(6, int(math.ceil(span / (2 * math.acos(
+            max(-1.0, min(1.0, 1 - deflection / R)))))) if R > deflection else 24)
+        prof = []
+        for i in range(n + 1):
+            z = -h + 2 * h * i / n
+            prof.append((math.sqrt(max(0.0, R * R - z * z)), z + float(self.cz)))
+        prof.append((r0, h + float(self.cz)))
+        prof.append((r0, -h + float(self.cz)))
+        return lathe(prof, deflection, float(self.cx), float(self.cy))
