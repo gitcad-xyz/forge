@@ -84,14 +84,20 @@ def test_chamfered_cube_topology_and_exactness() -> None:
 
     c = chamfer(box(10, 10, 10), 2)
     assert c.watertight_violations() == []
-    # hand-derived, twice over: edge cuts give 1000 - 480/wedges + 64/pairs
-    # - 16/triples = 808; industrial corner facets remove d^3/12 per corner
-    # (8 x 2/3) more. ref returns the EXACT rational OCCT approximates.
-    assert c.volume() == Fraction(2408, 3)
-    # the classic chamfered-cube topology: 6 octagons + 12 chamfer faces
-    # + 8 corner triangles = 26 planes
+    # Hand-derived: edge cuts give 1000 - 480/wedges + 64/pairs - 16/triples
+    # = 808. THAT DERIVATION WAS ALWAYS RIGHT. This test used to subtract a
+    # further 8 x d^3/12 for "industrial corner facets" so the number would
+    # match an OCCT float reading, and that subtraction made the kernel remove
+    # material no edge chamfered away. See gitcad's
+    # tests/invariants/test_chamfer_is_local_to_its_edges.py, where a point
+    # clearing all twelve edge half-spaces is shown to have been cut anyway.
+    # The three chamfer planes at a corner already meet at the single point
+    # (d/2, d/2, d/2), so there is no corner left to truncate.
+    assert c.volume() == 808
+    # 6 octagons + 12 chamfer faces = 18 planes. NOT 26: the 8 corner
+    # triangles are gone, because they were never geometrically there.
     planes = {key[0] for key in c.logical_faces()}
-    assert len(planes) == 26
+    assert len(planes) == 18
     assert chamfer(box(10, 10, 10), 2).volume() == c.volume()
 
 
@@ -101,7 +107,22 @@ def test_chamfer_block_matches_oracle_exactly() -> None:
     # the first real ref-vs-OCCT disagreement, resolved: OCCT reports
     # 5562.666666666667 for box(30,20,10) chamfer 2 — ref returns the
     # exact rational behind that float.
-    assert chamfer(box(30, 20, 10), 2).volume() == Fraction(16688, 3)
+    # The closed form, derived here and independently confirmed by exact
+    # rational vertex-enumeration of the twelve edge half-spaces:
+    #     V = abc - 2(a+b+c)d^2 + 6d^3
+    # For 30x20x10 at d=2:  6000 - 480 + 48 = 5568.
+    #
+    # This assertion used to read Fraction(16688, 3) = 5562.666..., matched to
+    # an OCCT reading. The gap is exactly 2d^3/3 - the eight corner tetrahedra
+    # the kernel was removing on top of the chamfers it was asked for. OCCT is
+    # no longer in this project (ADR-0020) so it cannot be re-measured; the
+    # justification therefore rests on the DEFINITION of a chamfer (the union
+    # of its per-edge wedges), which is the sounder basis regardless.
+    assert chamfer(box(30, 20, 10), 2).volume() == 5568
+    for a, b, c in ((30, 20, 10), (20, 20, 20), (40, 30, 20)):
+        for d in (1, 2, 3):
+            assert chamfer(box(a, b, c), d).volume() == (
+                a * b * c - 2 * (a + b + c) * d ** 2 + 6 * d ** 3)
 
 
 def test_serialization_round_trip_bit_exact() -> None:

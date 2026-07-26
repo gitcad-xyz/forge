@@ -115,13 +115,24 @@ def rotate(s: Solid, axis, deg) -> Solid:
 
 
 def chamfer(s: Solid, distance) -> Solid:
-    """Exact chamfer on all convex rational-normal edges, with industrial
-    corner-triangle vertex truncation (oracle-matched semantics)."""
-    from forgekernel.brep import chamfer_corners, chamfer_planar, logical_edges
+    """Exact chamfer on all convex rational-normal edges.
 
-    edges = logical_edges(s)
-    out = chamfer_planar(s, distance, edges)
-    return chamfer_corners(out, distance, edges)
+    A chamfer IS the solid intersected with one half-space per edge, and
+    nothing else. `chamfer_planar` computes exactly that, so it is the whole
+    operation.
+
+    There used to be a `chamfer_corners` pass here adding a vertex-truncation
+    facet per corner, on the belief that industrial kernels do so. They do not,
+    and the geometry says why: at a box corner the three chamfer planes
+    (x+y=d, y+z=d, z+x=d) already meet at the single point (d/2, d/2, d/2), so
+    the apex is a VERTEX and there is no corner face to cut. Cutting one anyway
+    removed the tetrahedron between that apex and the added plane x+y+z=2d —
+    d³/12 per corner, 2d³/3 per box, for every chamfer this kernel ever
+    produced. See tests/invariants/test_chamfer_is_local_to_its_edges.py.
+    """
+    from forgekernel.brep import chamfer_planar, logical_edges
+
+    return chamfer_planar(s, distance, logical_edges(s))
 
 
 def draft(s: Solid, angle_deg: float, neutral_z=0, faces=None) -> Solid:
