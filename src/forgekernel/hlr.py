@@ -152,7 +152,7 @@ def _inside_fn(solid):
                           and (q[0] - cx) ** 2 + (q[1] - cy) ** 2 <= r * r + _EPS)
     # general: parity against the tessellation
     try:
-        pn = _tri_polys_n(solid.tessellate())
+        pn = _tri_polys_n(_mesh(solid))
         return lambda q: _parity_inside(pn, q)
     except Exception:                   # noqa: BLE001 - no mesh ⇒ never occlude
         return lambda q: False
@@ -206,12 +206,38 @@ def _cyl_edges(c, view, deflection):
     return out
 
 
-def _mesh_edges(solid, view):
+def _mesh(solid, deflection: float = 0.2):
+    """ONE mesher, against the canonical form (ADR-0021).
+
+    All three call sites here used to call `solid.tessellate()` with no
+    argument, wrapped in a bare `except Exception` — and Body, RoundedBox,
+    FilletedBox and SphereOverlap have no zero-arg `.tessellate()`. The
+    AttributeError was swallowed and each site returned its empty answer, so
+    hlr_project and section_polys produced SILENTLY BLANK drawings for 19 of
+    52 buildable shapes: every rounded box, every filleted or shelled drilled
+    part, both sphere overlaps, both selected-edge filleted boxes.
+
+    Blank is the worst possible failure here, because an empty drawing is
+    indistinguishable from a solid that genuinely has no edges — and the
+    capability matrix scored those cells `ok`, since nothing was raised.
+
+    The seam's own `tessellate` already knew how to mesh all of them; the
+    "one mesher" change simply never reached hlr.py's three copies. So this
+    routes through the canonical body, and it does NOT swallow: a solid that
+    truly cannot be meshed must raise, so the caller reports a refusal rather
+    than a blank sheet.
+
+    Floats are legal here — this is meshing and drawing (ADR-0019).
+    """
+    from forgekernel import body as B
+
+    b = solid if isinstance(solid, B.Body) else B.to_body(solid)
+    return B.tessellate(b, deflection)
+
+
+def _mesh_edges(solid, view, deflection: float = 0.2):
     """Sharp feature edges + view-dependent silhouette edges from a mesh."""
-    try:
-        mesh = solid.tessellate()
-    except Exception:                   # noqa: BLE001
-        return []
+    mesh = _mesh(solid, deflection)
     verts = [tuple(float(c) for c in v) for v in mesh["vertices"]]
     from collections import defaultdict
     faces = defaultdict(list)           # undirected edge -> [triangle normals]
@@ -514,11 +540,11 @@ def _cyl_cap_sections(c, nc, dc):
     return out
 
 
-def _mesh_section(solid, nc, dc):
-    try:
-        mesh = solid.tessellate()
-    except Exception:                    # noqa: BLE001
-        return []
+def _mesh_section(solid, nc, dc, deflection: float = 0.2):
+    # the caller's deflection was silently dropped here: it was passed to the
+    # analytic paths but not to this one, so a mesh-sectioned sphere returned
+    # the same 52 segments at every deflection from 0.2 down to 0.001
+    mesh = _mesh(solid, deflection)
     verts = [tuple(float(x) for x in v) for v in mesh["vertices"]]
     out = []
     for tri in mesh["triangles"]:
@@ -558,7 +584,7 @@ def _section_segments(solid, nc, dc, deflection):
         for m in solid.members:
             out += _section_segments(m, nc, dc, deflection)
         return out
-    return _mesh_section(solid, nc, dc)
+    return _mesh_section(solid, nc, dc, deflection)
 
 
 def section_polys(solid, direction, xdir, offset, *, deflection=0.05):
