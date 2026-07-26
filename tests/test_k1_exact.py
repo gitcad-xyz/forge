@@ -437,6 +437,107 @@ def test_mitered_sweep_exact_in_root2() -> None:
     assert ms.volume() == SurdVal(720, 240, 2)          # 16 × length, EXACT
 
 
+def test_mitered_sweep_bbox_is_the_prism_box_not_a_sqrt_area_pad() -> None:
+    """W8: bbox used to pad the centreline by sqrt(area) — for any profile
+    wider than 4:1 that UNDERSTATES, so a 20x1 plate swept straight up got a
+    half-width-4.47 box that cut 5.5 mm inside real material on both x sides
+    (and padded 4.47 of air on y and z). A rectangle swept along a straight
+    line is a prism; its box is the profile's extents times the length."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    prof = [(-10, Fraction(-1, 2)), (10, Fraction(-1, 2)),
+            (10, Fraction(1, 2)), (-10, Fraction(1, 2))]
+    ms = sweep(20, [[0, 0, 0], [0, 0, 30]], profile=prof)
+    assert ms.volume() == 600                        # 20*1*30, unchanged
+    lo, hi = ms.bbox()
+    assert lo == _pytest.approx((-10.0, -0.5, 0.0), rel=0, abs=1e-12)
+    assert hi == _pytest.approx((10.0, 0.5, 30.0), rel=0, abs=1e-12)
+
+
+def test_mitered_sweep_bbox_around_a_right_angle_corner() -> None:
+    """The L: a 10x10 square swept z-up then x-along. Leg 1 is the prism
+    |x|,|y| <= 5 clipped by the 45-degree miter plane x + z = 10, leg 2 its
+    mirror image — so the union's exact box is (-5,-5,0)..(10,5,15), the
+    outer miter corner reaching z = 15 at x = -5."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    prof = [(-5, -5), (5, -5), (5, 5), (-5, 5)]
+    ms = sweep(100, [[0, 0, 0], [0, 0, 10], [10, 0, 10]], profile=prof)
+    lo, hi = ms.bbox()
+    assert lo == _pytest.approx((-5.0, -5.0, 0.0), rel=0, abs=1e-12)
+    assert hi == _pytest.approx((10.0, 5.0, 15.0), rel=0, abs=1e-12)
+
+
+def test_mitered_sweep_centroid_is_the_solid_not_the_wire() -> None:
+    """W11: centroid_f returned length-weighted midpoints of the CENTRELINE
+    segments — the wire's centroid, not the solid's. For the 10x10 L-sweep
+    the closed form is (1.875, 0, 8.125): leg 1 = {|x|,|y|<=5, 0<=z,
+    x+z<=10} has m_x = -2500/3, leg 2 (its miter mirror) m_x = 5000-1250/3,
+    V = 2000, so cx = 3750/2000; cz = 10 - cx by the miter symmetry. The
+    wire answer was (2.5, 0, 7.5) — biased a**2/(2(L1+L2)) per corner."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    prof = [(-5, -5), (5, -5), (5, 5), (-5, 5)]
+    ms = sweep(100, [[0, 0, 0], [0, 0, 10], [10, 0, 10]], profile=prof)
+    assert ms.centroid_f() == _pytest.approx((1.875, 0.0, 8.125),
+                                             rel=0, abs=1e-12)
+
+
+def test_mitered_sweep_straight_centroid_rides_the_profile_centroid() -> None:
+    """A straight sweep of an OFF-CENTRE profile: the solid's centroid sits
+    over the profile's own centroid, not the path (a prism, no oracle
+    needed). Also pins the frame convention: +z first leg maps profile
+    (u, v) to world (x, y)."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    prof = [(0, 0), (6, 0), (6, 2), (0, 2)]          # centroid (3, 1)
+    ms = sweep(12, [[0, 0, 0], [0, 0, 10]], profile=prof)
+    assert ms.centroid_f() == _pytest.approx((3.0, 1.0, 5.0),
+                                             rel=0, abs=1e-12)
+    lo, hi = ms.bbox()
+    assert lo == _pytest.approx((0.0, 0.0, 0.0), rel=0, abs=1e-12)
+    assert hi == _pytest.approx((6.0, 2.0, 10.0), rel=0, abs=1e-12)
+
+
+def test_mitered_sweep_metrics_without_profile_refuse() -> None:
+    """Built from an area alone the solid knows its exact volume but NOT its
+    shape — bbox/centroid must refuse rather than guess (the sqrt-area pad
+    was a silent wrong number through the seam)."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    ms = sweep(16, [[0, 0, 0], [0, 0, 20]])
+    with _pytest.raises(ValueError, match="profile"):
+        ms.bbox()
+    with _pytest.raises(ValueError, match="profile"):
+        ms.centroid_f()
+
+
+def test_mitered_sweep_reversing_path_refuses_metrics() -> None:
+    """A path that doubles straight back has no miter plane (t1 + t2 = 0) —
+    the sweep model is undefined there, so metrics refuse by an EXACT
+    rational test on the path deltas, not a float epsilon."""
+    import pytest as _pytest
+
+    from forgekernel.kernel import sweep
+
+    prof = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+    ms = sweep(4, [[0, 0, 0], [0, 0, 10], [0, 0, 3]], profile=prof)
+    with _pytest.raises(ValueError, match="reverses"):
+        ms.bbox()
+    with _pytest.raises(ValueError, match="reverses"):
+        ms.centroid_f()
+
+
 # -- W-K: composite tessellation (bounded-error view) -------------------------
 
 def test_revolve_mesh_approximates_exact_volume() -> None:
@@ -474,6 +575,87 @@ def test_sphere_overlap_booleans_exact() -> None:
     assert SphereOverlap(a, b, "intersect").volume() == PiVal(0, Fraction(104, 3))
     assert SphereOverlap(a, b, "union").volume() == PiVal(0, Fraction(896, 3))
     assert SphereOverlap(a, b, "cut").volume() == PiVal(0, 132)   # 500/3 - 104/3
+
+
+def test_sphere_overlap_centroid_is_the_cap_moment_not_the_midpoint() -> None:
+    """W7: centroid_f returned the midpoint of the two centres for EVERY op —
+    right only for the two symmetric cases (union/intersect of equal
+    spheres), which is why nothing caught it. For r=5 spheres 6 apart the
+    lens spans x in [1,5]; direct integration gives the lens x-moment 104π
+    and lens volume 104π/3, so the cut centroid is (0 - 104π)/(500π/3 -
+    104π/3) = -26/33 — NEGATIVE, 3.79 mm from the reported +3.0 and on the
+    other side of the origin. Every ratio is rational (π cancels), so the
+    floats below are the correctly-rounded exact values."""
+    from forgekernel.quadric import Sphere, SphereOverlap
+
+    a = Sphere.make(5)
+    b = Sphere.make(5).translated(6, 0, 0)
+    assert SphereOverlap(a, b, "cut").centroid_f() == (
+        float(Fraction(-26, 33)), 0.0, 0.0)
+    # the two symmetric cases the old code got right must stay right
+    assert SphereOverlap(a, b, "intersect").centroid_f() == (3.0, 0.0, 0.0)
+    assert SphereOverlap(a, b, "union").centroid_f() == (3.0, 0.0, 0.0)
+
+
+def test_sphere_overlap_centroid_unequal_radii() -> None:
+    """Unequal spheres r1=5, r2=3, d=6: d1 = 13/3, h1 = 2/3, h2 = 4/3, lens
+    volume 20π/3, lens moment about A 736π/27 (cap moment about its own
+    sphere centre is π h²(2r−h)²/4). Closed forms:
+        cut       -23/135,  intersect  184/45,  union  26/27
+    (cross-checked by 4M-sample Monte Carlo this session)."""
+    from forgekernel.quadric import Sphere, SphereOverlap
+
+    a = Sphere.make(5)
+    b = Sphere.make(3).translated(6, 0, 0)
+    assert SphereOverlap(a, b, "cut").centroid_f() == (
+        float(Fraction(-23, 135)), 0.0, 0.0)
+    assert SphereOverlap(a, b, "intersect").centroid_f() == (
+        float(Fraction(184, 45)), 0.0, 0.0)
+    assert SphereOverlap(a, b, "union").centroid_f() == (
+        float(Fraction(26, 27)), 0.0, 0.0)
+
+
+def test_sphere_overlap_bbox_stops_at_plane_and_waist() -> None:
+    """W12: the cut bbox was sphere A's whole box (+25% on the cut axis) and
+    the intersect box ignored the lens waist. The cut solid ends at the
+    radical plane x = d1 = (d²+r1²−r2²)/(2d) = 3; the lens's transverse
+    extent is the waist radius √(r1²−d1²) = 4. Both were already computed
+    for the volume — the box just never asked."""
+    from forgekernel.quadric import Sphere, SphereOverlap
+
+    a = Sphere.make(5)
+    b = Sphere.make(5).translated(6, 0, 0)
+    assert SphereOverlap(a, b, "cut").bbox() == ((-5.0, -5.0, -5.0),
+                                                 (3.0, 5.0, 5.0))
+    assert SphereOverlap(a, b, "intersect").bbox() == ((1.0, -4.0, -4.0),
+                                                       (5.0, 4.0, 4.0))
+    # union keeps the exact two-sphere box it always had
+    assert SphereOverlap(a, b, "union").bbox() == ((-5.0, -5.0, -5.0),
+                                                   (11.0, 5.0, 5.0))
+
+
+def test_sphere_overlap_bbox_off_axis_pair() -> None:
+    """Centres 7 apart along the rational direction (2,3,6)/7 — the support
+    construction must hold per WORLD axis, not just when the pair rides x.
+    Equal r=5: d1 = 7/2, waist² = 51/4. Per axis e: the far pole of A
+    survives the cut iff r1·(e·û) <= d1, else the extreme sits on the waist
+    circle at C·e + w·√(1−(e·û)²). Verified by 2M-sample rejection sampling
+    this session: observed extremes approach every bound from INSIDE
+    (pole axes to <5e-3; the waist axis to 0.023, slow because the true
+    extreme sits on a curve of measure zero) and never exceed it."""
+    import pytest as _pytest
+
+    from forgekernel.quadric import Sphere, SphereOverlap
+
+    a = Sphere.make(5)
+    b = Sphere.make(5).translated(2, 3, 6)
+    lo, hi = SphereOverlap(a, b, "cut").bbox()
+    w = math.sqrt(51 / 4)
+    assert lo == _pytest.approx((-5.0, -5.0, -5.0), rel=0, abs=1e-12)
+    # x: r1·(2/7) = 10/7 < 7/2 -> pole survives; y: 15/7 < 7/2 -> pole;
+    # z: 30/7 > 7/2 -> waist: 3 + w·√(1-36/49)
+    assert hi == _pytest.approx(
+        (5.0, 5.0, 3.0 + w * math.sqrt(13.0 / 49.0)), rel=0, abs=1e-12)
 
 
 def test_sphere_overlap_refuses_nonoverlap_and_irrational() -> None:

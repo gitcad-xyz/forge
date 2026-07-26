@@ -1623,9 +1623,26 @@ class MiteredSweep:
     adds back identically, so the swept volume is exactly the straight
     area×length even through corners. Segment lengths accumulate in one
     quadratic-surd field; a path mixing radicals (e.g. √2 and √3) refuses
-    (K3.1). This is the model OCCT cannot build (swept_channel)."""
+    (K3.1). This is the model OCCT cannot build (swept_channel).
 
-    def __init__(self, area, path: list) -> None:
+    Metrics (bbox / centroid_f) need the actual profile POLYGON, passed as
+    ``profile`` — vertices (u, v) in profile coordinates with (0, 0) riding
+    the path. Orientation convention: a +z first leg maps profile (u, v) to
+    world (x, y); in general u₀ ∝ ŷ × t̂₀ (falling back to ẑ × t̂₀ when the
+    first leg runs along ±y), v₀ = t̂₀ × u₀, and the frame is transported
+    across each corner by the affine reflection in the miter plane (normal
+    ∝ t̂_in + t̂_out — the picture-frame fold mapping each leg's prism onto
+    the next; it fixes the joint face pointwise, so cross-sections agree).
+    Each leg is then the profile prism clipped by its two planes — a convex
+    polytope whose extreme points are profile vertices on those planes, so
+    the box is exact, and whose centroid is a closed form in the profile's
+    area/first/second moments. Built from an area alone the solid still
+    knows its exact volume, but bbox/centroid REFUSE rather than guess
+    (W8/W11: the old √area pad and wire centroid were silent wrong numbers
+    through the seam — the pad even understated any profile wider than 4:1,
+    excluding real material from the box)."""
+
+    def __init__(self, area, path: list, profile: list | None = None) -> None:
         from forgekernel.surd import SurdVal, sqrt_rational
 
         self.area = F(area)
@@ -1637,6 +1654,26 @@ class MiteredSweep:
             d2 = sum((b[i] - a[i]) ** 2 for i in range(3))
             length = length + sqrt_rational(d2)      # may raise on mixed radicals
         self._length = length
+        self.profile = None
+        if profile is not None:
+            pts = [(F(p[0]), F(p[1])) for p in profile]
+            if len(pts) > 1 and pts[0] == pts[-1]:
+                pts = pts[:-1]
+            if len(pts) < 3:
+                raise ValueError("sweep profile needs >= 3 vertices")
+            n = len(pts)
+            area2 = sum(pts[i][0] * pts[(i + 1) % n][1]
+                        - pts[(i + 1) % n][0] * pts[i][1] for i in range(n))
+            if area2 == 0:
+                raise ValueError("sweep profile is degenerate (zero area)")
+            if area2 < 0:                            # normalise to CCW
+                pts = pts[::-1]
+                area2 = -area2
+            if self.area != area2 / 2:
+                raise ValueError(
+                    "sweep profile polygon area disagrees with the stated "
+                    "area — refuse rather than pick one silently")
+            self.profile = pts
 
     def length(self):
         return self._length
@@ -1644,28 +1681,156 @@ class MiteredSweep:
     def volume(self):
         return self._length * self.area              # SurdVal
 
-    def centroid_f(self) -> tuple:
-        # centroid on the centerline, length-weighted midpoints (floated)
-        from forgekernel.surd import sqrt_rational
+    # -- metric machinery (W8/W11) --------------------------------------------
 
-        acc = [0.0, 0.0, 0.0]
-        tot = 0.0
-        for a, b in zip(self.path, self.path[1:]):
-            seg = float(sqrt_rational(sum((b[i] - a[i]) ** 2 for i in range(3))))
-            mid = [(float(a[i]) + float(b[i])) / 2 for i in range(3)]
+    def _leg_frames(self):
+        """Float frames per leg + the clipping plane per leg end.
+
+        Returns (origins, dirs, frames, planes): per-leg path origin P_k and
+        unit direction t̂_k, per-leg (u, v) profile axes, and n+1 planes as
+        (point, normal) with UNNORMALISED miter normals (every use divides
+        two dot products with the same normal, so scale cancels).
+        Degeneracy is decided on the EXACT rational path deltas — no float
+        epsilon: a zero-length segment has no direction, and a straight
+        reversal (t̂₁ + t̂₂ = 0) has no miter plane.
+        """
+        if self.profile is None:
+            raise ValueError(
+                "MiteredSweep built from an area alone knows its exact "
+                "volume but not its shape: bbox/centroid need the profile "
+                "polygon (pass profile=). Refusing rather than padding by "
+                "sqrt(area) — the old pad was a silent wrong box (W8)")
+        deltas = [tuple(b[i] - a[i] for i in range(3))
+                  for a, b in zip(self.path, self.path[1:])]
+        for d in deltas:
+            if d == (0, 0, 0):
+                raise ValueError(
+                    "zero-length sweep segment has no direction — the miter "
+                    "frame is undefined")
+        for d1, d2 in zip(deltas, deltas[1:]):
+            cross = (d1[1] * d2[2] - d1[2] * d2[1],
+                     d1[2] * d2[0] - d1[0] * d2[2],
+                     d1[0] * d2[1] - d1[1] * d2[0])
+            if cross == (0, 0, 0) and sum(a * b for a, b in zip(d1, d2)) < 0:
+                raise ValueError(
+                    "sweep path reverses on itself — the miter plane "
+                    "(normal t1+t2) is undefined for a straight reversal")
+        origins = [tuple(float(c) for c in p) for p in self.path[:-1]]
+        dirs = []
+        for d in deltas:
+            fd = tuple(float(c) for c in d)
+            ln = math.sqrt(fd[0] * fd[0] + fd[1] * fd[1] + fd[2] * fd[2])
+            dirs.append((fd[0] / ln, fd[1] / ln, fd[2] / ln))
+
+        def _cross(a, b):
+            return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0])
+
+        def _dot(a, b):
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+        t0 = dirs[0]
+        # documented first-leg convention (exact test: is the first delta ±y?)
+        d0 = deltas[0]
+        ref = (0.0, 0.0, 1.0) if (d0[0] == 0 and d0[2] == 0) else (0.0, 1.0, 0.0)
+        u0 = _cross(ref, t0)
+        un = math.sqrt(_dot(u0, u0))
+        u0 = (u0[0] / un, u0[1] / un, u0[2] / un)
+        v0 = _cross(t0, u0)
+        frames = [(u0, v0)]
+        for k in range(1, len(dirs)):
+            n = tuple(dirs[k - 1][i] + dirs[k][i] for i in range(3))
+            nn = _dot(n, n)
+            u_p, v_p = frames[-1]
+            frames.append((
+                tuple(u_p[i] - 2 * _dot(u_p, n) / nn * n[i] for i in range(3)),
+                tuple(v_p[i] - 2 * _dot(v_p, n) / nn * n[i] for i in range(3))))
+        planes = [(origins[0], dirs[0])]
+        for k in range(1, len(dirs)):
+            planes.append((tuple(float(c) for c in self.path[k]),
+                           tuple(dirs[k - 1][i] + dirs[k][i] for i in range(3))))
+        planes.append((tuple(float(c) for c in self.path[-1]), dirs[-1]))
+        return origins, dirs, frames, planes
+
+    def _plane_coeffs(self, P, u, v, t, plane):
+        """s(a, b) = α + β·a + γ·b where the leg line P + a·u + b·v + s·t̂
+        pierces the plane (Q, m). Normal scale cancels in the ratios."""
+        Q, m = plane
+        tm = t[0] * m[0] + t[1] * m[1] + t[2] * m[2]
+        qm = sum((Q[i] - P[i]) * m[i] for i in range(3))
+        um = u[0] * m[0] + u[1] * m[1] + u[2] * m[2]
+        vm = v[0] * m[0] + v[1] * m[1] + v[2] * m[2]
+        return qm / tm, -um / tm, -vm / tm
+
+    def _profile_integrals(self):
+        """Exact polygon integrals about the profile origin (CCW): area A,
+        first moments ∫a, ∫b, second moments ∫a², ∫b², ∫ab — Green's
+        theorem closed forms, all Fractions."""
+        pts = self.profile
+        n = len(pts)
+        A = Ma = Mb = Iaa = Ibb = Iab = F(0)
+        for i in range(n):
+            x0, y0 = pts[i]
+            x1, y1 = pts[(i + 1) % n]
+            cr = x0 * y1 - x1 * y0
+            A += cr
+            Ma += (x0 + x1) * cr
+            Mb += (y0 + y1) * cr
+            Iaa += (x0 * x0 + x0 * x1 + x1 * x1) * cr
+            Ibb += (y0 * y0 + y0 * y1 + y1 * y1) * cr
+            Iab += (x0 * y1 + 2 * x0 * y0 + 2 * x1 * y1 + x1 * y0) * cr
+        return A / 2, Ma / 6, Mb / 6, Iaa / 12, Ibb / 12, Iab / 24
+
+    def centroid_f(self) -> tuple:
+        # W11: the old code returned length-weighted CENTRELINE midpoints —
+        # the wire's centroid. The solid's centroid weights each leg's
+        # clipped-prism centroid (miter wedge included): with the leg's two
+        # plane bounds affine in profile coords, s ∈ [α₀+β₀a+γ₀b, α₁+β₁a+γ₁b],
+        # every moment is a closed form in the profile's area/1st/2nd moments.
+        origins, dirs, frames, planes = self._leg_frames()
+        A, Ma, Mb, Iaa, Ibb, Iab = (float(x) for x in self._profile_integrals())
+
+        def E(al, be, ga):                    # ∫ s(a,b)² dA over the profile
+            return (al * al * A + 2 * al * be * Ma + 2 * al * ga * Mb
+                    + be * be * Iaa + 2 * be * ga * Iab + ga * ga * Ibb)
+
+        vol = 0.0
+        M = [0.0, 0.0, 0.0]
+        for k, t in enumerate(dirs):
+            P, (u, v) = origins[k], frames[k]
+            a0, b0, g0 = self._plane_coeffs(P, u, v, t, planes[k])
+            a1, b1, g1 = self._plane_coeffs(P, u, v, t, planes[k + 1])
+            da, db, dg = a1 - a0, b1 - b0, g1 - g0
+            Vk = da * A + db * Ma + dg * Mb
+            Mu = da * Ma + db * Iaa + dg * Iab
+            Mv = da * Mb + db * Iab + dg * Ibb
+            Ms = (E(a1, b1, g1) - E(a0, b0, g0)) / 2
+            vol += Vk
             for i in range(3):
-                acc[i] += seg * mid[i]
-            tot += seg
-        return (acc[0] / tot, acc[1] / tot, acc[2] / tot)
+                M[i] += P[i] * Vk + u[i] * Mu + v[i] * Mv + t[i] * Ms
+        return (M[0] / vol, M[1] / vol, M[2] / vol)
 
     def bbox(self):
-        # centerline bbox padded by the profile's circumradius estimate
-        pad = math.sqrt(float(self.area))
-        xs = [p[0] for p in self.path]
-        ys = [p[1] for p in self.path]
-        zs = [p[2] for p in self.path]
-        return ((float(min(xs)) - pad, float(min(ys)) - pad, float(min(zs)) - pad),
-                (float(max(xs)) + pad, float(max(ys)) + pad, float(max(zs)) + pad))
+        # W8: exact box of the union of clipped prisms — every extreme point
+        # of a leg polytope is a profile vertex on one of its two planes
+        # (never the √area pad, which understated wide profiles).
+        origins, dirs, frames, planes = self._leg_frames()
+        prof = [(float(a), float(b)) for a, b in self.profile]
+        lo = [math.inf] * 3
+        hi = [-math.inf] * 3
+        for k, t in enumerate(dirs):
+            P, (u, v) = origins[k], frames[k]
+            for plane in (planes[k], planes[k + 1]):
+                al, be, ga = self._plane_coeffs(P, u, v, t, plane)
+                for a, b in prof:
+                    s = al + be * a + ga * b
+                    for i in range(3):
+                        c = P[i] + a * u[i] + b * v[i] + s * t[i]
+                        if c < lo[i]:
+                            lo[i] = c
+                        if c > hi[i]:
+                            hi[i] = c
+        return (tuple(lo), tuple(hi))
 
     def watertight_violations(self) -> list:
         return []
@@ -1724,27 +1889,83 @@ class SphereOverlap:
             return PiVal(0, v1 - lens)
         return PiVal(0, v1 + v2 - lens)      # union
 
+    def _lens_moment_picoeff(self) -> Fraction:
+        """π-coefficient of the lens's first moment along the axis of
+        centres, measured from sphere A's centre. A cap {ξ ≥ r−h} of a
+        sphere radius r has moment about its own centre ∫ξ·π(r²−ξ²)dξ
+        = π h²(2r−h)²/4; B's cap rides at offset d and points backward."""
+        r1, r2, d = self.a.r, self.b.r, self.d
+        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+        h1 = r1 - d1
+        h2 = r2 - (d - d1)
+        return (h1 * h1 * (2 * r1 - h1) ** 2 / 4
+                + d * self._cap(r2, h2)
+                - h2 * h2 * (2 * r2 - h2) ** 2 / 4)
+
     def centroid_f(self) -> tuple:
-        return (float((self.a.cx + self.b.cx) / 2),
-                float((self.a.cy + self.b.cy) / 2),
-                float((self.a.cz + self.b.cz) / 2))
+        # W7: the old midpoint-of-centres was right only for the two
+        # symmetric ops (union/intersect of EQUAL spheres) — a cut centroid
+        # came back on the wrong side of the origin. The true centroid sits
+        # on the axis of centres at a RATIONAL offset ξ from A's centre
+        # (every term is rational·π, so π cancels in the ratio); the floats
+        # returned are the correctly-rounded exact values.
+        v1 = Fraction(4, 3) * self.a.r ** 3
+        v2 = Fraction(4, 3) * self.b.r ** 3
+        lens = self._lens_picoeff()
+        m = self._lens_moment_picoeff()
+        if self.op == "intersect":
+            xi = m / lens
+        elif self.op == "cut":
+            xi = -m / (v1 - lens)         # A's own moment about A is zero
+        else:                             # union = A + B − lens
+            xi = (self.d * v2 - m) / (v1 + v2 - lens)
+        a, b = self.a, self.b
+        w = xi / self.d                   # rational barycentric weight
+        return (float(a.cx + w * (b.cx - a.cx)),
+                float(a.cy + w * (b.cy - a.cy)),
+                float(a.cz + w * (b.cz - a.cz)))
+
+    def _support(self, e) -> float:
+        """Exact support (farthest reach) of the solid along the axis
+        direction ``e`` (a ±1 one-hot tuple). Every DECISION is a rational
+        comparison; only the final square root floats. Geometry: the cut
+        solid ends at the radical plane ξ = d1 = (d²+r1²−r2²)/(2d), the
+        lens's transverse extreme sits on the waist circle (centre
+        A + d1·û, radius w = √(r1²−d1²)), and a far pole survives iff it
+        is not strictly past the plane / inside the other sphere — with
+        rim and pole formulas agreeing exactly at the boundary. (The
+        pole-inside-A ∧ pole-inside-B corner case is impossible for a cut:
+        it would need d < |r1−r2|, which __init__ already refused.)"""
+        a, b = self.a, self.b
+        ac = (a.cx, a.cy, a.cz)
+        bc = (b.cx, b.cy, b.cz)
+        sa = sum(c * x for c, x in zip(ac, e)) + a.r
+        sb = sum(c * x for c, x in zip(bc, e)) + b.r
+        if self.op == "union":
+            return float(max(sa, sb))
+        d, r1, r2 = self.d, a.r, b.r
+        d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+        eu_d = sum((bc[i] - ac[i]) * e[i] for i in range(3))   # d·(e·û)
+        if self.op == "cut":
+            if r1 * eu_d <= d1 * d:       # A's far pole is not past the plane
+                return float(sa)
+        else:                             # intersect (the lens)
+            if sum((ac[i] + r1 * e[i] - bc[i]) ** 2 for i in range(3)) <= r2 * r2:
+                return float(sa)          # A's far pole is inside B
+            if sum((bc[i] + r2 * e[i] - ac[i]) ** 2 for i in range(3)) <= r1 * r1:
+                return float(sb)          # B's far pole is inside A
+        # extreme on the waist circle
+        w2 = r1 * r1 - d1 * d1
+        ce = sum(ac[i] * e[i] for i in range(3)) + d1 * eu_d / d
+        return float(ce) + math.sqrt(float(w2 * (1 - eu_d * eu_d / (d * d))))
 
     def bbox(self):
-        a, b = self.a, self.b
-        if self.op == "intersect":
-            lo = (max(a.cx - a.r, b.cx - b.r), max(a.cy - a.r, b.cy - b.r),
-                  max(a.cz - a.r, b.cz - b.r))
-            hi = (min(a.cx + a.r, b.cx + b.r), min(a.cy + a.r, b.cy + b.r),
-                  min(a.cz + a.r, b.cz + b.r))
-            return (tuple(float(v) for v in lo), tuple(float(v) for v in hi))
-        s = a if self.op == "cut" else None
-        boxes = [a] if s else [a, b]
-        lo = (min(float(x.cx - x.r) for x in boxes),
-              min(float(x.cy - x.r) for x in boxes),
-              min(float(x.cz - x.r) for x in boxes))
-        hi = (max(float(x.cx + x.r) for x in boxes),
-              max(float(x.cy + x.r) for x in boxes),
-              max(float(x.cz + x.r) for x in boxes))
+        # W12: the cut box was sphere A's whole box (+25% on the cut axis)
+        # and the intersect box ignored the lens waist. Exact per-axis
+        # support of the actual solid; union keeps its two-sphere box.
+        axes = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+        lo = tuple(-self._support((-e[0], -e[1], -e[2])) for e in axes)
+        hi = tuple(self._support(e) for e in axes)
         return (lo, hi)
 
     def watertight_violations(self) -> list:

@@ -160,8 +160,12 @@ def fillet_box(a, b, c, r, origin=(0, 0, 0)):
     return RoundedBox(a, b, c, r, origin)
 
 
-def sweep(profile_area, path):
-    """Mitered sweep of a convex profile — exact volume in Q[sqrt d]."""
+def sweep(profile_area, path, profile=None):
+    """Mitered sweep of a convex profile — exact volume in Q[sqrt d].
+
+    Pass the profile POLYGON as ``profile`` (vertices (u, v) with (0, 0)
+    riding the path) to get exact bbox/centroid; from an area alone the
+    solid knows its volume but refuses metrics (W8/W11)."""
     from forgekernel.quadric import MiteredSweep
 
-    return MiteredSweep(profile_area, path)
+    return MiteredSweep(profile_area, path, profile=profile)
