@@ -211,6 +211,32 @@ def test_coaxial_bores_are_one_stepped_void(label, build) -> None:
     assert B.volume(B.to_body(d)) == d.volume()
 
 
+GAPPED = [
+    # blind bore up from the bottom (r=2, z 0..3) and a wider blind bore down
+    # from the top (r=3, z 9..12): coaxial, separated by 6 mm of material
+    ("gap, step up", lambda: DrilledSolid(Solid.box(20, 20, 12), [])
+     .cut(Cyl(10, 10, 2, 0, 3)).cut(Cyl(10, 10, 3, 9, 12))),
+    ("gap, step down", lambda: DrilledSolid(Solid.box(20, 20, 12), [])
+     .cut(Cyl(10, 10, 3, 0, 3)).cut(Cyl(10, 10, 2, 9, 12))),
+    ("gap, same radius", lambda: DrilledSolid(Solid.box(20, 20, 12), [])
+     .cut(Cyl(10, 10, 2, 0, 3)).cut(Cyl(10, 10, 2, 9, 12))),
+]
+
+
+@pytest.mark.parametrize("label,build", GAPPED, ids=[g[0] for g in GAPPED])
+def test_gapped_coaxial_bores_grow_no_phantom_shoulder(label, build) -> None:
+    """W6: two coaxial bores that do NOT touch are two voids with a slab of
+    material between them — there is no shoulder. The converter's shoulder
+    loop walked zip(bands, bands[1:]) with only an equal-radius skip, so a
+    gapped stack with different radii grew a phantom annulus hanging in solid
+    material: volume off by exactly pi*(r_out^2 - r_in^2) with validate happy,
+    while the annulus' rims broke edge pairing (used 3x and 1x)."""
+    d = build()
+    canon = B.to_body(d)
+    assert B.manifold_violations(canon) == []
+    assert B.volume(canon) == d.volume()
+
+
 def test_a_whole_sphere_still_bounds_its_bbox() -> None:
     """A SphereS face carries no loops, and bbox walked loops only — so a
     sphere contributed nothing and the bounds came back inf/-inf."""

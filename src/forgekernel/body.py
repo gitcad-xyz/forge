@@ -2654,6 +2654,14 @@ def from_drilled(d) -> Body:
                               (Loop((Edge(lo_c, a, a), Edge(hi_c, b, b))),),
                               False))
         for (za, zb, r0), (zb2, zc, r1) in zip(bands, bands[1:]):
+            if zb2 != zb:
+                # the bands do not touch: a slab of material sits between two
+                # blind bores, and each already got its own floor/ceiling from
+                # the `ends` walk above. Emitting a shoulder here hung a
+                # phantom annulus in solid material — volume wrong by an exact
+                # pi multiple while validate stayed happy (W6), and the
+                # annulus' two rims tore edge pairing (used 3x and 1x).
+                continue
             if r0 == r1:
                 continue                              # no step: no shoulder
             rin, rout = min(r0, r1), max(r0, r1)
