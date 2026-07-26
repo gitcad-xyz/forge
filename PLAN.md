@@ -20,8 +20,14 @@ ending with the full verification ritual.
 | decision record | gitcad `docs/adr/0018-native-kernel.md`; coverage matrix `docs/research/kernel-coverage-plan.md` |
 | python | ALWAYS `C:/Users/danie/cad-dev/.venv/Scripts/python.exe` (plain `python` lacks gitcad; forgekernel is pip-installed -e into that venv) |
 
-Current state (2026-07-23): ref capability 52.9% (9/17), OCCT 94.1%
-(fails `swept_channel`), substantive disagreements 0 in every snapshot.
+Current state (2026-07-26): forge is the SOLE kernel — OCCT was removed
+from gitcad entirely (ADR-0020), so the OCCT columns above are history.
+Source of truth is now the seam capability matrix
+(`python -m gitcad.bench.capability --md`): **339/345 (98%)** on main
+(2 gaps, 4 permanently-inexact cells, 0 crashes); the released 0.9.6
+wheels score 327/345 (95%). Released: `forgekernel` + `forgekernel_rs`
+0.9.6 on PyPI; main is ahead of the tag (surdrev, wider exact fields,
+torus/napkin-ring work — unreleased).
 
 ## 1. Rules of engagement (non-negotiable)
 
