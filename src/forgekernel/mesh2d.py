@@ -42,6 +42,18 @@ def triangulate(outer: list[Pt], holes: list[list[Pt]] = (), *,
     two faces meet along mismatched edges and the shell cracks. A plate with a
     square through-hole came out with 12 unpaired edges: the mesh volume is
     right, so nothing downstream notices until the STL fails to print.
+
+    Collinearity is decided with a noise-scaled EPSILON when keep_collinear is
+    on (#131). The seam vertices are exactly collinear in the b-rep, but the
+    caller's 2D projection is float, so they arrive ~1e-15 off the line — on
+    either side, per face. An exact ``area == 0`` test then misses them, and
+    when the noise lands on the convex side the ear scan ate the vertex as a
+    near-zero-area SLIVER whose long edge chords past the seam: undirected
+    edge counts still pair (the sliver launders the T-junction), but the mesh
+    overlaps itself and tears the moment anything discards degenerate facets.
+    Chamfering a shelled box shipped exactly that. Floats deciding here is
+    legal — this is meshing (ADR-0019); no exact predicate consumes the
+    result.
     """
     pts: list[Pt] = list(outer)
     hole_indices = []
@@ -50,33 +62,43 @@ def triangulate(outer: list[Pt], holes: list[list[Pt]] = (), *,
         pts.extend(h)
 
     flat = [c for p in pts for c in p]
+    eps = 0.0
+    if keep_collinear and pts:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        span = max(max(xs) - min(xs), max(ys) - min(ys))
+        eps = span * span * 1e-12
     tris: list[int] = []
-    outer_node = _linked_list(flat, 0, len(outer) * 2, 2, True, keep_collinear)
+    outer_node = _linked_list(flat, 0, len(outer) * 2, 2, True, keep_collinear,
+                              eps)
     if outer_node is None or outer_node.next is outer_node.prev:
         return pts, []
     if hole_indices:
         outer_node = _eliminate_holes(flat, hole_indices, outer_node, 2,
-                                      keep_collinear)
-    _earcut_linked(outer_node, tris, 2)
+                                      keep_collinear, eps)
+    _earcut_linked(outer_node, tris, 2, eps=eps)
     return pts, [(tris[i], tris[i + 1], tris[i + 2]) for i in range(0, len(tris), 3)]
 
 
-def _mark_collinear_steiner(last):
+def _mark_collinear_steiner(last, eps=0.0):
     """Flag every mid-edge vertex so _filter_points keeps it. Exact-duplicate
-    vertices are deliberately left removable — earcut needs those gone."""
+    vertices are deliberately left removable — earcut needs those gone.
+    ``eps`` admits vertices the caller's float projection pushed a hair off
+    the line (#131) — they are exact seams in the b-rep."""
     if last is None:
         return
     p = last
     while True:
         if (not _equals(p, p.next) and not _equals(p, p.prev)
-                and _area(p.prev, p, p.next) == 0):
+                and abs(_area(p.prev, p, p.next)) <= eps):
             p.steiner = True
         p = p.next
         if p is last:
             break
 
 
-def _linked_list(data, start, end, dim, clockwise, keep_collinear=False):
+def _linked_list(data, start, end, dim, clockwise, keep_collinear=False,
+                 eps=0.0):
     last = None
     if clockwise == (_signed_area(data, start, end, dim) > 0):
         for i in range(start, end, dim):
@@ -88,7 +110,7 @@ def _linked_list(data, start, end, dim, clockwise, keep_collinear=False):
         _remove_node(last)
         last = last.next
     if keep_collinear:
-        _mark_collinear_steiner(last)
+        _mark_collinear_steiner(last, eps)
     return last
 
 
@@ -112,14 +134,14 @@ def _filter_points(start, end=None):
     return end
 
 
-def _earcut_linked(ear, triangles, dim, pass_=0):
+def _earcut_linked(ear, triangles, dim, pass_=0, eps=0.0):
     if ear is None:
         return
     ear = _filter_points(ear)
     stop = ear
     while ear.prev is not ear.next:
         prev, nxt = ear.prev, ear.next
-        if _is_ear(ear):
+        if _is_ear(ear, eps):
             triangles.append(prev.i)
             triangles.append(ear.i)
             triangles.append(nxt.i)
@@ -130,19 +152,21 @@ def _earcut_linked(ear, triangles, dim, pass_=0):
         ear = nxt
         if ear is stop:
             if pass_ == 0:
-                _earcut_linked(_filter_points(ear), triangles, dim, 1)
+                _earcut_linked(_filter_points(ear), triangles, dim, 1, eps)
             elif pass_ == 1:
                 ear = _cure_local_intersections(_filter_points(ear), triangles)
-                _earcut_linked(ear, triangles, dim, 2)
+                _earcut_linked(ear, triangles, dim, 2, eps)
             elif pass_ == 2:
-                _split_earcut(ear, triangles, dim)
+                _split_earcut(ear, triangles, dim, eps)
             return
 
 
-def _is_ear(ear):
+def _is_ear(ear, eps=0.0):
     a, b, c = ear.prev, ear, ear.next
-    if _area(a, b, c) >= 0:
-        return False                        # reflex
+    if _area(a, b, c) >= -eps:
+        return False                        # reflex — or a sliver within the
+        # projection noise (#131): eating a seam vertex as a near-zero-area
+        # ear chords past it and tears the shell against the neighbour face
     p = c.next
     while p is not a:
         if (_point_in_triangle(a.x, a.y, b.x, b.y, c.x, c.y, p.x, p.y)
@@ -170,7 +194,7 @@ def _cure_local_intersections(start, triangles):
     return _filter_points(p)
 
 
-def _split_earcut(start, triangles, dim):
+def _split_earcut(start, triangles, dim, eps=0.0):
     a = start
     while True:
         b = a.next.next
@@ -179,8 +203,8 @@ def _split_earcut(start, triangles, dim):
                 c = _split_polygon(a, b)
                 a = _filter_points(a, a.next)
                 c = _filter_points(c, c.next)
-                _earcut_linked(a, triangles, dim, 0)
-                _earcut_linked(c, triangles, dim, 0)
+                _earcut_linked(a, triangles, dim, 0, eps)
+                _earcut_linked(c, triangles, dim, 0, eps)
                 return
             b = b.next
         a = a.next
@@ -188,11 +212,13 @@ def _split_earcut(start, triangles, dim):
             break
 
 
-def _eliminate_holes(data, hole_indices, outer_node, dim, keep_collinear=False):
+def _eliminate_holes(data, hole_indices, outer_node, dim, keep_collinear=False,
+                     eps=0.0):
     queue = []
     for i, start in enumerate(hole_indices):
         end = hole_indices[i + 1] * dim if i + 1 < len(hole_indices) else len(data)
-        lst = _linked_list(data, start * dim, end, dim, False, keep_collinear)
+        lst = _linked_list(data, start * dim, end, dim, False, keep_collinear,
+                           eps)
         if lst is lst.next:
             lst.steiner = True
         queue.append(_left_most(lst))

@@ -1616,7 +1616,18 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
     # it per circle tears every taper: a frustum's r=2 and r=5 rims want
     # different counts, so the wall and the caps stop sharing vertices. Coaxial
     # bores in a counterbore have the same problem.
+    #
+    # #137: an axis that carries a TWELFTH trim (a 30°/60° crossing from the
+    # odd-twelfth straddling-bore family) gets a 12·2^d count instead of the
+    # dyadic 4·2^d, so the trimmed band, the rim arcs and every whole circle
+    # on that axis still land on one shared grid. The only sampler that
+    # cannot follow is a dyadic corner OCTANT (2^d points per quarter — no
+    # power of two divides into thirds), so the refusal narrows to the case
+    # where an octant genuinely shares the axis, instead of refusing every
+    # twelfth-trimmed body outright.
     axis_segs: dict = {}
+    twelfth_axes: set = set()
+    octant_axes: set = set()
     for f in body.faces:
         if isinstance(f.surface, Torus):
             # a torus shares its axis with the cylinders and disks it blends
@@ -1652,12 +1663,33 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             k = _line_key(rims[0].c, rims[0].n)
             axis_segs[k] = max(axis_segs.get(k, 0),
                                _segs_for(widest, deflection / 2))
+        is_octant = (isinstance(f.surface, SphereS) and f.loops
+                     and f.surface.pole is None and zone_span is None)
         for lp in f.loops:
             for e in lp.edges:
                 if isinstance(e.curve, Circle):
                     k = _line_key(e.curve.c, e.curve.n)
                     axis_segs[k] = max(axis_segs.get(k, 0),
                                        _segs_for(float(e.curve.r)))
+                    if is_octant:
+                        octant_axes.add(k)
+                    if e.v0 != e.v1:
+                        try:
+                            a_k0, a_span = _arc_quarters(e.curve, e.v0, e.v1)
+                        except ValueError:
+                            pass                # off the twelfth grid entirely
+                        else:
+                            if a_k0 % 3 or a_span % 3:
+                                twelfth_axes.add(k)
+    for k in twelfth_axes:
+        n = axis_segs.get(k, 0)
+        if n and n % 12:
+            # the next 12·2^d at or above the dyadic count — never coarser,
+            # and every quarter and twelfth point lies on the same grid
+            d = 1
+            while 12 * 2 ** d < n:
+                d += 1
+            axis_segs[k] = 12 * 2 ** d
 
     def circle_pts(c: Circle, n=None):
         r = float(c.r)
@@ -1692,8 +1724,15 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
         except ValueError:
             return _arc_pts(c, v0, v1, deflection)
         if span % 3:
-            return _arc_pts(c, v0, v1, deflection)
-        nseg = _per_quarter(c) * (span // 3)
+            # an odd-twelfth arc: only meshable on a shared grid when its
+            # whole axis runs at 12·2^d (#137) — free sampling here would
+            # tear against the trimmed band beside it
+            n_axis = axis_segs.get(_line_key(c.c, c.n), 0)
+            if not n_axis or n_axis % 12:
+                return _arc_pts(c, v0, v1, deflection)
+            nseg = (n_axis // 12) * span
+        else:
+            nseg = _per_quarter(c) * (span // 3)
         cc = tuple(float(x) for x in c.c)
         rr = float(c.r)
         return [tuple(cc[t] + rr * (math.cos((k0 + span * m / nseg) * math.pi / 6)
@@ -1763,19 +1802,24 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             # match the band to that or the shell tears along every seam.
             per = _per_quarter(circ)
             if span % 3:
-                # The exact arithmetic reaches twelfths (30° steps); the MESH
-                # cannot follow yet, and the reason is structural rather than
-                # unfinished. A corner octant is subdivided dyadically, giving
-                # 2^d points per QUARTER, and no power of two divides into
-                # thirds — so a 30° band and the octant beside it have no
-                # common grid and the shell would tear along every seam.
-                # Sampling the octant non-dyadically is the fix; until then say
-                # so rather than emit a torn mesh (K3.7).
-                raise ValueError(
-                    f"a band spanning {span} twelfths of a turn cannot share a "
-                    "mesh grid with dyadic corner octants — 30° trims are "
-                    "exact but not yet meshable (K3.7)")
-            nseg = per * (span // 3)
+                # The exact arithmetic reaches twelfths (30° steps), and so
+                # does the mesh now (#137): the axis bucket runs at 12·2^d
+                # whenever a twelfth trim is present, so the band, the rim
+                # arcs and every whole circle share one grid. The one sampler
+                # that cannot follow is a dyadic corner OCTANT (2^d points per
+                # quarter — no power of two divides into thirds), so only a
+                # genuine octant on this axis still refuses.
+                band_key = _line_key(circ.c, circ.n)
+                n_axis = axis_segs.get(band_key, 0)
+                if band_key in octant_axes or not n_axis or n_axis % 12:
+                    raise ValueError(
+                        f"a band spanning {span} twelfths of a turn cannot "
+                        "share a mesh grid with dyadic corner octants — 30° "
+                        "trims are exact but not meshable beside an octant "
+                        "(K3.7)")
+                nseg = (n_axis // 12) * span
+            else:
+                nseg = per * (span // 3)
             axis = _unit(tuple(float(x) for x in s.d))
             # every CIRCULAR rim, not only the trimmed arcs — the same source
             # _band_height reads. A band whose far rim is a whole circle while

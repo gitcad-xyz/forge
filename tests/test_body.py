@@ -1475,15 +1475,47 @@ def test_an_arc_off_a_twelfth_still_refuses() -> None:
     assert B._quarter_index(c, (root2, root2, F(0))) is None
 
 
-def test_a_thirty_degree_band_refuses_to_MESH_and_says_why() -> None:
-    """The exact arithmetic reaches twelfths; the display mesh cannot follow,
-    and the reason is structural rather than unfinished — a corner octant is
-    subdivided dyadically, giving 2^d points per QUARTER, and no power of two
-    divides into thirds. Emitting a torn shell would be the wrong answer, so it
-    says so."""
+def test_a_thirty_degree_band_meshes_on_the_twelfth_grid() -> None:
+    """#137 closed — the strictly stronger contract replaces the old refusal
+    pin. The blanket refusal reasoned that a corner octant subdivides
+    dyadically (2^d points per quarter) and no power of two divides into
+    thirds; true, but it refused every twelfth-trimmed body whether or not an
+    octant was anywhere near it. The axis bucket now runs at 12·2^d whenever
+    a twelfth trim is present, so a lone 30° band meshes — with its arc
+    endpoints landing EXACTLY on the trim directions — and the refusal
+    narrows to a dyadic octant genuinely sharing the axis (the next test)."""
     face = _wedge_face(1)
-    with pytest.raises(ValueError, match="twelfths of a turn"):
-        B.tessellate(B.Body((face,)), 0.2)
+    mesh = B.tessellate(B.Body((face,)), 0.2)
+    assert mesh["triangles"]
+    verts = {tuple(round(c, 9) for c in v) for v in mesh["vertices"]}
+    # the 0° and 30° rim endpoints, exact on the grid: (2,0,0) and (√3,1,0)
+    assert (2.0, 0.0, 0.0) in verts
+    assert (round(math.sqrt(3), 9), 1.0, 0.0) in verts
+    # chordal lateral area must approximate r·Δθ·h = 2·(π/6)·5
+    area = 0.0
+    v = mesh["vertices"]
+    for a, b, c in mesh["triangles"]:
+        pa, pb, pc = v[a], v[b], v[c]
+        cr = ((pb[1] - pa[1]) * (pc[2] - pa[2]) - (pb[2] - pa[2]) * (pc[1] - pa[1]),
+              (pb[2] - pa[2]) * (pc[0] - pa[0]) - (pb[0] - pa[0]) * (pc[2] - pa[2]),
+              (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0]))
+        area += math.sqrt(sum(x * x for x in cr)) / 2
+    assert area == pytest.approx(2 * (math.pi / 6) * 5, rel=0.02)
+
+
+def test_a_twelfth_band_beside_a_dyadic_octant_still_refuses() -> None:
+    """The genuinely structural remnant of the old refusal: a sphere face on
+    the octant path subdivides dyadically, and no power of two divides into
+    thirds — so a 30° band sharing its AXIS has no common grid with it and
+    must refuse by name rather than emit a torn shell."""
+    face = _wedge_face(1)
+    rim = B.Circle((F(0), F(0), F(7)), (F(0), F(0), F(1)),
+                   (F(1), F(0), F(0)), F(2))
+    v = (F(2), F(0), F(7))
+    oct_face = B.Face(B.SphereS((F(0), F(0), F(7)), F(2)),
+                      (B.Loop((B.Edge(rim, v, v),)),), True)
+    with pytest.raises(ValueError, match="octant"):
+        B.tessellate(B.Body((face, oct_face)), 0.2)
 
 
 # -- the arc oracle: a complementary arc is a DIFFERENT edge ------------------
