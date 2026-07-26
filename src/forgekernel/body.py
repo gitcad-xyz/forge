@@ -1135,6 +1135,29 @@ def bbox(body: Body):
                 lo[i] = min(lo[i], float(c[i]) - r)
                 hi[i] = max(hi[i], float(c[i]) + r)
             continue
+        if isinstance(f.surface, Cone) and len(f.loops) < 2:
+            # A POINTED cone's apex is a singular point lying on no edge, so
+            # the walk below never visits it and the box collapsed along the
+            # axis: scale(cone(6,0,10), 2) reported a z-extent of 0.0 for a
+            # 20 mm solid. Third instance of one pattern, after Torus and
+            # SphereS: the extreme is not on any edge.
+            #
+            # Two loops means the cone is truncated at both ends and the apex
+            # is not part of the face, so it must NOT be added — a bound may be
+            # loose, but needlessly loosening every frustum would blunt the
+            # AABB pre-filter that part.interference depends on.
+            #
+            # The loop count is a sufficient test for every cone this kernel
+            # builds, not a proof for arbitrary trimming. The backstop for the
+            # general case is gitcad's tests/invariants/test_bbox_is_a_sound_
+            # bound.py, which asserts the mesh fits inside the reported box for
+            # the whole corpus under transforms — that is the property that
+            # matters, and it fails loudly if a trimming ever escapes this.
+            ap = f.surface.p
+            for i in range(3):
+                lo[i] = min(lo[i], float(ap[i]))
+                hi[i] = max(hi[i], float(ap[i]))
+            # fall through: the base circle still contributes its own extent
         for lp in f.loops:
             circ = _loop_is_circle(lp)
             if circ is not None:
