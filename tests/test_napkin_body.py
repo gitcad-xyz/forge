@@ -135,6 +135,21 @@ def test_a_translated_ring_converts_about_its_own_centre() -> None:
     assert float(hi[2]) == pytest.approx(7 + 6.0)
 
 
+def test_a_fractional_band_converts_at_the_right_height() -> None:
+    """Same defect as the contour-level test in test_surdrev.py, one layer up:
+    `NapkinRing._half_height` truncated a fractional R² − r² through ``int()``,
+    so the BODY's rims sat at ±1 instead of ±√(5/4) — a well-formed, watertight,
+    wrong solid. Volume literal: (4/3)π·(5/4)^(3/2) = (5/6)√5·π."""
+    got = B.volume(B.to_body(NapkinRing(Q(3, 2), 1)))
+    assert got.a == 0
+    assert got.b == SurdVal(0, Q(5, 6), 5), f"{got.b!r} != (5/6)·√5"
+    # the representation's OWN bbox is tight in z, so the truncation showed
+    # there too: it reported ±1 where ±√(5/4) belongs (the Body bbox is
+    # allowed to be loose in z and stays at ±R — not asserted here)
+    lo, hi = NapkinRing(Q(3, 2), 1).bbox()
+    assert float(hi[2]) == pytest.approx(math.sqrt(5 / 4), rel=1e-12)
+
+
 def test_the_zone_term_is_not_applied_to_a_whole_sphere() -> None:
     """Guard against the seductive over-application of Archimedes' 2πrΔz.
 

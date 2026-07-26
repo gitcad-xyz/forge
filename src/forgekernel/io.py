@@ -92,7 +92,13 @@ def dumps_body(body) -> str:
             return {"kind": "cone", "p": _vec(s.p), "d": _vec(s.d),
                     "tan_half": _num(s.tan_half)}
         if isinstance(s, SphereS):
-            return {"kind": "sphere", "c": _vec(s.c), "r": _num(s.r)}
+            out = {"kind": "sphere", "c": _vec(s.c), "r": _num(s.r)}
+            if s.pole is not None:
+                # the pole TRIM is part of what the surface is (a blind
+                # bore's one-rim face) — dropping it would make the document
+                # describe a different solid, silently
+                out["pole"] = _vec(s.pole)
+            return out
         raise ValueError(
             f"no text encoding for a {type(s).__name__} surface yet (K3.7)")
 
@@ -186,7 +192,8 @@ def loads_body(text: str):
             return Cone(vec(need(s, "p", list)), vec(need(s, "d", list)),
                         scalar(need(s, "tan_half", str)))
         if k == "sphere":
-            return SphereS(vec(need(s, "c", list)), scalar(need(s, "r", str)))
+            return SphereS(vec(need(s, "c", list)), scalar(need(s, "r", str)),
+                           vec(need(s, "pole", list)) if "pole" in s else None)
         raise ValueError(f"unknown surface kind {k!r}")
 
     def curve(c):

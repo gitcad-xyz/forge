@@ -95,11 +95,21 @@ class Torus:
 
 @dataclass(frozen=True)
 class SphereS:
+    """``pole`` is a TRIM carried on the surface, following the Torus
+    precedent (its k0/span): a spherical face bounded by ONE rim is ambiguous
+    — the cap on one side and the pole-containing remainder on the other are
+    both bounded by that rim, and nothing structural could catch the
+    substitution (`_sphere_zone`'s docstring). ``pole`` is the direction (need
+    not be unit) of the pole the face CONTAINS. ``None`` — the default, and
+    what every existing constructor builds — means untrimmed: a whole sphere,
+    an octant, or a two-rim zone, exactly as before."""
     c: Vec
     r: Fraction
+    pole: Vec | None = None
 
     def transformed(self, m):
-        return SphereS(m.point(self.c), m.scale_len(self.r))
+        return SphereS(m.point(self.c), m.scale_len(self.r),
+                       None if self.pole is None else m.direction(self.pole))
 
 
 # -- curves ------------------------------------------------------------------
@@ -769,15 +779,28 @@ def _face_volume_term(face: Face):
         # x·n̂ = r + c·n̂. Over the whole sphere ∮c·n̂ dA = 0, leaving
         # (1/3)r·4πr². Over one OCTANT neither term vanishes: the area is
         # πr²/2 and ∮n̂ dA is (πr²/4) times the octant's sign vector.
-        zone = _sphere_zone(face, s)
-        if zone is not None:
-            # A ZONE between two z-parallel rims — the surviving surface of a
-            # sphere with a coaxial bore. On a sphere x·n̂ = r everywhere, so
-            # the term is (1/3)·r·Area, and Archimedes gives the zone's area
-            # as 2πr·Δz exactly: it depends only on the SLAB HEIGHT, not on
-            # where the slab sits. Hence (2πr²/3)·Δz, with Δz generally in
-            # ℚ[√d] — which is precisely why this needed F() widened first.
-            return _pi_value(0, sgn * 2 * s.r * s.r * zone / 3, "sphere zone")
+        span = (_sphere_pole_span(face, s) if s.pole is not None
+                else _sphere_zone(face, s))
+        if span is not None:
+            # A ZONE between two z-parallel latitudes — two rims for a
+            # napkin ring's band, or one rim plus a surviving pole for a
+            # blind bore. On a sphere x·n̂ = r + c·n̂, so the term is
+            # (1/3)(r·Area + c·∮n̂dA). Archimedes gives Area = 2πr·Δz
+            # exactly — it depends only on the SLAB HEIGHT — and
+            # ∮n̂dA = π((z_hi−c_z)² − (z_lo−c_z)²)·ẑ by the same projection.
+            # The OFFSET term is identically zero for a zone symmetric about
+            # the sphere's centre (every napkin ring), which is why its
+            # absence was invisible until the blind bore arrived: a one-rim
+            # face has ∮n̂dA = −πr_rim²·ẑ ≠ 0, and dropping it goes wrong by
+            # exactly c_z·πr_rim²/3 the moment the solid leaves the origin.
+            # Δz and the offset are generally in ℚ[√d] — precisely why this
+            # needed F() widened first.
+            zlo, zhi = span
+            off = s.c[2] * ((zhi - s.c[2]) * (zhi - s.c[2])
+                            - (zlo - s.c[2]) * (zlo - s.c[2]))
+            return _pi_value(
+                0, sgn * (2 * s.r * s.r * (zhi - zlo) + off) / 3,
+                "sphere zone")
         oct_ = _sphere_octant(face)
         if oct_ is None:
             return PiVal(0, _exact(sgn * 4 * s.r ** 3 / 3, "sphere"))
@@ -935,7 +958,8 @@ def _band_sweep(arcs, cyl: Cylinder):
 
 
 def _sphere_zone(face: Face, s: "SphereS"):
-    """Δz of a spherical ZONE bounded by two z-parallel circular rims, or None.
+    """(z_lo, z_hi) of a spherical ZONE bounded by two z-parallel circular
+    rims, or None.
 
     Deliberately narrow: exactly two full-circle rims, both perpendicular to z,
     both actually on the sphere. Anything else falls through to the octant path
@@ -945,13 +969,19 @@ def _sphere_zone(face: Face, s: "SphereS"):
 
     ONE AMBIGUITY IS NOT RESOLVED HERE, and must not be papered over by anyone
     widening this. Two rims bound a sphere in two ways: the BAND between them
-    and the pair of polar caps outside them. The b-rep as it stands carries no
-    flag distinguishing the two, so this function assumes the band — which is
-    what `from_napkin_ring` builds and the only thing in the kernel that
-    reaches here. If a caps-shaped face ever needs representing, it needs a
-    representational change (a trim domain), not a looser predicate: the term
-    for the caps is 4πr³/3 − 2πr²Δz/3 and nothing structural would catch the
-    substitution.
+    and the pair of polar caps outside them. The b-rep carries no flag
+    distinguishing the two ON A TWO-RIM FACE, so this function assumes the
+    band — which is what `from_napkin_ring` builds and the only thing in the
+    kernel that reaches here. If a caps-shaped face ever needs representing,
+    it needs a representational change (a trim domain), not a looser
+    predicate: the term for the caps is 4πr³/3 − 2πr²Δz/3 and nothing
+    structural would catch the substitution.
+
+    The ONE-RIM edition of that ambiguity (the cap above the rim versus the
+    pole-containing remainder below it) IS resolved, by exactly such a
+    representational change: `SphereS.pole` carries the trim on the surface
+    (the Torus k0/span precedent), and `_sphere_pole_span` reads it. A
+    one-rim face WITHOUT the flag still refuses through the octant path.
     """
     if len(face.loops) != 1:
         return None
@@ -972,7 +1002,44 @@ def _sphere_zone(face: Face, s: "SphereS"):
             return None                      # rim does not lie ON the sphere
         zs.append(c.c[2])
     hi, lo = (zs[0], zs[1]) if _gt(zs[0], zs[1]) else (zs[1], zs[0])
-    return hi - lo
+    return lo, hi
+
+
+def _sphere_pole_span(face: Face, s: "SphereS"):
+    """(z_lo, z_hi) of a spherical face bounded by ONE z-parallel rim, where
+    ``s.pole`` says which pole the face contains. Raises on anything else —
+    a malformed pole-trimmed face must refuse, never fall back to a guess.
+
+    The pole itself is a singular point on no edge, exactly like a pointed
+    cone's apex (`_cone_rim_count`), so the face's single edge is the rim —
+    and so `manifold_violations` needs no exemption: the rim pairs with the
+    bore wall and nothing dangles.
+    """
+    if s.pole is None:
+        raise ValueError("not a pole-trimmed sphere face")
+    if s.pole[0] != 0 or s.pole[1] != 0 or s.pole[2] == 0:
+        raise ValueError(
+            "a pole-trimmed sphere face whose pole is off the z axis is "
+            "outside what this term computes (K3.7)")
+    if len(face.loops) != 1 or len(face.loops[0].edges) != 1:
+        raise ValueError(
+            "a pole-trimmed sphere face must carry exactly one rim (K3.7)")
+    e = face.loops[0].edges[0]
+    c = e.curve
+    if (not isinstance(c, Circle) or e.v0 != e.v1
+            or c.n[0] != 0 or c.n[1] != 0
+            or c.c[0] != s.c[0] or c.c[1] != s.c[1] or c.r == 0):
+        raise ValueError(
+            "a pole-trimmed sphere face needs one full circular rim, "
+            "coaxial with the sphere and of positive radius (K3.7)")
+    dz = c.c[2] - s.c[2]
+    if dz * dz + c.r * c.r != s.r * s.r:
+        raise ValueError(
+            "the rim of a pole-trimmed sphere face does not lie on the "
+            "sphere (K3.7)")
+    if _gt(0 * s.pole[2], s.pole[2]):                  # pole points down
+        return s.c[2] - s.r, c.c[2]
+    return c.c[2], s.c[2] + s.r
 
 
 def _gt(a, b) -> bool:
@@ -1558,9 +1625,12 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             k = _line_key(f.surface.c, f.surface.d)
             axis_segs[k] = max(axis_segs.get(k, 0),
                                _segs_for(float(f.surface.R + f.surface.a)))
-        zone_dz = (_sphere_zone(f, f.surface)
-                   if isinstance(f.surface, SphereS) else None)
-        if zone_dz is not None:
+        zone_span = None
+        if isinstance(f.surface, SphereS):
+            zone_span = (_sphere_pole_span(f, f.surface)
+                         if f.surface.pole is not None
+                         else _sphere_zone(f, f.surface))
+        if zone_span is not None:
             # A spherical ZONE is WIDER than either of its rims — a napkin ring
             # bored at r=1 through a sphere of R=6 bulges to r=6 in between.
             # Taking the bucket from the rims alone (the loop below) meshed
@@ -1569,13 +1639,15 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             # of a silent wrong answer. The count has to come from the WIDEST
             # circle the face actually spans, and it has to land in the same
             # bucket as the bore wall or the shell tears along both rims.
+            # A pole-trimmed face (blind bore) spans rim to POLE, so its z
+            # extent comes from the span, not from its single rim.
             #
             # Floats are legal here — this is meshing (ADR-0019).
             rims = [e.curve for lp in f.loops for e in lp.edges]
             cz = float(f.surface.c[2])
-            zs = [float(c.c[2]) for c in rims]
+            zs = [float(z) for z in zone_span]
             rr = float(f.surface.r)
-            widest = rr if min(zs) <= cz <= max(zs) else max(
+            widest = rr if zs[0] <= cz <= zs[1] else max(
                 math.sqrt(max(0.0, rr * rr - (z - cz) ** 2)) for z in zs)
             k = _line_key(rims[0].c, rims[0].n)
             axis_segs[k] = max(axis_segs.get(k, 0),
@@ -1780,31 +1852,48 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                     outn = nrm if face.sense else tuple(-x for x in nrm)
                     tri(pa, pb, pc, outn)
                     tri(pa, pc, pd, outn)
-        elif isinstance(s, SphereS) and _sphere_zone(face, s) is not None:
-            # A spherical ZONE: the band of a sphere between two coaxial rims,
-            # which is what survives when a bore is drilled clean through. It
-            # is neither a whole sphere nor an octant, so the octant path below
-            # rightly refuses it — but refusing is a mesh that does not exist,
-            # and #124 removed the fallback that quietly meshed the
-            # representation instead (it discarded the caller's deflection).
+        elif isinstance(s, SphereS) and (
+                s.pole is not None or _sphere_zone(face, s) is not None):
+            # A spherical ZONE: the band of a sphere between two coaxial rims
+            # (a through bore), or between one rim and a surviving POLE (a
+            # blind bore — `SphereS.pole` carries which side). It is neither a
+            # whole sphere nor an octant, so the octant path below rightly
+            # refuses it — but refusing is a mesh that does not exist, and
+            # #124 removed the fallback that quietly meshed the representation
+            # instead (it discarded the caller's deflection).
             #
-            # The ONLY thing watertightness depends on is that the two boundary
+            # The ONLY thing watertightness depends on is that the boundary
             # rings land on exactly the vertices the bore wall already puts
             # there. So they are not recomputed from the sphere: they come from
             # `circle_pts` on the SAME Circle objects the wall meshes, at the
             # same per-axis segment count. The interior rings are free — they
-            # are shared with nothing.
+            # are shared with nothing. A pole end is a single point: its
+            # "ring" repeats it, the vertex indexer dedupes it, and the quad
+            # loop's degenerate triangles collapse into a clean fan — the same
+            # way a pointed cone's apex meshes.
             #
             # Floats are legal here — this is meshing (ADR-0019).
             rims = [e.curve for lp in face.loops for e in lp.edges]
-            c_lo, c_hi = sorted(rims, key=lambda c: float(c.c[2]))
-            ring_lo, segs = circle_pts(c_lo)
-            ring_hi, _ = circle_pts(c_hi, segs)
             cc = tuple(float(x) for x in s.c)
             rr = float(s.r)
-            u = _unit(tuple(float(x) for x in c_lo.ref))
-            w = _unit(_cross_f(tuple(float(x) for x in c_lo.n), u))
-            zlo, zhi = float(c_lo.c[2]), float(c_hi.c[2])
+            if s.pole is not None:
+                zlo_e, zhi_e = _sphere_pole_span(face, s)
+                c_ref = rims[0]
+                ring_rim, segs = circle_pts(c_ref)
+                south = float(s.pole[2]) < 0
+                pole_pt = (cc[0], cc[1], cc[2] + (-rr if south else rr))
+                pole_ring = [pole_pt] * segs
+                ring_lo, ring_hi = ((pole_ring, ring_rim) if south
+                                    else (ring_rim, pole_ring))
+                zlo, zhi = float(zlo_e), float(zhi_e)
+            else:
+                c_lo, c_hi = sorted(rims, key=lambda c: float(c.c[2]))
+                c_ref = c_lo
+                ring_lo, segs = circle_pts(c_lo)
+                ring_hi, _ = circle_pts(c_hi, segs)
+                zlo, zhi = float(c_lo.c[2]), float(c_hi.c[2])
+            u = _unit(tuple(float(x) for x in c_ref.ref))
+            w = _unit(_cross_f(tuple(float(x) for x in c_ref.n), u))
             # The step is in POLAR ANGLE, and it spends only HALF the
             # deflection — matching what the axis bucket was budgeted with
             # above. The zone is curved in both latitude and longitude and the
@@ -2444,6 +2533,37 @@ def from_napkin_ring(n) -> Body:
     return Body((zone, wall))
 
 
+def from_sphere_blind_bore(b) -> Body:
+    """A sphere with a coaxial BLIND bore from +z: three faces.
+
+      * the sphere minus its north cap — ONE rim at z = cz + √(R²−r²), with
+        `SphereS.pole` pointing at the SOUTH pole the face contains (the
+        one-rim band-versus-caps ambiguity is decided on the surface, never
+        assumed);
+      * the bore wall, floor to rim, facing INWARD;
+      * the FLAT floor disk at the tool's end, facing UP into the hole — a
+        plane, not the spherical cap an earlier backlog note guessed.
+
+    The rim is shared by zone and wall; the floor circle by wall and floor
+    disk; the south pole is a singular point on no edge (the pointed-cone
+    precedent), so edge pairing closes with nothing dangling. The rim height
+    is generally IRRATIONAL — the same reason `from_napkin_ring` needed F()
+    widened to ℚ[√d].
+    """
+    h = b._half_height()
+    zrim = b.cz + h
+    zfl = b.cz + b.f
+    rim = _circle_at(b.cx, b.cy, zrim, b.r)
+    flo = _circle_at(b.cx, b.cy, zfl, b.r)
+    vr = (b.cx + b.r, b.cy, zrim)
+    vf = (b.cx + b.r, b.cy, zfl)
+    zone = Face(SphereS((b.cx, b.cy, b.cz), b.R, pole=(F(0), F(0), F(-1))),
+                (Loop((Edge(rim, vr, vr),)),), True)
+    wall = Face(Cylinder((b.cx, b.cy, zfl), (F(0), F(0), F(1)), b.r),
+                (Loop((Edge(flo, vf, vf), Edge(rim, vr, vr))),), False)
+    return Body((zone, wall, _disk_face(b.cx, b.cy, zfl, b.r, True)))
+
+
 def _face_contains_xy(face: "Face", px, py) -> bool:
     """Exact: does (px, py) lie inside this face's OUTER loop, in xy?
 
@@ -2803,12 +2923,14 @@ def to_body(shape) -> Body:
                                      DrilledSolid, RevolveSolid, RoundedBox,
                                      Sphere)
 
-    from forgekernel.surdrev import NapkinRing
+    from forgekernel.surdrev import NapkinRing, SphereBlindBore
 
     if isinstance(shape, Body):
         return shape
     if isinstance(shape, NapkinRing):
         return from_napkin_ring(shape)
+    if isinstance(shape, SphereBlindBore):
+        return from_sphere_blind_bore(shape)
     if isinstance(shape, Solid):
         return from_solid(shape)
     if isinstance(shape, QCone):

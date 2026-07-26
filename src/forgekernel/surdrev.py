@@ -59,18 +59,46 @@ def napkin_ring_contour(sphere_r, bore_r):
     NO horizontal caps — the sphere's polar caps are removed entirely by the
     bore, which is the detail a rectangle-shaped mental model gets wrong.
     """
-    from forgekernel.surd import SurdVal
-
     R2, r0 = F(sphere_r) ** 2, F(bore_r)
     a = R2 - r0 * r0
     if a <= 0:
         raise ValueError("bore is not narrower than the sphere")
-    h = SurdVal(0, 1, int(a)) if F(a).denominator != 1 or not _is_square(a) \
-        else F(a) ** F(1, 2)
-    if not isinstance(h, SurdVal):
-        h = SurdVal(h, 0, 1)
+    h = _band_half_height(a)
     return [("arc", R2, -h, h),                       # meridian, upward
             ("line", (r0, h), (r0, -h))]              # bore wall, downward
+
+
+def _band_half_height(a, collapse_square: bool = True):
+    """Exact √a as a ``SurdVal``, for the height where a bore meets a sphere.
+
+    This used to be ``SurdVal(0, 1, int(a))`` for any non-square a — and
+    ``int()`` TRUNCATES, so a fractional band height (sphere R=3/2, bore r=1:
+    a = 5/4) was silently rebuilt as √1. Volume 1.6% light, watertight, through
+    every structural check: the backlog's own defect class. ``sqrt_rational``
+    is exact over all of ℚ≥0 and fixes the fractional case.
+
+    For INTEGER a the two historical representations are preserved bit for
+    bit, because ``SurdVal`` equality is representation-sensitive across
+    radicands (√45 ≠ 3·√5 to ``__eq__``) and existing napkin-ring bodies,
+    documents and test literals carry them: the unnormalised ``(0, 1, a)``
+    always, except that ``collapse_square`` (the contour's convention)
+    collapses a perfect square to its rational value.
+
+    Always a ``SurdVal`` (possibly with a zero surd part), because callers
+    feed it straight into arithmetic that must stay in one representation per
+    solid — and test_surdrev pins the type.
+    """
+    import math
+
+    from forgekernel.surd import SurdVal, sqrt_rational
+
+    a = F(a)
+    if a.denominator == 1:
+        if collapse_square and _is_square(a):
+            return SurdVal(math.isqrt(a.numerator), 0, 1)
+        return SurdVal(0, 1, int(a))
+    h = sqrt_rational(a)
+    return h if isinstance(h, SurdVal) else SurdVal(h, 0, 1)
 
 
 def _is_square(x) -> bool:
@@ -113,9 +141,13 @@ class NapkinRing:
 
     # --- exact -------------------------------------------------------------
     def _half_height(self):
-        from forgekernel.surd import SurdVal
-
-        return SurdVal(0, 1, int(self.R * self.R - self.r * self.r))
+        # via _band_half_height, NOT SurdVal(0, 1, int(...)): int() truncates
+        # a fractional band height, and the rims of the canonical body then
+        # sit at the wrong z — see test_a_fractional_band_converts_at_the_
+        # right_height. collapse_square=False keeps this method's historical
+        # representation for every integer band (test literals pin √64 as-is).
+        return _band_half_height(self.R * self.R - self.r * self.r,
+                                 collapse_square=False)
 
     def volume(self):
         from forgekernel.quadric import PiVal
@@ -154,6 +186,10 @@ class NapkinRing:
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Floats are legal here — this is meshing (ADR-0019).
 
+        SEAM NOTE: unused by the seam since #124 — the canonical Body is the
+        one mesher there. Kept because the representation promises to draw
+        itself (test_the_representation_itself_meshes_inside_its_own_bbox).
+
         The profile is a LENS: the meridian arc from (r, −h) up over the bulge
         and back to (r, +h), closed by the straight bore wall. Both arc
         endpoints land exactly on r = the bore radius, because
@@ -175,4 +211,155 @@ class NapkinRing:
             prof.append((math.sqrt(max(0.0, R * R - z * z)), z + float(self.cz)))
         prof.append((r0, h + float(self.cz)))
         prof.append((r0, -h + float(self.cz)))
+        return lathe(prof, deflection, float(self.cx), float(self.cy))
+
+
+def blind_bore_contour(sphere_r, bore_r, floor):
+    """The profile of a sphere with a coaxial BLIND bore entering from +z.
+
+    ``floor`` is the bore's flat bottom, RELATIVE to the sphere centre, and
+    must sit strictly inside the band: floor² < R² − r². The profile is the
+    meridian arc from the surviving south pole up to where the bore exits,
+    the bore wall down to the floor, the flat floor in to the axis, and the
+    axis itself (zero radius, zero contribution — kept so the loop reads as
+    closed).
+
+    Unlike the napkin ring there IS a flat face: the tool's own bottom cap.
+    An earlier backlog note guessed the floor was a spherical cap — it is a
+    PLANE, because the sphere's surface at the floor depth lies outside the
+    bore for every admissible floor.
+    """
+    R, r0, f = F(sphere_r), F(bore_r), F(floor)
+    R2 = R * R
+    a = R2 - r0 * r0
+    if not (0 < r0 < R):
+        raise ValueError(
+            f"blind bore needs 0 < bore {r0} < sphere {R}")
+    if f * f >= a:
+        raise ValueError(
+            f"blind-bore floor at {f} is not strictly inside the band "
+            f"|z| < sqrt({a}) — at the edge the wall vanishes, past it the "
+            "topology is a different solid (through ring or untouched cap)")
+    # a NEW type carries no legacy representation: fully normalised square-free
+    # radicand (√45 is 3·√5 here), unlike the napkin ring's historical form
+    from forgekernel.surd import sqrt_rational
+
+    h = sqrt_rational(a)
+    return [("arc", R2, -R, h),                       # meridian, pole to rim
+            ("line", (r0, h), (r0, f)),               # bore wall, downward
+            ("line", (r0, f), (F(0), f)),             # flat floor, inward
+            ("line", (F(0), f), (F(0), -R))]          # axis (contributes 0)
+
+
+class SphereBlindBore:
+    """A sphere with a coaxial cylindrical bore that enters from +z and STOPS.
+
+    Three faces, and that is the whole solid:
+
+      * the sphere minus ONE polar cap — a single rim at z = cz + √d
+        (d = R² − r²); the south pole survives as a singular point on no
+        edge, exactly like a pointed cone's apex;
+      * the bore wall, from the floor up to the rim;
+      * the FLAT DISK floor at z = cz + f — the tool's own bottom cap, a
+        plane and not a spherical cap.
+
+    Exact in ℚ[√d][π] via `contour_r2_dz`:
+
+        V = π · ( 2R³/3 + (2/3)·d·√d + r²·f )
+
+    derived from the removed set (the bore cylinder of height √d − f plus the
+    sphere's cap above √d) and verified against Monte-Carlo membership
+    sampling: R=6, r=1, f=0 gives π(144 + 70√35/3) = 886.0606404251…, banked
+    MC 885.969 ± 1.296 (3σ, 4M samples) and re-measured fresh at seed
+    987654321 (16M samples, analytic membership: inside the sphere and not in
+    the bore's half-infinite cylinder).
+
+    Only the CENTRED case entering from the top. Off-axis the volume acquires
+    elliptic integrals and leaves every algebraic extension; a floor at or
+    beyond ±√d is a different topology (no wall left / a through ring / an
+    untouched cap). All of those refuse in the constructor — a refusal is the
+    finished answer, a near-miss silently answered is not.
+    """
+
+    __slots__ = ("R", "r", "f", "cx", "cy", "cz")
+
+    def __init__(self, R, r, f, cx=0, cy=0, cz=0) -> None:
+        self.R, self.r, self.f = F(R), F(r), F(f)
+        self.cx, self.cy, self.cz = F(cx), F(cy), F(cz)
+        blind_bore_contour(self.R, self.r, self.f)      # validates R, r, f
+
+    # --- exact -------------------------------------------------------------
+    def _half_height(self):
+        # normalised square-free form, matching blind_bore_contour — one
+        # representation per solid, so rim arithmetic never mixes radicands
+        from forgekernel.surd import sqrt_rational
+
+        return sqrt_rational(self.R * self.R - self.r * self.r)
+
+    def volume(self):
+        from forgekernel.quadric import PiVal
+
+        v3 = contour_r2_dz(blind_bore_contour(self.R, self.r, self.f))
+        try:                       # rational band height → stays a PiVal
+            return PiVal(0, __import__("fractions").Fraction(v3))
+        except (TypeError, ValueError):
+            from forgekernel.polypi import PiPoly
+
+            return PiPoly([0, v3])          # a + b·π with b in ℚ[√d]
+    def centroid(self):
+        """EXACT. Not the centre: the bore removes material from the top, so
+        z̄ = cz + m_z/(V/π) with (by ∫z dV over the profile of revolution)
+
+            m_z = R²d/2 − d²/4 − R⁴/4 − r²(d − f²)/2,   d = R² − r²
+
+        which is RATIONAL (only even powers of √d appear), divided by the
+        ℚ[√d] value V/π. x̄ and ȳ are the axis by symmetry."""
+        d = self.R * self.R - self.r * self.r
+        mz = (self.R * self.R * d / 2 - d * d / 4
+              - self.R ** 4 / 4
+              - self.r * self.r * (d - self.f * self.f) / 2)
+        v3 = contour_r2_dz(blind_bore_contour(self.R, self.r, self.f))
+        return (self.cx, self.cy, self.cz + mz / v3)
+
+    def centroid_f(self) -> tuple[float, float, float]:
+        c = self.centroid()
+        return (float(c[0]), float(c[1]), float(c[2]))
+
+    def bbox(self):
+        """Tight: the north cap is gone, so the top is the rim at cz + √d;
+        the south pole survives, so the bottom is cz − R. Floats are legal
+        here — a bound, not a topology decision (ADR-0019)."""
+        h = float(self._half_height())
+        R = float(self.R)
+        cx, cy, cz = float(self.cx), float(self.cy), float(self.cz)
+        return ((cx - R, cy - R, cz - R), (cx + R, cy + R, cz + h))
+
+    def translated(self, x, y, z) -> "SphereBlindBore":
+        return SphereBlindBore(self.R, self.r, self.f,
+                               self.cx + x, self.cy + y, self.cz + z)
+
+    # --- display -----------------------------------------------------------
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        """Floats are legal here — this is meshing (ADR-0019). The seam uses
+        the canonical Body's mesher; this exists so the representation can
+        draw itself, same as NapkinRing."""
+        import math
+
+        from forgekernel.tess import lathe
+
+        R, r0, f = float(self.R), float(self.r), float(self.f)
+        h = float(self._half_height())
+        cz = float(self.cz)
+        # meridian from the south pole up to the rim, sagitta-bounded
+        lo_ang, hi_ang = -math.pi / 2, math.asin(max(-1.0, min(1.0, h / R)))
+        step = 2 * math.acos(max(-1.0, min(1.0, 1 - deflection / R))) \
+            if R > deflection else math.pi / 8
+        n = max(12, int(math.ceil((hi_ang - lo_ang) / step)))
+        prof = [(0.0, cz - R)]
+        for i in range(1, n):
+            ang = lo_ang + (hi_ang - lo_ang) * i / n
+            prof.append((R * math.cos(ang), cz + R * math.sin(ang)))
+        prof.append((r0, cz + h))               # the rim, exactly
+        prof.append((r0, cz + f))               # down the bore wall
+        prof.append((0.0, cz + f))              # the flat floor
         return lathe(prof, deflection, float(self.cx), float(self.cy))

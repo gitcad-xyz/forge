@@ -425,6 +425,19 @@ def write_step_body(body: Body, *, name: str = "gitcad_part") -> str:
             faces.append(advanced_face(surface_of(s), [lp], face.sense))
             continue
         if isinstance(s, SphereS):
+            if face.loops or s.pole is not None:
+                # A TRIMMED spherical face (a napkin ring's zone, a blind
+                # bore's one-rim cap complement). This branch would silently
+                # emit the WHOLE sphere as two lunes and drop the rims — a
+                # well-formed file describing a different solid, which is
+                # worse than no file. Until the writer can trim a spherical
+                # surface by its rim loops, refuse by name. (In practice a
+                # zone's irrational rim height already refused downstream;
+                # a rational-rim zone would NOT have, hence this guard.)
+                raise ValueError(
+                    "STEP export of a trimmed spherical face (zone or "
+                    "pole-trimmed cap complement) is not implemented yet "
+                    "(K3.7)")
             # A whole sphere carries no loops and its parametrisation is
             # periodic in longitude AND degenerate at the poles. Split it into
             # two lunes along the meridian great circle through the poles: the

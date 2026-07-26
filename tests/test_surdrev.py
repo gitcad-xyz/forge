@@ -56,6 +56,22 @@ def test_a_straight_only_profile_still_agrees_with_RevolveSolid() -> None:
         math.pi * 25 * 12, rel=1e-15)
 
 
+def test_a_fractional_band_height_is_not_truncated_to_an_integer() -> None:
+    """Backlog defect class: silent wrong number, found while closing the
+    blind-bore cell. `napkin_ring_contour` built its half-height as
+    ``SurdVal(0, 1, int(a))`` whenever R² − r² was not an integer — and
+    ``int(5/4)`` is 1, so a sphere of R=3/2 bored at r=1 reported √1 where
+    √(5/4) belongs: volume 5.7596 against a true 5.8540, 1.6% light, through
+    every structural check. The closed form (4/3)π·d^(3/2) with d = 5/4 is
+    (5/6)√5·π, written here as a literal."""
+    from fractions import Fraction as F
+
+    v3 = contour_r2_dz(napkin_ring_contour(F(3, 2), 1))
+    assert v3 == SurdVal(0, F(5, 6), 5), f"got {v3!r}, want (5/6)·√5"
+    assert float(v3) * math.pi == pytest.approx(
+        (4 / 3) * math.pi * (9 / 4 - 1) ** 1.5, rel=1e-12)
+
+
 def test_a_bore_as_wide_as_the_sphere_is_refused_not_zeroed() -> None:
     with pytest.raises(ValueError):
         napkin_ring_contour(5, 5)
