@@ -601,13 +601,21 @@ def _face_volume_term(face: Face):
         # A face cannot have negative area. If it does, an inner loop was
         # attached to a face that does not contain it — refuse rather than
         # return a confidently wrong exact volume.
-        if float(_as_fraction(area_rat) or 0) + math.pi * float(
-                _as_fraction(area_pi) or 0) < -1e-12:
+        #
+        # float() DIRECTLY, not via _as_fraction: this is a sanity bound, not a
+        # topology decision (ADR-0019 — a float may measure, never decide), and
+        # `_as_fraction(x) or 0` quietly read a SURD area as ZERO, which turned
+        # the guard off for exactly the faces that need it. An annular cap of a
+        # shelled cone has radius (28−√29)/5.
+        if float(area_rat) + math.pi * float(area_pi) < -1e-12:
             raise ValueError(
                 "face has negative area — an inner loop is larger than the "
                 "boundary carrying it (a hole attached to the wrong face)")
-        return PiVal(_exact(sgn * rat, "planar area"),
-                     _exact(sgn * pi, "circular area"))
+        # _pi_value, not _exact: an annular cap whose rim radius is a surd is
+        # legitimate now — it is what the inward offset of a slanted profile
+        # edge produces. _pi_value still returns a plain PiVal when both parts
+        # are rational, so no existing answer changes type.
+        return _pi_value(sgn * rat, sgn * pi, "planar face")
     if isinstance(s, Cylinder):
         # x·n̂ = p·N̂ + r on the surface, so ∮x·n̂ dA = r·h·(p·∫N̂dθ + r·Δθ).
         # Over a FULL band ∫N̂dθ vanishes and this is the familiar
@@ -665,8 +673,13 @@ def _face_volume_term(face: Face):
                 "right (K3.7)")
         su = 1 if ua + ub > 0 else -1
         nax_area = -su * s.tan_half * (ra + rb) * abs(ub - ua)
-        return PiVal(0, _exact(sgn * dot(s.p, s.d) / ln * nax_area / 3,
-                               "cone band"))
+        # _pi_value, not _exact: offsetting a slanted profile edge inward keeps
+        # the taper (the offset line is PARALLEL, so tan_half stays rational)
+        # but slides the apex to an irrational height and the rims to
+        # irrational radii. The term is unchanged; only the field it may land
+        # in is wider, and a rational frustum still returns a plain PiVal.
+        return _pi_value(0, sgn * dot(s.p, s.d) / ln * nax_area / 3,
+                         "cone band")
     if isinstance(s, Torus):
         # x·n̂ = c·n̂ + R cos(phi) + a on the tube, and dA = a(R + a cos phi),
         # so the phi integral carries cos and cos^2 terms. At quarter turns
@@ -1171,6 +1184,13 @@ def manifold_violations(body: Body) -> list[str]:
     return bad
 
 
+def _cone_rim_count(face: Face) -> int:
+    """How many circular rims bound a conical face — 2 for a frustum, 1 for a
+    pointed cone (the apex is a singular point on no edge)."""
+    return sum(1 for lp in face.loops for e in lp.edges
+               if isinstance(e.curve, Circle))
+
+
 def bbox(body: Body):
     """Float bbox of the body (a bound, not a topological decision)."""
     lo = [math.inf] * 3
@@ -1203,24 +1223,24 @@ def bbox(body: Body):
                 lo[i] = min(lo[i], float(c[i]) - r)
                 hi[i] = max(hi[i], float(c[i]) + r)
             continue
-        if isinstance(f.surface, Cone) and len(f.loops) < 2:
+        if isinstance(f.surface, Cone) and _cone_rim_count(f) < 2:
             # A POINTED cone's apex is a singular point lying on no edge, so
             # the walk below never visits it and the box collapsed along the
             # axis: scale(cone(6,0,10), 2) reported a z-extent of 0.0 for a
             # 20 mm solid. Third instance of one pattern, after Torus and
             # SphereS: the extreme is not on any edge.
             #
-            # Two loops means the cone is truncated at both ends and the apex
-            # is not part of the face, so it must NOT be added — a bound may be
-            # loose, but needlessly loosening every frustum would blunt the
-            # AABB pre-filter that part.interference depends on.
+            # Two RIMS means the cone is truncated at both ends and the apex is
+            # not part of the face, so it must NOT be added — a bound may be
+            # loose, but needlessly loosening every frustum blunts the AABB
+            # pre-filter that part.interference depends on.
             #
-            # The loop count is a sufficient test for every cone this kernel
-            # builds, not a proof for arbitrary trimming. The backstop for the
-            # general case is gitcad's tests/invariants/test_bbox_is_a_sound_
-            # bound.py, which asserts the mesh fits inside the reported box for
-            # the whole corpus under transforms — that is the property that
-            # matters, and it fails loudly if a trimming ever escapes this.
+            # Counting rims, not LOOPS: every frustum this kernel builds puts
+            # both rims in ONE loop (from_cone and from_revolve both do), so
+            # `len(f.loops) < 2` was true for all of them and every frustum
+            # body reported its box out to the apex — cone(6,2,10) came back
+            # 15 mm tall instead of 10. Sound, so no invariant caught it, and
+            # 50% loose on a shape whose whole point is the taper.
             ap = f.surface.p
             for i in range(3):
                 lo[i] = min(lo[i], float(ap[i]))

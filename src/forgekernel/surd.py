@@ -43,6 +43,22 @@ def sqrt_rational(x) -> "SurdVal":
     return SurdVal(0, coeff, kk)
 
 
+def exact_sqrt(x):
+    """Exact √x in the SMALLEST field that holds it: a ``Fraction`` when x is
+    a perfect rational square, a ``SurdVal`` otherwise.
+
+    ``sqrt_rational`` always hands back a ``SurdVal``, which is right when the
+    caller is already in ℚ[√d] and wrong when it is not: a value typed
+    ``SurdVal(4, 0, 1)`` is equal to 4 but is not a ``Fraction``, and code that
+    shares one offset routine between rectilinear and slanted profiles would
+    then retype every existing rational answer. Widening a field must be
+    invisible to everything that did not need it — the same rule ``_pi_value``
+    follows when it returns ``PiVal`` rather than ``PiPoly``.
+    """
+    v = sqrt_rational(x)
+    return v.a if v.b == 0 else v
+
+
 class SurdVal:
     is_exact_scalar = True   # exact beyond Q; F() must not coerce it away
     """a + b·√d, exact. d is square-free (d==1 means purely rational)."""
