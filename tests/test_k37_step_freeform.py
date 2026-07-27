@@ -535,6 +535,193 @@ def test_heal_cannot_invent_a_missing_face() -> None:
         read_step_freeform_solid(step, heal_tolerance=1e-3)
 
 
+# -- the crack refutation: closure must be CERTIFIED, never sampled -----------
+#
+# Adversarial CLOSED_SHELL lie (refuter round: the K3.7 closure audit only
+# compared adjacent faces' trim images at shared pcurve breakpoints, and
+# straight degree-1 pcurves get no interior breakpoints even when the
+# SURFACE is curved along the edge). Box [0,4]×[0,4]×[0,2] whose top
+# surface is degree (2,1) bulged upward — control z: (2, zmid, 2), so
+# z = 2 + (zmid−2)·2s(1−s), s = u/4 — over flat height-2 walls, with
+# EVERY pcurve straight. The top's y=0 / y=4 borders are then curved 3D
+# arcs while the walls' top edges are straight: a real open slit of apex
+# height (zmid−2)/2 mm along two edges that passes every vertex/endpoint
+# check (h = 0 at the corners). zmid=2 is the honest flat control (an
+# exact 32 box); any zmid≠2 must REFUSE with the mm gap report — the
+# certified tier proves the two composed border curves identical (enough
+# exact rational samples to pin a polynomial identity) or refuses.
+
+
+def _crack_box_step(zmid: float) -> str:
+    L: list[str] = []
+
+    def cp(eid, *coords):
+        vals = ",".join(f"{float(c):g}." if float(c) == int(c)
+                        else f"{float(c):g}" for c in coords)
+        L.append(_e(eid, f"CARTESIAN_POINT('',({vals}))"))
+        return eid
+
+    corners = {101: (0, 0, 0), 102: (4, 0, 0), 103: (4, 4, 0), 104: (0, 4, 0),
+               105: (0, 0, 2), 106: (4, 0, 2), 107: (4, 4, 2), 108: (0, 4, 2)}
+    for eid, (x, y, z) in corners.items():
+        cp(eid, x, y, z)
+        L.append(_e(eid + 100, f"VERTEX_POINT('',#{eid})"))
+
+    # bottom z=0: S(u,v)=(u,v,0); S_u×S_v = +z (inward) → .F.
+    cp(301, 0, 0, 0); cp(302, 0, 4, 0); cp(303, 4, 0, 0); cp(304, 4, 4, 0)
+    L.append(_e(310, "B_SPLINE_SURFACE_WITH_KNOTS('',1,1,"
+                     "((#301,#302),(#303,#304)),.UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(2,2),(2,2),(0.,4.),(0.,4.),.UNSPECIFIED.)"))
+    # top BULGED: degree (2,1): S(u,v)=(u,v,2+h(u)); S_u×S_v ≈ +z → .T.
+    cp(361, 0, 0, 2); cp(362, 0, 4, 2)
+    cp(363, 2, 0, zmid); cp(364, 2, 4, zmid)
+    cp(365, 4, 0, 2); cp(366, 4, 4, 2)
+    L.append(_e(360, "B_SPLINE_SURFACE_WITH_KNOTS('',2,1,"
+                     "((#361,#362),(#363,#364),(#365,#366)),"
+                     ".UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(3,3),(2,2),(0.,4.),(0.,4.),.UNSPECIFIED.)"))
+    # wall x=0: S=(0,u,v), (u,v)=(y,z); S_u×S_v = +x (inward) → .F.
+    cp(311, 0, 0, 0); cp(312, 0, 0, 2); cp(313, 0, 4, 0); cp(314, 0, 4, 2)
+    L.append(_e(320, "B_SPLINE_SURFACE_WITH_KNOTS('',1,1,"
+                     "((#311,#312),(#313,#314)),.UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(2,2),(2,2),(0.,4.),(0.,2.),.UNSPECIFIED.)"))
+    # wall x=4: S=(4,u,v); S_u×S_v = +x (outward) → .T.
+    cp(321, 4, 0, 0); cp(322, 4, 0, 2); cp(323, 4, 4, 0); cp(324, 4, 4, 2)
+    L.append(_e(330, "B_SPLINE_SURFACE_WITH_KNOTS('',1,1,"
+                     "((#321,#322),(#323,#324)),.UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(2,2),(2,2),(0.,4.),(0.,2.),.UNSPECIFIED.)"))
+    # wall y=0: S=(u,0,v), (u,v)=(x,z); S_u×S_v = −y (outward) → .T.
+    cp(331, 0, 0, 0); cp(332, 0, 0, 2); cp(333, 4, 0, 0); cp(334, 4, 0, 2)
+    L.append(_e(340, "B_SPLINE_SURFACE_WITH_KNOTS('',1,1,"
+                     "((#331,#332),(#333,#334)),.UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(2,2),(2,2),(0.,4.),(0.,2.),.UNSPECIFIED.)"))
+    # wall y=4: S=(u,4,v); S_u×S_v = −y (inward) → .F.
+    cp(351, 0, 4, 0); cp(352, 0, 4, 2); cp(353, 4, 4, 0); cp(354, 4, 4, 2)
+    L.append(_e(350, "B_SPLINE_SURFACE_WITH_KNOTS('',1,1,"
+                     "((#351,#352),(#353,#354)),.UNSPECIFIED.,.F.,.F.,.F.,"
+                     "(2,2),(2,2),(0.,4.),(0.,2.),.UNSPECIFIED.)"))
+
+    ctx2 = 400
+    L.append(_e(ctx2, "( GEOMETRIC_REPRESENTATION_CONTEXT(2) "
+                      "PARAMETRIC_REPRESENTATION_CONTEXT() "
+                      "REPRESENTATION_CONTEXT('2d','') )"))
+    nid = [500]
+
+    def emit(body):
+        nid[0] += 1
+        L.append(_e(nid[0], body))
+        return nid[0]
+
+    def pt2(u, v):
+        return emit(f"CARTESIAN_POINT('',({float(u):g},{float(v):g}))")
+
+    def pcurve(surf, a, b):
+        c2 = emit(f"B_SPLINE_CURVE_WITH_KNOTS('',1,"
+                  f"(#{pt2(*a)},#{pt2(*b)}),"
+                  f".UNSPECIFIED.,.F.,.F.,(2,2),(0.,4.),.UNSPECIFIED.)")
+        dr = emit(f"DEFINITIONAL_REPRESENTATION('',(#{c2}),#{ctx2})")
+        return emit(f"PCURVE('',#{surf},#{dr})")
+
+    def curve3(a, b):
+        r1 = emit(f"CARTESIAN_POINT('',({float(a[0]):g},{float(a[1]):g},"
+                  f"{float(a[2]):g}))")
+        r2 = emit(f"CARTESIAN_POINT('',({float(b[0]):g},{float(b[1]):g},"
+                  f"{float(b[2]):g}))")
+        return emit(f"B_SPLINE_CURVE_WITH_KNOTS('',1,(#{r1},#{r2}),"
+                    f".UNSPECIFIED.,.F.,.F.,(2,2),(0.,4.),.UNSPECIFIED.)")
+
+    def edge(v1, v2, pcs):
+        c3 = curve3(corners[v1], corners[v2])
+        sc = emit(f"SURFACE_CURVE('',#{c3},"
+                  f"({','.join('#' + str(p) for p in pcs)}),.PCURVE_S1.)")
+        return emit(f"EDGE_CURVE('',#{v1 + 100},#{v2 + 100},#{sc},.T.)")
+
+    e_b_y0 = edge(101, 102, [pcurve(310, (0, 0), (4, 0)),
+                             pcurve(340, (0, 0), (4, 0))])
+    e_b_x4 = edge(102, 103, [pcurve(310, (4, 0), (4, 4)),
+                             pcurve(330, (0, 0), (4, 0))])
+    e_b_y4 = edge(103, 104, [pcurve(310, (4, 4), (0, 4)),
+                             pcurve(350, (4, 0), (0, 0))])
+    e_b_x0 = edge(104, 101, [pcurve(310, (0, 4), (0, 0)),
+                             pcurve(320, (4, 0), (0, 0))])
+    e_v00 = edge(101, 105, [pcurve(320, (0, 0), (0, 2)),
+                            pcurve(340, (0, 0), (0, 2))])
+    e_v40 = edge(102, 106, [pcurve(330, (0, 0), (0, 2)),
+                            pcurve(340, (4, 0), (4, 2))])
+    e_v44 = edge(103, 107, [pcurve(330, (4, 0), (4, 2)),
+                            pcurve(350, (4, 0), (4, 2))])
+    e_v04 = edge(104, 108, [pcurve(320, (4, 0), (4, 2)),
+                            pcurve(350, (0, 0), (0, 2))])
+    # top edges (t_y0 / t_y4 are the CRACK edges when zmid ≠ 2)
+    e_t_y0 = edge(105, 106, [pcurve(360, (0, 0), (4, 0)),
+                             pcurve(340, (0, 2), (4, 2))])
+    e_t_x4 = edge(106, 107, [pcurve(360, (4, 0), (4, 4)),
+                             pcurve(330, (0, 2), (4, 2))])
+    e_t_y4 = edge(107, 108, [pcurve(360, (4, 4), (0, 4)),
+                             pcurve(350, (4, 2), (0, 2))])
+    e_t_x0 = edge(108, 105, [pcurve(360, (0, 4), (0, 0)),
+                             pcurve(320, (4, 2), (0, 2))])
+
+    def face(surf, oriented, sense):
+        oes = [emit(f"ORIENTED_EDGE('',*,*,#{e},{'.T.' if f else '.F.'})")
+               for (e, f) in oriented]
+        lp = emit(f"EDGE_LOOP('',({','.join('#' + str(o) for o in oes)}))")
+        b = emit(f"FACE_OUTER_BOUND('',#{lp},.T.)")
+        return emit(f"ADVANCED_FACE('',(#{b}),#{surf},{sense})")
+
+    faces = [
+        face(310, [(e_b_y0, True), (e_b_x4, True), (e_b_y4, True),
+                   (e_b_x0, True)], ".F."),
+        face(360, [(e_t_y0, True), (e_t_x4, True), (e_t_y4, True),
+                   (e_t_x0, True)], ".T."),
+        face(320, [(e_b_x0, False), (e_v04, True), (e_t_x0, True),
+                   (e_v00, False)], ".F."),
+        face(330, [(e_b_x4, False), (e_v40, True), (e_t_x4, True),
+                   (e_v44, False)], ".T."),
+        face(340, [(e_b_y0, True), (e_v40, True), (e_t_y0, False),
+                   (e_v00, False)], ".T."),
+        face(350, [(e_b_y4, False), (e_v44, True), (e_t_y4, True),
+                   (e_v04, False)], ".F."),
+    ]
+    sh = emit(f"CLOSED_SHELL('',({','.join('#' + str(f) for f in faces)}))")
+    emit(f"MANIFOLD_SOLID_BREP('crack_box',#{sh})")
+    body = "\n".join(L)
+    return ("ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\n"
+            "ENDSEC;\nDATA;\n" + body + "\nENDSEC;\nEND-ISO-10303-21;\n")
+
+
+def test_crack_honest_flat_control_imports_exact_32() -> None:
+    # zmid=2 is a genuinely closed flat box written through the same
+    # degree-(2,1) top surface: it must keep importing on the exact tier
+    shell = read_step_freeform_solid(_crack_box_step(2))
+    vol = shell.volume(depth=4)
+    assert vol.lo == vol.hi == 32
+
+
+@pytest.mark.parametrize("zmid", [3, 52])
+def test_mid_edge_crack_refuses_with_mm_gap_report(zmid) -> None:
+    # 0.5 mm and 25 mm apex slits along two edges, invisible to every
+    # vertex/endpoint/breakpoint sample — certification must refuse
+    with pytest.raises(NonClosedShellError) as exc:
+        read_step_freeform_solid(_crack_box_step(zmid))
+    rep = exc.value.report
+    assert rep["open_edges"] > 0
+    assert rep["open_perimeter_mm"] > 0
+    assert "mm" in str(exc.value)
+
+
+def test_mid_edge_crack_reaches_router_refusal() -> None:
+    with pytest.raises(NonClosedShellError):
+        read_step_solid(_crack_box_step(52))
+
+
+def test_mid_edge_crack_is_not_healable_by_vertex_merge() -> None:
+    # heal is the recorded-intent VERTEX merge; every vertex here already
+    # coincides exactly — a mid-edge crack must never heal silently
+    with pytest.raises(NonClosedShellError):
+        read_step_freeform_solid(_crack_box_step(3), heal_tolerance=1e-3)
+
+
 # -- refusals by name ----------------------------------------------------------
 
 

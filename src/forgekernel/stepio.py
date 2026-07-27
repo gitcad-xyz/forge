@@ -739,6 +739,7 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part",
 # reciprocal rule); analytic surfaces, sign-varying weights, missing
 # pcurves, VERTEX_LOOPs and periodic seams refuse by name.
 
+from forgekernel.nurbs import _deboor4, _insert_knot_once
 from forgekernel.nurbs import bezier_segments as _bezier_segments
 
 
@@ -782,6 +783,7 @@ class _TrimTopo(StepFile):
     def __init__(self, text: str) -> None:
         super().__init__(text)
         self._edges: dict[int, dict] = {}
+        self._surf_shapes: dict[int, tuple] = {}
 
     def solids(self) -> list[int]:
         return [e for e, (t, _) in sorted(self.entities.items())
@@ -888,13 +890,51 @@ class _TrimTopo(StepFile):
         self._edges[eid] = rec
         return rec
 
+    def _surf_shape(self, surf_eid: int):
+        """(p, q, interior_u_knots, interior_v_knots, rational) of the
+        face geometry under a pcurve — a PLANE lifts as an affine
+        (degree-(1, 1), knot-free, polynomial) map."""
+        shape = self._surf_shapes.get(surf_eid)
+        if shape is not None:
+            return shape
+        if "PLANE" in self.entities[surf_eid][0]:
+            shape = (1, 1, (), (), False)
+        else:
+            s = self.surface(surf_eid)
+            u0, u1 = s.U[s.p], s.U[s.nu]
+            v0, v1 = s.V[s.q], s.V[s.nv]
+            shape = (s.p, s.q,
+                     tuple(sorted({k for k in s.U if u0 < k < u1})),
+                     tuple(sorted({k for k in s.V if v0 < k < v1})),
+                     any(w != 1 for row in s.w for w in row))
+        self._surf_shapes[surf_eid] = shape
+        return shape
+
     def edge_breaks(self, eid: int, subdiv: int):
-        """The edge's SHARED breakpoint parameters — the union of every
-        pcurve's knots, dyadically refined per span when any pcurve is
-        curved. Shared per EDGE ENTITY: both adjacent faces evaluate
-        their own pcurve at the same parameters, so the loop vertices
-        pair exactly (a per-face refinement mints T-junctions and the
-        pairing audit refuses). ``None`` for a pcurve-less edge."""
+        """The edge's SHARED breakpoint parameters — dense enough that
+        exact cross-face agreement at every breakpoint CERTIFIES the two
+        faces' composed border curves identical, never merely samples
+        them.
+
+        Per adjacent face, the border image t ↦ S(u(t), v(t)) is (on
+        each span) a polynomial — or one-signed-rational — function of
+        degree at most d_u·p + d_v·q, where d_u/d_v are the pcurve's
+        coordinate degrees and (p, q) the surface degrees. Two such
+        functions that agree at more exact rational parameters than the
+        cross-multiplied degree bound are IDENTICAL on the span
+        (polynomial identity in ℚ), so the breakpoint set carries, per
+        span, bound+1 uniform rational samples. Span delimiters are the
+        pcurve knots plus the exact parameters where a degree-1 pcurve
+        crosses an interior surface knot line; a CURVED pcurve whose
+        control hull spans an interior knot line refuses by name (its
+        crossing parameter is algebraic — no exact certificate).
+
+        Dyadic per-span refinement when any pcurve is curved is kept
+        (unioned in) for strip-box tightness. Shared per EDGE ENTITY:
+        both adjacent faces evaluate their own pcurve at the same
+        parameters, so the loop vertices pair exactly (a per-face
+        refinement mints T-junctions and the pairing audit refuses).
+        ``None`` for a pcurve-less edge."""
         rec = self.edge_rec(eid)
         if rec["breaks"] is not None or not rec["pcs"]:
             return rec["breaks"]
@@ -907,17 +947,148 @@ class _TrimTopo(StepFile):
                 f"are inconsistent")
         lo, hi = doms.pop()
         knots = sorted({k for pc in pcs for k in pc.U if lo <= k <= hi})
+
+        # certification: span delimiters + per-piece composed-degree bounds
+        delims = set(knots)
+        face_pieces: list[list] = []      # per face: [(a, b, Dnum, Dden)]
+        for surf_eid, pc in rec["pcs"].items():
+            p, q, int_u, int_v, rational = self._surf_shape(surf_eid)
+            pieces = []
+            for (a, b, cps) in _bezier_segments(pc):
+                us = [c[0] for c in cps]
+                vs = [c[1] for c in cps]
+                d_u = 0 if min(us) == max(us) else pc.p
+                d_v = 0 if min(vs) == max(vs) else pc.p
+                bound = d_u * p + d_v * q
+                for interior, ws in ((int_u, us), (int_v, vs)):
+                    w0, w1 = min(ws), max(ws)
+                    for k in interior:
+                        if not (w0 < k < w1):
+                            continue
+                        if pc.p == 1:
+                            # affine piece: exact rational crossing
+                            t = a + (b - a) * (k - ws[0]) / (ws[-1] - ws[0])
+                            if a < t < b:
+                                delims.add(t)
+                        else:
+                            raise ValueError(
+                                f"import_step: curved pcurve of edge "
+                                f"#{eid} spans an interior knot of "
+                                f"surface #{surf_eid} — the composed "
+                                f"border curve breaks at an algebraic "
+                                f"parameter with no exact certificate; "
+                                f"split the pcurve at the surface knot "
+                                f"lines before export")
+                pieces.append((a, b, bound, bound if rational else 0))
+            face_pieces.append(pieces)
+
+        breaks_set = set(delims)
+        dl = sorted(delims)
+        for x, y in zip(dl, dl[1:]):
+            bounds = []
+            for pieces in face_pieces:
+                for (a, b, dn, dd) in pieces:
+                    if a <= x and y <= b:
+                        bounds.append((dn, dd))
+                        break
+            if len(bounds) == 2:
+                (n1, d1), (n2, d2) = bounds
+                need = max(n1 + d2, n2 + d1)
+            elif bounds:
+                need = sum(bounds[0])
+            else:
+                need = 1
+            for j in range(1, need):      # need+1 samples incl. endpoints
+                breaks_set.add(x + (y - x) * j / F(need))
+
         if any(pc.p >= 2 for pc in pcs):
             n = 2 ** subdiv
-            breaks: list = []
             for a, b in zip(knots, knots[1:]):
                 step = (b - a) / n
-                breaks.extend(a + step * i for i in range(n))
-            breaks.append(hi)
-        else:
-            breaks = knots
-        rec["breaks"] = breaks
-        return breaks
+                breaks_set.update(a + step * i for i in range(1, n))
+        rec["breaks"] = sorted(breaks_set)
+        return rec["breaks"]
+
+    def straight_border_certificate(self, eid: int, A, B) -> bool:
+        """CERTIFIED image coincidence for a pointwise-mismatched shared
+        edge. Two faces may parameterize the SAME border differently —
+        e.g. a one-signed rational reparameterization of a straight
+        border — and still close the shell: closure is about image SETS.
+        This proves, exactly in ℚ, that every adjacent face's composed
+        border image is EXACTLY the segment A–B: each composed border's
+        (homogeneous) control points are computed exactly — degree-1
+        axis-parallel pcurves compose to an iso-curve extracted by de
+        Boor + Boehm restriction; a plane composes affinely — and must
+        be collinear with A–B with segment coordinate s ∈ [0, 1]. With
+        one-signed weights the hull property then pins the image inside
+        the segment, and continuity from A to B covers it, so the image
+        IS the segment for every face. Anything this cannot prove
+        (curved or diagonal pcurves, off-line control points) returns
+        ``False`` and the gap stands — a proof or a refusal, never a
+        sample."""
+        d = tuple(B[c] - A[c] for c in range(3))
+        dd = sum(c * c for c in d)
+        if dd == 0:
+            return False
+
+        def on_segment(P) -> bool:
+            r = tuple(P[c] - A[c] for c in range(3))
+            cx = (r[1] * d[2] - r[2] * d[1], r[2] * d[0] - r[0] * d[2],
+                  r[0] * d[1] - r[1] * d[0])
+            if any(c != 0 for c in cx):
+                return False
+            s = sum(r[c] * d[c] for c in range(3)) / dd
+            return 0 <= s <= 1
+
+        rec = self.edge_rec(eid)
+        for surf_eid, pc in rec["pcs"].items():
+            if pc.p != 1:
+                return False
+            if "PLANE" in self.entities[surf_eid][0]:
+                # affine lift: piece images are segments between the
+                # exact images of the piece's endpoints
+                O, ax, rd = self.plane_frame(surf_eid)
+                d2v = (ax[1] * rd[2] - ax[2] * rd[1],
+                       ax[2] * rd[0] - ax[0] * rd[2],
+                       ax[0] * rd[1] - ax[1] * rd[0])
+                for (_a, _b, cps) in _bezier_segments(pc):
+                    for (u, v, _z) in cps:
+                        if not on_segment(tuple(
+                                O[c] + u * rd[c] + v * d2v[c]
+                                for c in range(3))):
+                            return False
+                continue
+            s = self.surface(surf_eid)
+            for (_a, _b, cps) in _bezier_segments(pc):
+                (u0, v0), (u1, v1) = cps[0][:2], cps[1][:2]
+                if u0 == u1:            # iso-curve in v at fixed u
+                    deg, knots = s.q, list(s.V)
+                    pts = [_deboor4(s.p, s.U,
+                                    [s.H[i][j] for i in range(s.nu)], u0)
+                           for j in range(s.nv)]
+                    w0, w1 = min(v0, v1), max(v0, v1)
+                elif v0 == v1:          # iso-curve in u at fixed v
+                    deg, knots = s.p, list(s.U)
+                    pts = [_deboor4(s.q, s.V, s.H[i], v0)
+                           for i in range(s.nu)]
+                    w0, w1 = min(u0, u1), max(u0, u1)
+                else:
+                    return False        # diagonal: no exact composition here
+                pts = [tuple(p) for p in pts]
+                for t in (w0, w1):      # Boehm restriction to the trim range
+                    while knots.count(t) < deg:
+                        knots, pts = _insert_knot_once(deg, knots, pts, t)
+                for i, h in enumerate(pts):
+                    # control points ACTIVE on [w0, w1] (a superset only
+                    # loosens the hull — sound: it can refuse, not accept)
+                    if not (knots[i] < w1 and knots[i + deg + 1] > w0):
+                        continue
+                    if h[3] == 0:
+                        return False
+                    if not on_segment((h[0] / h[3], h[1] / h[3],
+                                       h[2] / h[3])):
+                        return False
+        return True
 
     def edge_on_face(self, eid: int, surf_eid: int):
         """(uv points at the shared breakpoints, hull boxes of curved
@@ -947,10 +1118,14 @@ def read_step_freeform_solid(text: str, *, heal_tolerance=None,
     """Import the first freeform (B-spline-faced) solid in a STEP file as
     an audited :class:`~forgekernel.trimshell.TrimmedShell`.
 
-    Closure is established BEFORE any orientation decision (#135): a
-    shell that does not close refuses with a gap report in millimetres,
-    healable only by the recorded-intent vertex merge. Global orientation
-    is decided by the certified volume sign — audit-backed, never
+    Closure is established BEFORE any orientation decision (#135), and
+    it is CERTIFIED, never sampled: adjacent faces' shared-edge images
+    are proven coincident (exact agreement in ℚ at more breakpoints per
+    span than the composed border curves' degree bound is a polynomial
+    identity), or the import refuses with a gap report in millimetres —
+    healable only by the recorded-intent vertex merge, which can repair
+    a vertex tear but never a mid-edge crack. Global orientation is
+    decided by the certified volume sign — audit-backed, never
     flag-trusted — and the full three-oracle audit runs at the door.
     Volume brackets are width-0 (exact tier) for polynomial faces with
     degree-1 pcurves, certified otherwise; refusals are by name."""
@@ -1197,18 +1372,22 @@ def read_step_freeform_solid(text: str, *, heal_tolerance=None,
                             + [("v", find(v_hi))])
                     vids_ = [v_lo] + [None] * (len(breaks) - 2) + [v_hi]
                     # cross-face agreement: both faces' pcurves must place
-                    # every shared breakpoint at the SAME exact 3D point
+                    # every shared breakpoint at the SAME exact 3D point.
+                    # edge_breaks makes this a CERTIFICATE, not a sample:
+                    # per span it carries more exact rational parameters
+                    # than the composed border curves' degree bound, so
+                    # agreement everywhere proves the two images are one
+                    # curve — and any disagreement is a REAL open slit,
+                    # collected as a gap segment for the mm report (a
+                    # vertex merge can never heal a mid-edge crack)
                     for t, uv in zip(breaks, pts):
                         p3 = eval3(uv[0], uv[1])
                         prev = rec["pts3"].get(t)
                         if prev is None:
                             rec["pts3"][t] = p3
                         elif prev != p3:
-                            raise ValueError(
-                                f"import_step: edge #{eid}: the two "
-                                f"faces' pcurves disagree about the 3D "
-                                f"point at parameter {t} — the file's "
-                                f"representations are inconsistent")
+                            gap_segs.append({"a": prev, "b": p3,
+                                             "coverage": 1, "edge": eid})
                 else:
                     if not planar:
                         raise ValueError(
@@ -1347,6 +1526,26 @@ def read_step_freeform_solid(text: str, *, heal_tolerance=None,
             gap_segs.append({"a": f.surface.eval(*a.uv(f)),
                              "b": f.surface.eval(*b.uv(f)),
                              "coverage": total - 2 if total > 2 else 1})
+    # a pointwise parameter mismatch is not yet a crack: two faces may
+    # parameterize the SAME border differently and still close the shell.
+    # Only a PROOF may drop the gap — the exact straight-segment
+    # certificate on the edge's composed borders; everything unproven
+    # stays in the report and refuses in millimetres
+    if gap_segs:
+        cert_cache: dict[int, bool] = {}
+        kept = []
+        for g in gap_segs:
+            geid = g.pop("edge", None)
+            if geid is not None:
+                ok = cert_cache.get(geid)
+                if ok is None:
+                    r = topo.edge_rec(geid)
+                    ok = cert_cache[geid] = topo.straight_border_certificate(
+                        geid, vpos[r["v1"]], vpos[r["v2"]])
+                if ok:
+                    continue
+            kept.append(g)
+        gap_segs = kept
     if gap_segs:
         gr = boundary_gap_report(gap_segs)
         raise NonClosedShellError(
