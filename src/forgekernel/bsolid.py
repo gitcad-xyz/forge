@@ -628,6 +628,26 @@ def trimmed_patch_flux_ci(surface: BSplineSurface, loops, depth: int = 5):
     return _sum_ci(surface, depth, classify)
 
 
+def _strip_classify(strip, inside):
+    """The cell classifier a certified boolean-face bracket runs on:
+    boxes overlapping the SSI strip are "split" (their covered fraction
+    is unknown), boxes off the strip are decided by one exact membership
+    test at the midpoint — sound because membership is constant on every
+    strip-free connected region (the strip encloses the whole trim
+    boundary)."""
+    sq = [tuple(F(c) for c in cell) for cell in strip]
+
+    def classify(box):
+        u0, u1, v0, v1 = box
+        for (s0, s1, t0, t1) in sq:
+            if s0 < u1 and u0 < s1 and t0 < v1 and v0 < t1:
+                return "split"                    # strip overlaps interior
+        um, vm = (u0 + u1) / 2, (v0 + v1) / 2
+        return "in" if inside(um, vm) else "out"
+
+    return classify
+
+
 def certified_trim_flux(surface: BSplineSurface, strip, inside,
                         depth: int = 4):
     """Flux of a boolean face bracketed through the SSI strip — the
@@ -651,14 +671,70 @@ def certified_trim_flux(surface: BSplineSurface, strip, inside,
     O(2^-depth)·|F|·(strip length). Works for polynomial AND rational
     surfaces — nothing exact exists for a strip-bounded region, so
     there is no exact tier to defend here."""
-    sq = [tuple(F(c) for c in cell) for cell in strip]
+    return _sum_ci(surface, depth, _strip_classify(strip, inside))
 
-    def classify(box):
-        u0, u1, v0, v1 = box
-        for (s0, s1, t0, t1) in sq:
-            if s0 < u1 and u0 < s1 and t0 < v1 and v0 < t1:
-                return "split"                    # strip overlaps interior
-        um, vm = (u0 + u1) / 2, (v0 + v1) / 2
-        return "in" if inside(um, vm) else "out"
 
-    return _sum_ci(surface, depth, classify)
+def _normal_forms(net):
+    """((Px, Py, Pz), Q) tensor Bernstein forms with S_u×S_v = P/Q in
+    LOCAL [0,1]² coordinates. Polynomial nets: the cross-product forms
+    directly, Q None. Rational nets (homogeneous 4-tuples): S = A/w
+    gives S_u×S_v = [(A_u w − A w_u) × (A_v w − A w_v)] / w⁴, so P is
+    that cross form and Q = w⁴ (provably positive, checked)."""
+    dim = len(net[0][0])
+    comps = [[[F(pt[c]) for pt in row] for row in net] for c in range(dim)]
+    if dim == 3:
+        Du = [_bf_du(c) for c in comps[:3]]
+        Dv = [_bf_dv(c) for c in comps[:3]]
+        Q = None
+    else:
+        W = comps[3]
+        Wu, Wv = _bf_du(W), _bf_dv(W)
+        Du = [_bf_sub(_bf_mul(_bf_du(c), W), _bf_mul(c, Wu))
+              for c in comps[:3]]
+        Dv = [_bf_sub(_bf_mul(_bf_dv(c), W), _bf_mul(c, Wv))
+              for c in comps[:3]]
+        W2 = _bf_mul(W, W)
+        Q = _bf_mul(W2, W2)
+        qmn, _ = _bf_hull(Q)
+        if qmn <= 0:
+            raise ValueError(
+                "certified vector area: weight form is not provably "
+                "one-signed (sign-varying weights arrive at K3.7)")
+    P = (_bf_sub(_bf_mul(Du[1], Dv[2]), _bf_mul(Du[2], Dv[1])),
+         _bf_sub(_bf_mul(Du[2], Dv[0]), _bf_mul(Du[0], Dv[2])),
+         _bf_sub(_bf_mul(Du[0], Dv[1]), _bf_mul(Du[1], Dv[0])))
+    return P, Q
+
+
+def certified_vector_area(surface: BSplineSurface, strip, inside,
+                          depth: int = 4):
+    """∮∮_D S_u×S_v du dv over a boolean face's trimmed region D,
+    bracketed through the SSI strip — a triple of ``CInterval``.
+
+    This is the Σ-flux orientation oracle for a closed shell of trimmed
+    faces (:class:`forgekernel.trimshell.TrimmedShell`): ∮ n̂ dA over ANY
+    closed surface is exactly zero (divergence theorem on the constant
+    fields x̂, ŷ, ẑ), so the per-face brackets summed with the faces'
+    senses must CONTAIN (0, 0, 0) — an interval that certifiably
+    excludes zero is a proven orientation or membership error, while a
+    true shell can never fail (each bracket contains its true value).
+    Same cell rules as :func:`certified_trim_flux`: strip-free cells are
+    exact (polynomial) or reciprocal-ruled (rational), strip cells
+    contribute their hull range as uncertainty."""
+    from forgekernel.interval import CInterval
+    from forgekernel.nurbs import bezier_patches
+
+    classify = _strip_classify(strip, inside)
+    spans = []
+    for (u0, u1, v0, v1, net) in bezier_patches(surface):
+        P, Q = _normal_forms(net)
+        spans.append(((F(u0), F(u1), F(v0), F(v1)), P, Q))
+    out = []
+    for c in range(3):
+        lo = hi = F(0)
+        for (box, P, Q) in spans:
+            l, h = _accumulate(P[c], Q, box, depth, classify)
+            lo += l
+            hi += h
+        out.append(CInterval(lo, hi))
+    return tuple(out)
