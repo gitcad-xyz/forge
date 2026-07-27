@@ -843,7 +843,20 @@ def _refine_constrained(A, B, pt, fixed, iters: int = 16):
         vals[i] = float(val)
     free = [i for i in range(4) if i not in fixed]
     if not free:
-        raise ValueError("all four parameters fixed — nothing to solve")
+        # All four parameters pinned: the candidate point is fully
+        # determined — there is nothing to SOLVE, only the exact residual
+        # certificate to check (the matched-corner-probe idiom, 0 Newton
+        # iterations). This arises when a corner cell of one surface's
+        # domain pairs with a corner cell of the other's (e.g. exactly
+        # coincident faces sharing a parameter-domain corner); raising
+        # here used to escape the seam as a raw ValueError (the released
+        # 0.9.8 coplanar-loft crash) instead of letting the caller's
+        # structured refusal machinery classify the cell.
+        out = tuple(fixed[i] for i in range(4))
+        pa = A.eval(out[0], out[1])
+        pb = B.eval(out[2], out[3])
+        res2 = sum((pa[c] - pb[c]) ** 2 for c in range(3))
+        return out, res2 < F(1, 10 ** 20), res2
 
     def _rat():
         return tuple(fixed[i] if i in fixed
