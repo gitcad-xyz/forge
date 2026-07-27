@@ -246,6 +246,266 @@ class Solid:
         return {"vertices": verts, "triangles": tris}
 
 
+# -- K3.6b: geometry that does not close (#135) -------------------------------
+#
+# The anti-Parasolid bet at the border: an open shell is never silently a
+# solid. Volume and centroid are ORIGIN-DEPENDENT on an open shell (the
+# divergence sum keeps the flux through the missing wall), so they are not
+# approximations there — they are not numbers at all. The machinery below
+# projects the exact interval-coverage audit back into user millimetres, and
+# repairs — only ever by exact vertex merge, never by inventing a face.
+
+class NonClosedShellError(ValueError):
+    """A polygon set does not close into the boundary of a solid.
+
+    ``segments`` are the uncovered boundary intervals with EXACT 3D endpoints;
+    ``report`` is the same story in display millimetres (see
+    :func:`boundary_gap_report`); ``healed`` carries the heal record when a
+    vertex merge ran first and could not finish the job."""
+
+    def __init__(self, message: str, *, segments: list, report: dict,
+                 healed: dict | None = None) -> None:
+        super().__init__(message)
+        self.segments = segments
+        self.report = report
+        self.healed = healed
+
+
+class SnapClusterError(ValueError):
+    """A heal tolerance chained vertices into a cluster wider than itself.
+
+    Merging 0 / 0.008 / 0.016 at tol 0.01 would move a vertex 1.6x the
+    promised tolerance — transitive closure quietly breaks the contract, so
+    the cluster refuses by name instead."""
+
+    def __init__(self, message: str, *, cluster: list, diameter_sq: Fraction,
+                 tolerance: Fraction) -> None:
+        super().__init__(message)
+        self.cluster = cluster
+        self.diameter_sq = diameter_sq
+        self.tolerance = tolerance
+
+
+def _dist2(a: Vec, b: Vec) -> Fraction:
+    d = sub(a, b)
+    return dot(d, d)
+
+
+def open_boundary_segments(polys: list[Polygon], cap: int = 256) -> list[dict]:
+    """Every uncovered (or overcovered) boundary interval, as exact 3D
+    endpoints — the same signed interval-coverage audit as
+    ``Solid.watertight_violations``, projected back out of carrier-line
+    parameters into points a person can find on the part. Empty == closed."""
+    from collections import defaultdict
+
+    lines: dict = defaultdict(list)
+    for p in polys:
+        n = len(p.verts)
+        for i in range(n):
+            a, b = p.verts[i], p.verts[(i + 1) % n]
+            cd = _canon_dir(sub(b, a))
+            if cd is None:
+                continue
+            key = (cd, cross(a, cd))              # (direction, Plücker moment)
+            ta, tb = dot(a, cd), dot(b, cd)
+            sign = 1 if ta < tb else -1
+            lines[key].append((min(ta, tb), max(ta, tb), sign))
+    segs: list[dict] = []
+    for (cd, moment), intervals in sorted(lines.items(),
+                                          key=lambda kv: repr(kv[0])):
+        cuts = sorted({t for lo, hi, _ in intervals for t in (lo, hi)})
+        dd = dot(cd, cd)
+        # point on the carrier line at parameter t (t = dot(p, cd)):
+        # base is the line's closest point to the origin, exact.
+        base = smul(1 / dd, cross(cd, moment))
+        runs: list[list] = []                     # [t_lo, t_hi, coverage]
+        for lo, hi in zip(cuts, cuts[1:]):
+            cov = sum(s for slo, shi, s in intervals if slo <= lo and hi <= shi)
+            if cov != 0 and runs and runs[-1][1] == lo and runs[-1][2] == cov:
+                runs[-1][1] = hi                  # extend the maximal run
+            elif cov != 0:
+                runs.append([lo, hi, cov])
+        segs.extend({"a": add(base, smul(t0 / dd, cd)),
+                     "b": add(base, smul(t1 / dd, cd)),
+                     "coverage": cov}
+                    for t0, t1, cov in runs)
+        if len(segs) >= cap:
+            break
+    return segs[:cap]
+
+
+def boundary_gap_report(segments: list[dict]) -> dict:
+    """The gap report in user millimetres — what an agent (or a person)
+    needs to decide between repairing at source and healing: how many open
+    edges, how long the open boundary runs, how many connected chains it
+    forms, and — when opposing chains exist — how wide the crack between
+    them is. Never the raw carrier-line parameters (a 3 um tear renders as
+    ``t=[-133323,10.003]`` in those — unreadable and not millimetres)."""
+    import math
+
+    def fpt(v: Vec) -> tuple:
+        return tuple(float(c) for c in v)
+
+    def length(s: dict) -> float:
+        return math.sqrt(float(_dist2(s["a"], s["b"])))
+
+    # connected chains by EXACT shared endpoints
+    parent = list(range(len(segments)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    index: dict = {}
+    for i, s in enumerate(segments):
+        for v in (s["a"], s["b"]):
+            if v in index:
+                ra, rb = find(index[v]), find(i)
+                parent[ra] = rb
+            else:
+                index[v] = i
+    chains: dict = {}
+    for i in range(len(segments)):
+        chains.setdefault(find(i), []).append(i)
+    chain_pts = [[v for i in members for v in
+                  (segments[i]["a"], segments[i]["b"])]
+                 for members in chains.values()]
+    max_gap = None
+    if len(chain_pts) >= 2:
+        gaps = []
+        for i, pts in enumerate(chain_pts):
+            best = None
+            for j, other in enumerate(chain_pts):
+                if i == j:
+                    continue
+                for p in pts:
+                    for q in other:
+                        d2 = _dist2(p, q)
+                        if best is None or d2 < best:
+                            best = d2
+            gaps.append(best)
+        max_gap = math.sqrt(float(max(gaps)))
+    return {"open_edges": len(segments),
+            "open_perimeter_mm": sum(length(s) for s in segments),
+            "chains": len(chain_pts),
+            "max_gap_mm": max_gap,
+            "segments_mm": [{"a": fpt(s["a"]), "b": fpt(s["b"]),
+                             "length_mm": length(s),
+                             "coverage": s["coverage"]}
+                            for s in segments[:16]],
+            "segments_truncated": max(0, len(segments) - 16)}
+
+
+def _area_vec(verts: list[Vec]) -> Vec:
+    acc = (Fraction(0), Fraction(0), Fraction(0))
+    v0 = verts[0]
+    for a, b in zip(verts[1:], verts[2:]):
+        acc = add(acc, cross(sub(a, v0), sub(b, v0)))
+    return acc
+
+
+def snap_vertices(polys: list[Polygon], tolerance) -> tuple[list[Polygon], dict]:
+    """Certified heal: merge vertices coincident within ``tolerance`` — and
+    nothing else. Exact predicates throughout (dist² <= tol², no sqrt in any
+    decision); the representative is the lexicographic minimum of its cluster
+    (deterministic, so rebuilds stay byte-canonical); a cluster whose diameter
+    exceeds the tolerance REFUSES (transitive chains would move a vertex
+    farther than promised); faces that collapse are dropped INTO the record,
+    never silently. Returns ``(new_polys, record)`` where the record is the
+    certificate: how many vertices moved, the exact max move, and the bound
+    |ΔV| <= Σ(affected face area)·max_move — deliberately NOT a delta against
+    the pre-heal volume, which is origin-dependent on an open shell and
+    therefore meaningless."""
+    import math
+
+    tol = tolerance if isinstance(tolerance, Fraction) else Fraction(str(tolerance))
+    if tol <= 0:
+        raise ValueError("snap_vertices wants a positive tolerance")
+    tol2 = tol * tol
+    verts = sorted({v for p in polys for v in p.verts})
+    n = len(verts)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            # cheap exact reject before the full distance: sorted order makes
+            # the x-gap monotone, so once it alone exceeds tol, stop the row
+            dx = verts[j][0] - verts[i][0]
+            if dx * dx > tol2:
+                break
+            if _dist2(verts[i], verts[j]) <= tol2:
+                parent[find(i)] = find(j)
+    clusters: dict = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    mapping: dict = {}
+    moved: list[tuple] = []
+    cluster_members: set = set()
+    for members in clusters.values():
+        if len(members) == 1:
+            continue
+        pts = [verts[i] for i in members]
+        for a in range(len(pts)):
+            for b in range(a + 1, len(pts)):
+                d2 = _dist2(pts[a], pts[b])
+                if d2 > tol2:
+                    raise SnapClusterError(
+                        f"heal tolerance {float(tol):g} chains "
+                        f"{len(pts)} vertices into a cluster of diameter "
+                        f"{math.sqrt(float(d2)):g} mm — merging would move a "
+                        f"vertex farther than the promised tolerance",
+                        cluster=[tuple(float(c) for c in p) for p in pts],
+                        diameter_sq=d2, tolerance=tol)
+        rep = min(pts)
+        for p in pts:
+            cluster_members.add(p)
+            mapping[p] = rep
+            if p != rep:
+                moved.append((p, rep, _dist2(p, rep)))
+    new_polys: list[Polygon] = []
+    dropped: list[str] = []
+    affected_area = 0.0
+    affected_sources: list[str] = []
+    for p in polys:
+        nv = [mapping.get(v, v) for v in p.verts]
+        ded: list[Vec] = []
+        for v in nv:
+            if not ded or v != ded[-1]:
+                ded.append(v)
+        if len(ded) > 1 and ded[0] == ded[-1]:
+            ded.pop()
+        if any(v in cluster_members for v in p.verts):
+            affected_sources.append(p.source)
+            affected_area += math.sqrt(float(p.area2())) / 2
+        if len(ded) < 3 or is_zero(_area_vec(ded)):
+            dropped.append(p.source)
+            continue
+        new_polys.append(Polygon(ded, p.source))
+    max_move_sq = max((d2 for _, _, d2 in moved), default=Fraction(0))
+    max_move = math.sqrt(float(max_move_sq))
+    record = {"tolerance": str(tol),
+              "moved": len(moved),
+              "vertices_moved": [(tuple(float(c) for c in a),
+                                  tuple(float(c) for c in b),
+                                  math.sqrt(float(d2)))
+                                 for a, b, d2 in moved[:16]],
+              "max_move_sq": max_move_sq,
+              "max_move_mm": max_move,
+              "affected_faces": affected_sources,
+              "affected_area_mm2": affected_area,
+              "volume_change_bound_mm3": affected_area * max_move,
+              "dropped_faces": dropped}
+    return new_polys, record
+
+
 def _pt(v: Vec) -> str:
     return f"({float(v[0]):g},{float(v[1]):g},{float(v[2]):g})"
 

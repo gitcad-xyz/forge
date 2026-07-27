@@ -305,20 +305,106 @@ class _Topo(StepFile):
                 if "MANIFOLD_SOLID_BREP" in t]
 
 
-def read_step_planar_solid(text: str):
+def read_step_planar_solid(text: str, *, heal_tolerance=None,
+                           report: dict | None = None):
     """Import the first planar-faced solid in a STEP file as an exact
     forge Solid (coordinates via lossless decimal→rational). Refuses
-    freeform faces and holes with their stage names."""
-    from forgekernel.brep import Polygon, Solid
+    freeform faces and holes with their stage names.
 
+    The border is audited (#135): closure is established BEFORE the
+    orientation flip — on an open shell the volume sign is origin-dependent,
+    so flipping by it first used to invert every face of a far-from-origin
+    open shell. A shell that does not close refuses with
+    :class:`~forgekernel.brep.NonClosedShellError` carrying a gap report in
+    user millimetres — unless ``heal_tolerance`` (opt-in, the caller's
+    recorded intent) authorizes an exact vertex merge, which repairs tears
+    but can never invent a missing face. ``report`` (a dict, filled in
+    place) receives ``dropped`` entries (degenerate faces, extra solids in a
+    multi-solid file) and the ``healed`` certificate."""
+    from forgekernel.brep import (NonClosedShellError, Polygon, Solid,
+                                  _area_vec, boundary_gap_report,
+                                  open_boundary_segments, snap_vertices)
+    from forgekernel.exact import dot as _dot
+    from forgekernel.exact import is_zero as _is_zero
+    from forgekernel.exact import sub as _sub
+
+    rep = report if report is not None else {}
     topo = _Topo(text)
     sids = topo.solids()
     if not sids:
         raise ValueError("import_step: no MANIFOLD_SOLID_BREP in file")
+    if len(sids) > 1:
+        # a multi-solid file used to import only its first solid with the
+        # rest silently absent — the drop now lands in the report
+        rep.setdefault("dropped", []).extend(
+            f"MANIFOLD_SOLID_BREP #{e}: multi-solid file — only the first "
+            f"solid imports (compounds arrive at K3.7)" for e in sids[1:])
     loops = topo.planar_solid_faces(sids[0])
-    polys = [Polygon([tuple(p) for p in loop], f"step.face{i}")
-             for i, loop in enumerate(loops)]
+    polys: list = []
+    for i, loop in enumerate(loops):
+        pts = [tuple(p) for p in loop]
+        ded = [v for j, v in enumerate(pts) if v != pts[j - 1]]
+        area = _area_vec(ded) if len(ded) >= 3 else None
+        if area is None or _is_zero(area):
+            # a degenerate loop is a DROP, reported — not Polygon's raw
+            # "collinear points" crash and not a silent Solid.__init__ filter
+            rep.setdefault("dropped", []).append(
+                f"step.face{i}: degenerate face loop (zero area) dropped")
+            continue
+        # exact planarity: the loop must lie in ONE plane. The reader never
+        # checks the declared PLANE's origin, so a bent quad — 3 um of sag —
+        # used to import clean and silently mean whatever the first three
+        # vertices said. Refuse by name instead (exact test, no epsilon).
+        v0 = ded[0]
+        sag = [j for j, v in enumerate(ded) if _dot(_sub(v, v0), area) != 0]
+        if sag:
+            raise ValueError(
+                f"import_step: non-planar face loop (step.face{i}: vertex "
+                f"{tuple(float(c) for c in ded[sag[0]])} is exactly off the "
+                f"loop's plane) — forge planar import cannot represent a "
+                f"bent loop; repair or re-export from the source system "
+                f"(freeform faces arrive at K3.7)")
+        polys.append(Polygon(ded, f"step.face{i}"))
+    # -- closure audit at the border, BEFORE any orientation decision ---------
+    segs = open_boundary_segments(polys)
+    healed = None
+    if segs and heal_tolerance is not None:
+        polys2, healed = snap_vertices(polys, heal_tolerance)
+        segs2 = open_boundary_segments(polys2)
+        if segs2:
+            gr = boundary_gap_report(segs2)
+            raise NonClosedShellError(
+                f"import_step: shell still does not close after healing "
+                f"(moved {healed['moved']} vertices; a vertex merge cannot "
+                f"invent a missing face): {gr['open_edges']} open boundary "
+                f"edges, {gr['open_perimeter_mm']:.6g} mm open perimeter",
+                segments=segs2, report=gr, healed=healed)
+        for p2 in polys2:
+            # a merge can bend a quad out of plane; shipping it would trade
+            # an open shell for a silently-wrong closed one
+            a2 = _area_vec(p2.verts)
+            if any(_dot(_sub(v, p2.verts[0]), a2) != 0 for v in p2.verts):
+                raise ValueError(
+                    f"import_step: non-planar face loop ({p2.source}: the "
+                    f"heal bent this face out of its exact plane) — lower "
+                    f"heal_tolerance or repair in the source system")
+        polys = polys2
+        rep["healed"] = healed
+        rep.setdefault("dropped", []).extend(
+            f"{src}: face collapsed by heal and was dropped"
+            for src in healed["dropped_faces"])
+    elif segs:
+        gr = boundary_gap_report(segs)
+        raise NonClosedShellError(
+            f"import_step: the shell does not close — {gr['open_edges']} "
+            f"open boundary edges, {gr['open_perimeter_mm']:.6g} mm open "
+            f"perimeter"
+            + (f", crack width {gr['max_gap_mm']:.6g} mm"
+               if gr["max_gap_mm"] is not None else ""),
+            segments=segs, report=gr)
     s = Solid(polys)
+    # orientation by volume sign is SOUND here: the shell is closed, so the
+    # sign is origin-independent
     if s.volume() < 0:
         s = Solid([p.flipped() for p in polys])
     if s.volume() <= 0:
@@ -401,6 +487,20 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part",
     blind. Circles and cylinders are emitted as EXACT analytic surfaces, not
     faceted — a drilled plate exports as a real cylindrical hole that any CAD
     system reads back as a hole."""
+    from forgekernel.brep import (NonClosedShellError, boundary_gap_report,
+                                  open_boundary_segments)
+
+    # #135: this writer used to emit CLOSED_SHELL unconditionally — an open
+    # shell went out wearing a closed label and the lie propagated to the
+    # next reader. Audit first; a refusal beats a well-formed falsehood.
+    open_segs = open_boundary_segments(solid.polys)
+    if open_segs:
+        gr = boundary_gap_report(open_segs)
+        raise NonClosedShellError(
+            f"export refuses to emit CLOSED_SHELL over an open shell: "
+            f"{gr['open_edges']} open boundary edges, "
+            f"{gr['open_perimeter_mm']:.6g} mm open perimeter",
+            segments=open_segs, report=gr)
     lines: list[str] = []
     nid = [0]
 
