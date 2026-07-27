@@ -20,7 +20,15 @@ Structure (all geometry exact rational; Bézier patches, weights 1):
 3. **Certified refinement.** Per cell, a float Newton solve lands a
    point on the intersection; the *certificate* is exact: the rational
    residual |A(u,v) − B(s,t)|² is computed in ℚ and must be below tol².
-   Points that fail to certify are dropped and reported honestly.
+
+4. **Per-cell existence resolution.** A cell whose refinement fails to
+   certify is never silently dropped (that punches holes in the trim
+   loops a boolean would build). The resolver deepens the subdivision of
+   exactly that cell's pairs until one of three certified outcomes:
+   a residual-certified point INSIDE the cell (existence), every
+   descendant pair pruned (exclusion — the same bbox-disjointness proof
+   detection uses), or a named refusal ``SsiCellUncertified`` carrying
+   the cells (tangential contact, or resolution budget).
 
 The empty case is a genuine differentiator: bbox-disjointness at the
 top level *proves* non-intersection — a float sampler can only fail to
@@ -32,6 +40,39 @@ from __future__ import annotations
 from fractions import Fraction
 
 F = Fraction
+
+# resolution budget for the per-cell existence test: extra subdivision
+# levels tried on a cell whose first refinement failed to certify
+_RESOLVE_LEVELS = 6
+
+
+class SsiCellUncertified(ValueError):
+    """Structured refusal: surviving subdivision cell(s) could be neither
+    certified (no residual-certified point found inside the cell) nor
+    proven empty (subdivision pruning never exhausted the cell's
+    descendant pairs) within the resolution budget.
+
+    Tangential contact is the canonical cause — bbox pruning cannot
+    separate touching surfaces, and Newton's normal equations are
+    singular where the tangent planes coincide, so no transversal
+    certificate exists to find. Refusing by name is the finished answer
+    (ADR-0019); the alternative was a silent drop that punches holes in
+    the trim loops a boolean builds from these points.
+
+    ``cells`` — [(a_box, b_box), …]: the unresolved cells as
+    (u0, u1, v0, v1) Fraction boxes in BOTH surfaces' parameter domains.
+    """
+
+    def __init__(self, cells, depth: int, extra: int) -> None:
+        self.cells = list(cells)
+        self.depth = depth
+        self.extra = extra
+        super().__init__(
+            f"ssi_cell_uncertified: {len(self.cells)} surviving cell(s) "
+            f"neither certified nor proven empty at depth {depth} plus "
+            f"{extra} resolution levels — tangential or near-tangential "
+            f"contact has no transversal certificate; raise depth only "
+            f"if the contact is believed transversal")
 
 
 class BezierPatch:
@@ -250,31 +291,118 @@ def _solve3f(M, b):
     return [a[i][3] / a[i][i] for i in range(3)]
 
 
-def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
-    """Full SSI: branches + one certified point per surviving cell.
+def _resolve_cell_pairs(pairs, cell, newton, extra: int = _RESOLVE_LEVELS,
+                        cap: int = 256, tries: int = 8):
+    """Certified existence/exclusion for ONE surviving cell whose first
+    Newton refinement failed to certify — the test that turns a silent
+    drop into a classification.
 
-    Returns {"branches": n, "points": [(u,v,s,t)...] certified,
-    "uncertified": count, "empty_certified": bool}."""
-    branches, pairs = ssi_branches(A, B, depth)
+    ``pairs`` are the surviving (A-leaf, B-leaf) ``BezierPatch`` pairs
+    sharing this A-cell, ``cell`` its (u0, u1, v0, v1) box, and
+    ``newton(um, vm, sm, tm)`` the certified refinement in the caller's
+    parameter convention. Deepens the subdivision of exactly these pairs,
+    retrying certification from the refined midpoints. Returns one of
+
+    * ``("point", (u, v, s, t))`` — a residual-certified point INSIDE the
+      cell (exact ℚ containment; a certified point elsewhere on the curve
+      does not classify THIS cell);
+    * ``("empty", None)`` — every descendant pair pruned by control-net
+      bbox disjointness: the cell provably contains no intersection.
+      Sound only because no pair is ever discarded — growth past ``cap``
+      returns unresolved instead of truncating;
+    * ``("unresolved", None)`` — budget exhausted with pairs alive and no
+      certificate either way. Tangential contact lands exactly here:
+      pruning cannot separate touching surfaces and Newton's normal
+      equations go singular where the tangent planes coincide."""
+    u0, u1, v0, v1 = cell
+    cur = list(pairs)
+    # Matched-corner probes first: a contact sitting exactly ON a cell
+    # corner (domain edges meeting, or the curve grazing a dyadic corner)
+    # is invisible to midpoint-started Newton — the iteration stalls
+    # against the domain clamp — but certifies directly AT the corner,
+    # residual exactly 0, so the certificate alone (0 Newton iterations)
+    # decides and costs one exact evaluation per corner.
+    for a, b in cur:
+        for (ua, va), (ub, vb) in (((a.u0, a.v0), (b.u0, b.v0)),
+                                   ((a.u1, a.v0), (b.u1, b.v0)),
+                                   ((a.u0, a.v1), (b.u0, b.v1)),
+                                   ((a.u1, a.v1), (b.u1, b.v1))):
+            u, v, s, t, ok, _ = newton(ua, va, ub, vb, 0)
+            if ok and u0 <= u <= u1 and v0 <= v <= v1:
+                return ("point", (u, v, s, t))
+    for _ in range(extra):
+        nxt = []
+        for a, b in cur:
+            for sa in a.split4():
+                ba = sa.bbox()
+                for sb in b.split4():
+                    if _boxes_overlap(ba, sb.bbox()):
+                        nxt.append((sa, sb))
+        if not nxt:
+            return ("empty", None)                  # certified exclusion
+        if len(nxt) > cap:
+            return ("unresolved", None)             # never truncate
+        step = max(1, len(nxt) // tries)            # spread the retries
+        for a, b in nxt[::step][:tries]:
+            um, vm = (a.u0 + a.u1) / 2, (a.v0 + a.v1) / 2
+            sm, tm = (b.u0 + b.u1) / 2, (b.v0 + b.v1) / 2
+            u, v, s, t, ok, _ = newton(um, vm, sm, tm)
+            if ok and u0 <= u <= u1 and v0 <= v <= v1:
+                return ("point", (u, v, s, t))      # certified existence
+        cur = nxt
+    return ("unresolved", None)
+
+
+def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
+    """Full SSI: branches + one certified point per surviving cell, with
+    every cell CLASSIFIED — a certified point, proven empty by the
+    resolver, or the pair refuses (:class:`SsiCellUncertified`). Never a
+    silent drop.
+
+    Returns {"branches": n (over point-bearing cells), "points":
+    [(u,v,s,t)...] certified, "uncertified": 0, "empty_certified": bool,
+    "cells": surviving-cell count, "empty_cells": cells proven empty,
+    "tightened": cells certified only after deepening}. ``uncertified``
+    is kept for compatibility and is 0 by construction — an unresolved
+    cell raises instead of being counted."""
+    _, pairs = ssi_branches(A, B, depth)
     if not pairs:
         return {"branches": 0, "points": [], "uncertified": 0,
-                "empty_certified": True}
-    pts, bad = [], 0
-    seen = set()
+                "empty_certified": True, "cells": 0, "empty_cells": 0,
+                "tightened": 0}
+    groups: dict = {}
     for a, b in pairs:
-        key = (a.u0, a.v0)
-        if key in seen:
-            continue
-        seen.add(key)
-        um, vm = (a.u0 + a.u1) / 2, (a.v0 + a.v1) / 2
-        sm, tm = (b.u0 + b.u1) / 2, (b.v0 + b.v1) / 2
-        u, v, s, t, ok, _ = refine_point(A.net, B.net, um, vm, sm, tm)
+        groups.setdefault((a.u0, a.u1, a.v0, a.v1), []).append((a, b))
+
+    def newton(um, vm, sm, tm, iters=12):
+        return refine_point(A.net, B.net, um, vm, sm, tm, iters)
+
+    pts, alive, unresolved = [], [], []
+    empty = tightened = 0
+    for cell, grp in groups.items():
+        a0, b0 = grp[0]
+        um, vm = (a0.u0 + a0.u1) / 2, (a0.v0 + a0.v1) / 2
+        sm, tm = (b0.u0 + b0.u1) / 2, (b0.v0 + b0.v1) / 2
+        u, v, s, t, ok, _ = newton(um, vm, sm, tm)
         if ok:
             pts.append((u, v, s, t))
+            alive.append(cell)
+            continue
+        verdict, pt = _resolve_cell_pairs(grp, cell, newton)
+        if verdict == "point":
+            pts.append(pt)
+            alive.append(cell)
+            tightened += 1
+        elif verdict == "empty":
+            empty += 1
         else:
-            bad += 1
-    return {"branches": len(branches), "points": pts, "uncertified": bad,
-            "empty_certified": False}
+            unresolved.append((cell, (b0.u0, b0.u1, b0.v0, b0.v1)))
+    if unresolved:
+        raise SsiCellUncertified(unresolved, depth, _RESOLVE_LEVELS)
+    return {"branches": len(_cluster(alive)), "points": pts,
+            "uncertified": 0, "empty_certified": not pts,
+            "cells": len(groups), "empty_cells": empty,
+            "tightened": tightened}
 
 
 # -- K3.5: SSI over B-spline surfaces + ordered polylines ---------------------
@@ -362,20 +490,90 @@ def _ssi_boxes(A, B, depth: int, use_rust: bool | None):
     return boxes
 
 
-def _ssi_cells(A, B, depth: int, use_rust: bool | None):
-    """Shared detection for the surface SSI entry points: the surviving
-    leaf pairs deduplicated into a ``{A-cell: B-cell}`` map, plus the
-    branch clustering of the A-cells (connected components in A's
-    parameter domain). Returns ``(cells, branches)`` — ``({}, [])``
-    means certified-empty."""
+def _clip_dyadic(p: BezierPatch, box):
+    """Clip a Bézier span patch down to a dyadic descendant box by de
+    Casteljau splits — exact, the same arithmetic the detection pass used
+    to produce the cell in the first place."""
+    u0, u1, v0, v1 = box
+    for _ in range(64):
+        if (p.u0, p.u1) == (u0, u1):
+            break
+        lo, hi = p.split_u()
+        p = lo if u1 <= lo.u1 else hi
+    else:
+        raise AssertionError("cell box is not a dyadic descendant (u)")
+    for _ in range(64):
+        if (p.v0, p.v1) == (v0, v1):
+            break
+        lo, hi = p.split_v()
+        p = lo if v1 <= lo.v1 else hi
+    else:
+        raise AssertionError("cell box is not a dyadic descendant (v)")
+    return p
+
+
+def _cell_patch(spans, box):
+    """The exact Bézier sub-patch of a surface for one surviving cell:
+    find the Bézier span containing the (dyadic-within-span) box, clip
+    down to it."""
+    u0, u1, v0, v1 = box
+    for su0, su1, sv0, sv1, net in spans:
+        if su0 <= u0 and u1 <= su1 and sv0 <= v0 and v1 <= sv1:
+            return _clip_dyadic(BezierPatch(net, su0, su1, sv0, sv1), box)
+    raise AssertionError("surviving cell lies in no Bézier span")
+
+
+def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
+    """Shared certified-classification core for the surface SSI entry
+    points. Every surviving A-cell ends classified: a certified point,
+    proven empty (:func:`_resolve_cell_pairs`), or the whole pair refuses
+    with :class:`SsiCellUncertified` — never a silent drop.
+
+    Returns ``None`` for detection-level certified emptiness, else
+    ``(points, branches, stats)`` where ``points`` maps each point-bearing
+    A-cell box to its certified (u, v, s, t), ``branches`` clusters those
+    cells (connected components in A's parameter domain), and ``stats``
+    is {"cells", "empty_cells", "tightened"}."""
     boxes = _ssi_boxes(A, B, depth, use_rust)
     if not boxes:
-        return {}, []
-    cells: dict = {}
+        return None
+    groups: dict = {}
     for abox, bbox_ in boxes:
-        cells.setdefault(abox, bbox_)
-    branches = _cluster(list(cells))
-    return cells, branches
+        groups.setdefault(abox, []).append(bbox_)
+
+    def newton(um, vm, sm, tm, iters=12):
+        return _refine_global(A, B, um, vm, sm, tm, iters)
+
+    spans = None
+    points: dict = {}
+    unresolved = []
+    empty = tightened = 0
+    for abox, bbs in groups.items():
+        b0 = bbs[0]
+        um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
+        sm, tm = (b0[0] + b0[1]) / 2, (b0[2] + b0[3]) / 2
+        u, v, s, t, ok, _ = newton(um, vm, sm, tm)
+        if ok:
+            points[abox] = (u, v, s, t)
+            continue
+        if spans is None:
+            from forgekernel.nurbs import bezier_patches
+            spans = (list(bezier_patches(A)), list(bezier_patches(B)))
+        grp = [(_cell_patch(spans[0], abox), _cell_patch(spans[1], bb))
+               for bb in bbs]
+        verdict, pt = _resolve_cell_pairs(grp, abox, newton)
+        if verdict == "point":
+            points[abox] = pt
+            tightened += 1
+        elif verdict == "empty":
+            empty += 1
+        else:
+            unresolved.append((abox, b0))
+    if unresolved:
+        raise SsiCellUncertified(unresolved, depth, _RESOLVE_LEVELS)
+    branches = _cluster(list(points))
+    return points, branches, {"cells": len(groups), "empty_cells": empty,
+                              "tightened": tightened}
 
 
 def ssi_strips(A, B, depth: int = 4, use_rust: bool | None = None):
@@ -397,23 +595,18 @@ def ssi_strips(A, B, depth: int = 4, use_rust: bool | None = None):
 
 def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
     """SSI between two B-spline surfaces: certified points in global
-    parameters plus the branch count. See :func:`ssi_curves` for the same
+    parameters plus the branch count, every surviving cell classified
+    (point / proven-empty / :class:`SsiCellUncertified` — see
+    :func:`_resolve_cell_pairs`). See :func:`ssi_curves` for the same
     points chained into ordered per-branch polylines."""
-    cells, branches = _ssi_cells(A, B, depth, use_rust)
-    if not cells:
+    res = _ssi_resolved(A, B, depth, use_rust)
+    if res is None:
         return {"branches": 0, "points": [], "uncertified": 0,
-                "empty_certified": True}
-    pts, bad = [], 0
-    for abox, bbox_ in cells.items():
-        um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
-        sm, tm = (bbox_[0] + bbox_[1]) / 2, (bbox_[2] + bbox_[3]) / 2
-        u, v, s, t, ok, _ = _refine_global(A, B, um, vm, sm, tm)
-        if ok:
-            pts.append((u, v, s, t))
-        else:
-            bad += 1
-    return {"branches": len(branches), "points": pts, "uncertified": bad,
-            "empty_certified": False}
+                "empty_certified": True, "cells": 0, "empty_cells": 0,
+                "tightened": 0}
+    points, branches, stats = res
+    return {"branches": len(branches), "points": list(points.values()),
+            "uncertified": 0, "empty_certified": not points, **stats}
 
 
 def _order_branch(points):
@@ -466,32 +659,28 @@ def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):
 
     Returns ``{"curves": [{"points": [(u,v,s,t)…] (exact ℚ),
     "xyz": [(x,y,z)…] (float, for render), "closed": bool}, …],
-    "uncertified": n, "empty_certified": bool}``. The points are the
-    certified objects (residual < 1e-20); the ordering is a float
-    convenience layered on top."""
-    cells, branches = _ssi_cells(A, B, depth, use_rust)
-    if not cells:
-        return {"curves": [], "uncertified": 0, "empty_certified": True}
+    "uncertified": 0, "empty_certified": bool, "cells": n,
+    "empty_cells": n, "tightened": n}``. The points are the certified
+    objects (residual < 1e-20); the ordering is a float convenience
+    layered on top. Every surviving cell is classified — a cell that can
+    be neither certified nor proven empty raises
+    :class:`SsiCellUncertified` instead of being dropped."""
+    res = _ssi_resolved(A, B, depth, use_rust)
+    if res is None:
+        return {"curves": [], "uncertified": 0, "empty_certified": True,
+                "cells": 0, "empty_cells": 0, "tightened": 0}
+    points, branches, stats = res
     branch_of = {abox: bi for bi, group in enumerate(branches) for abox in group}
     per_branch: dict[int, list] = {bi: [] for bi in range(len(branches))}
-    bad = 0
-    for abox, bbox_ in cells.items():
-        um, vm = (abox[0] + abox[1]) / 2, (abox[2] + abox[3]) / 2
-        sm, tm = (bbox_[0] + bbox_[1]) / 2, (bbox_[2] + bbox_[3]) / 2
-        u, v, s, t, ok, _ = _refine_global(A, B, um, vm, sm, tm)
-        if ok:
-            per_branch[branch_of[abox]].append((u, v, s, t))
-        else:
-            bad += 1
+    for abox, pt in points.items():
+        per_branch[branch_of[abox]].append(pt)
     curves = []
     for bi in range(len(branches)):
-        bpts = per_branch[bi]
-        if not bpts:
-            continue
-        ordered, closed = _order_branch(bpts)
+        ordered, closed = _order_branch(per_branch[bi])
         xyz = [tuple(float(c) for c in A.eval(p[0], p[1])) for p in ordered]
         curves.append({"points": ordered, "xyz": xyz, "closed": closed})
-    return {"curves": curves, "uncertified": bad, "empty_certified": False}
+    return {"curves": curves, "uncertified": 0,
+            "empty_certified": not points, **stats}
 
 
 def _refine_global(A, B, u, v, s, t, iters: int = 12):
