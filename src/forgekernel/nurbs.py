@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from forgekernel.interval import CInterval
+from forgekernel.interval import CInterval, ci_reciprocal as _ci_reciprocal
 
 F = Fraction
 
@@ -157,13 +157,6 @@ def bezier(control_points, weights=None) -> BSplineCurve:
 
 def _ci(x) -> CInterval:
     return x if isinstance(x, CInterval) else CInterval.exact(F(x))
-
-
-def _ci_reciprocal(x: CInterval) -> CInterval:
-    """1/x for an interval that strictly excludes zero (certified)."""
-    s = x.sign()                                    # raises if straddles 0
-    lo, hi = (F(1) / x.hi, F(1) / x.lo) if s > 0 else (F(1) / x.hi, F(1) / x.lo)
-    return CInterval(min(lo, hi), max(lo, hi))
 
 
 # -- K3.2: tensor-product NURBS surfaces --------------------------------------

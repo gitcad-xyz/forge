@@ -139,3 +139,12 @@ class CInterval:
 
 def _as_ci(x) -> CInterval:
     return x if isinstance(x, CInterval) else CInterval.exact(x)
+
+
+def ci_reciprocal(x: CInterval) -> CInterval:
+    """1/x for an interval that strictly excludes zero (certified).
+    Enclosure-preserving: 1/t is monotone on either side of zero, so the
+    reciprocal of the endpoints brackets the reciprocal of every point."""
+    x.sign()                                        # raises if straddles 0
+    lo, hi = Fraction(1) / x.hi, Fraction(1) / x.lo
+    return CInterval(min(lo, hi), max(lo, hi))

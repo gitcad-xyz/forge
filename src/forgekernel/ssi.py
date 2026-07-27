@@ -314,12 +314,13 @@ def _net_str(net):
     return [[[_rstr(c) for c in pt] for pt in row] for row in net]
 
 
-def _ssi_cells(A, B, depth: int, use_rust: bool | None):
-    """Shared detection for the surface SSI entry points: exact Bézier
-    extraction + pairwise subdivision detection, deduplicated into a
-    surviving ``{A-cell: B-cell}`` map, plus the branch clustering of the
-    A-cells (connected components in A's parameter domain). Returns
-    ``(cells, branches)`` — ``({}, [])`` means certified-empty.
+def _ssi_boxes(A, B, depth: int, use_rust: bool | None):
+    """Raw subdivision detection between two B-spline surfaces: exact
+    Bézier extraction + pairwise subdivision, returning every surviving
+    ``(a_box, b_box)`` leaf pair as Fraction 4-tuples. ``[]`` means
+    certified-empty. The union of the a-boxes (resp. b-boxes) provably
+    encloses the true intersection curve in A's (resp. B's) parameter
+    domain — subdivision pruning never discards a real intersection.
 
     Detection — the hot loop — runs in the Rust port (``ssi_pairs``,
     oracle-verified bit-identical) when the extension is built; the Python
@@ -358,6 +359,16 @@ def _ssi_cells(A, B, depth: int, use_rust: bool | None):
                 _, pairs = ssi_branches(patch_a, patch_b, depth)
                 boxes.extend(((p.u0, p.u1, p.v0, p.v1),
                               (q.u0, q.u1, q.v0, q.v1)) for p, q in pairs)
+    return boxes
+
+
+def _ssi_cells(A, B, depth: int, use_rust: bool | None):
+    """Shared detection for the surface SSI entry points: the surviving
+    leaf pairs deduplicated into a ``{A-cell: B-cell}`` map, plus the
+    branch clustering of the A-cells (connected components in A's
+    parameter domain). Returns ``(cells, branches)`` — ``({}, [])``
+    means certified-empty."""
+    boxes = _ssi_boxes(A, B, depth, use_rust)
     if not boxes:
         return {}, []
     cells: dict = {}
@@ -365,6 +376,23 @@ def _ssi_cells(A, B, depth: int, use_rust: bool | None):
         cells.setdefault(abox, bbox_)
     branches = _cluster(list(cells))
     return cells, branches
+
+
+def ssi_strips(A, B, depth: int = 4, use_rust: bool | None = None):
+    """The certified trim-curve ENCLOSURE on both parameter domains: the
+    deduplicated sets of surviving subdivision cells, ``(a_cells,
+    b_cells)``, each a set of (u0, u1, v0, v1) Fraction boxes at
+    resolution 2^-depth (within each Bézier span).
+
+    The true intersection curve provably lies inside the union of the
+    a-cells in A's domain AND inside the union of the b-cells in B's
+    domain — bbox pruning never discards a real intersection. This is
+    the rigorous object a boolean's certified volume bracket is built
+    from (:func:`forgekernel.bsolid.certified_trim_flux`); the chained
+    polyline of :func:`ssi_curves` is only a float rendering aid.
+    ``(set(), set())`` means certified non-intersection."""
+    boxes = _ssi_boxes(A, B, depth, use_rust)
+    return ({abox for abox, _ in boxes}, {bbox_ for _, bbox_ in boxes})
 
 
 def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
