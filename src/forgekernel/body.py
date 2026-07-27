@@ -1562,6 +1562,21 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
     """One display mesh for the canonical form — planar faces are triangulated
     (with circular holes cut out), cylindrical faces become bands, spheres a UV
     mesh. Floats are legal here: meshing is a display property (ADR-0019)."""
+    if not isinstance(body, Body):
+        # Refuse by name, never crash on ``.faces`` (#96 gap 11). A freeform
+        # solid has no display mesh AT ALL yet — no converter can help — so
+        # its refusal names the stage that brings one; anything else is a
+        # representation the caller should convert first.
+        name = type(body).__name__
+        if name in _FREEFORM_REPS:
+            raise ValueError(
+                f"no display mesh for {name} yet: freeform tessellation "
+                "arrives with K7's trimmed-patch tessellator (shared with "
+                "K3.7's STEP topology); until then this refusal is the "
+                "finished answer (ADR-0019)")
+        raise ValueError(
+            f"tessellate takes the canonical Body, got {name}; convert "
+            "with to_body() first (ADR-0021)")
     from forgekernel.mesh2d import triangulate
 
     verts: list = []
@@ -3091,6 +3106,14 @@ def _find_cap_disk(face_list, c, z):
     return None
 
 
+# Representations whose boundary is genuinely freeform (spline / NURBS /
+# transcendental sweep). Their canonical form is the K7 trimmed-patch shell,
+# which does not exist yet — matched by NAME so this module needs no import
+# of loft/bsolid/trim/curve/profile2d just to refuse honestly.
+_FREEFORM_REPS = frozenset({
+    "LoftSolid", "PatchSolid", "TrimmedPatch", "TubeSolid", "SplinePrism"})
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
@@ -3148,6 +3171,12 @@ def to_body(shape) -> Body:
             face_lists[ci][di] = None
         return Body(tuple(f for fl in face_lists for f in fl
                           if f is not None))
+    if type(shape).__name__ in _FREEFORM_REPS:
+        raise ValueError(
+            f"no canonical-B-rep converter for {type(shape).__name__} yet: "
+            "a freeform solid's canonical form is the K7 trimmed-patch "
+            "shell (ADR-0021) — booleans, meshing and STEP topology for it "
+            "arrive with K7")
     raise ValueError(
         f"no canonical-B-rep converter for {type(shape).__name__} yet "
         "(ADR-0021 converters land per representation)")
