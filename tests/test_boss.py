@@ -123,6 +123,75 @@ def test_cut_distributes_over_a_disjoint_union() -> None:
     assert _nonmanifold(out.tessellate(0.05)) == 0
 
 
+def test_boss_on_plate_mesh_buries_no_faces_in_the_contact_disc() -> None:
+    """The flagship boss-on-plate must mesh with NO material-buried faces.
+
+    Concatenating the member shells emitted the plate's top face as a full
+    rectangle and laid the boss's bottom cap on top of it — every triangle
+    in the contact disc had solid on both sides. Volume and per-shell
+    closure stayed right (both shells are individually closed), which is
+    exactly why nothing caught it: the lie was topological, and any
+    slicer/half-edge consumer saw internal walls.
+
+    The stitched mesh must have zero z=5 triangles covering the contact
+    region, still enclose the same volume, and pair every edge BY INDEX —
+    one closed surface, not two shells hiding a wall."""
+    plate = Solid.box(30, 30, 5)
+    boss = Cyl(15, 15, 6, 5, 15)
+    mesh = DisjointUnion([plate, boss]).tessellate(0.05)
+    verts, tris = mesh["vertices"], mesh["triangles"]
+
+    # probe a grid of points well inside the contact disc: NO triangle lying
+    # in the plane z=5 may cover any of them (in the old mesh each is covered
+    # twice: plate top + boss cap)
+    flat = [[verts[i] for i in t] for t in tris
+            if all(verts[i][2] == 5.0 for i in t)]
+
+    def covered(px, py) -> int:
+        hits = 0
+        for a, b, c in flat:
+            d1 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])
+            d2 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0])
+            d3 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0])
+            if (d1 >= 0 and d2 >= 0 and d3 >= 0) or \
+               (d1 <= 0 and d2 <= 0 and d3 <= 0):
+                hits += 1
+        return hits
+    probes = [(15 + dx, 15 + dy) for dx in (-3.7, -1.3, 0.0, 1.9, 3.1)
+              for dy in (-3.9, -1.1, 0.7, 2.3, 3.3)]
+    # all probes sit well inside even the INSCRIBED ring polygon of the
+    # boss wall (r·cos(pi/n) > 5.9 at this deflection)
+    assert all((px - 15) ** 2 + (py - 15) ** 2 < 34 for px, py in probes)
+    buried = sum(covered(px, py) for px, py in probes)
+    assert buried == 0
+
+    # the enclosed volume is untouched by the stitch: still the sum of the
+    # plate and the boss's inscribed-polygon prism
+    from forgekernel.tess import mesh_volume
+    plate_v = mesh_volume(plate.tessellate())
+    boss_v = mesh_volume(boss.tessellate(0.05))
+    assert mesh_volume(mesh) == pytest.approx(plate_v + boss_v, rel=1e-9)
+
+    # and the stitched result is ONE closed surface: every edge pairs by
+    # vertex index (the hole rim reuses the boss wall's ring vertices)
+    assert _nonmanifold(mesh) == 0
+
+
+def test_overhanging_boss_keeps_the_merged_shell_fallback() -> None:
+    # the boss overhangs the plate edge: the contact patch is not a full
+    # disc, the single-hole stitch does not apply, and the union must keep
+    # meshing as two individually-closed shells (volume still the sum)
+    plate = Solid.box(30, 30, 5)
+    boss = Cyl(30, 15, 6, 5, 15)                  # centre ON the plate edge
+    u = DisjointUnion([plate, boss])
+    mesh = u.tessellate(0.05)
+    from forgekernel.tess import mesh_volume
+    plate_v = mesh_volume(plate.tessellate())
+    boss_v = mesh_volume(boss.tessellate(0.05))
+    assert mesh_volume(mesh) == pytest.approx(plate_v + boss_v, rel=1e-9)
+    assert _nonmanifold(mesh) == 0
+
+
 def test_revolve_solid_can_sit_off_axis() -> None:
     loop = [(0, 0), (2, 0), (2, 5), (0, 5)]              # a plain cylinder r=2
     at_origin, moved = RevolveSolid(loop), RevolveSolid(loop, 7, -3)

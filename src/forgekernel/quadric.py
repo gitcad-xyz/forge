@@ -845,6 +845,258 @@ def _member_centroid(m):
     return tuple(float(x) for x in m.centroid())
 
 
+def _face_z_and_up(p):
+    """(z, up) for a horizontal planar face, else None — exact."""
+    n = p.plane.n
+    if n[0] != 0 or n[1] != 0:
+        return None
+    zs = {v[2] for v in p.verts}
+    if len(zs) != 1:
+        return None
+    return (next(iter(zs)), n[2] > 0)
+
+
+def _disc_strictly_inside_face(p, c) -> bool:
+    """Exact: the disc (c.cx, c.cy, radius c.r) lies STRICTLY inside the
+    face polygon's xy projection — centre inside by ray parity, every
+    boundary edge clear of the disc by squared distance. Strict, so a
+    tangent-to-the-rim disc keeps the merged-shells fallback rather than
+    risking a degenerate band triangle."""
+    verts = [(v[0], v[1]) for v in p.verts]
+    m = len(verts)
+    inside = False
+    for i in range(m):
+        (x1, y1), (x2, y2) = verts[i], verts[(i + 1) % m]
+        if (y1 > c.cy) != (y2 > c.cy):
+            if c.cx < x1 + (c.cy - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    if not inside:
+        return False
+    r2 = c.r * c.r
+    for i in range(m):
+        (x1, y1), (x2, y2) = verts[i], verts[(i + 1) % m]
+        if _dist2_point_seg(c.cx, c.cy, x1, y1, x2, y2) <= r2:
+            return False
+    return True
+
+
+def _face_convex_xy(p) -> bool:
+    """Exact: the face polygon's xy projection is convex (collinear runs
+    allowed). The angular band triangulation is only valid for a convex
+    outer loop."""
+    verts = [(v[0], v[1]) for v in p.verts]
+    m = len(verts)
+    pos = neg = False
+    for i in range(m):
+        ax, ay = verts[i]
+        bx, by = verts[(i + 1) % m]
+        cx, cy = verts[(i + 2) % m]
+        cr = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if cr > 0:
+            pos = True
+        elif cr < 0:
+            neg = True
+    return not (pos and neg)
+
+
+def _stitch_plan(members) -> list:
+    """Full-disc cap-on-face contacts between a Cyl and a planar Solid,
+    detected with exact predicates: the cylinder's bottom cap on an
+    up-facing horizontal face (a boss standing on a plate) or its top cap
+    under a down-facing one, with the whole disc strictly inside a CONVEX
+    face polygon. Returns [(solid_idx, poly_idx, cyl_idx, z)].
+
+    Anything more entangled — several discs on one face, one cap meeting
+    several faces, non-Cyl members, surd coordinates the predicates cannot
+    divide through — keeps the merged-shells fallback for every party."""
+    cands = []
+    for ci, c in enumerate(members):
+        if not isinstance(c, Cyl):
+            continue
+        for si, s in enumerate(members):
+            if not isinstance(s, Solid):
+                continue
+            for pi, p in enumerate(s.polys):
+                try:
+                    fz = _face_z_and_up(p)
+                    if fz is None:
+                        continue
+                    z, up = fz
+                    if up and c.z0 == z:
+                        end = "lo"
+                    elif (not up) and c.z1 == z:
+                        end = "hi"
+                    else:
+                        continue
+                    if not _face_convex_xy(p):
+                        continue
+                    if not _disc_strictly_inside_face(p, c):
+                        continue
+                except (TypeError, ZeroDivisionError, AttributeError):
+                    continue
+                cands.append((si, pi, ci, end, z))
+    from collections import Counter
+
+    per_face = Counter((si, pi) for si, pi, _, _, _ in cands)
+    per_cap = Counter((ci, end) for _, _, ci, end, _ in cands)
+    return [(si, pi, ci, z) for si, pi, ci, end, z in cands
+            if per_face[(si, pi)] == 1 and per_cap[(ci, end)] == 1]
+
+
+def _ear_clip_f(loop, eps):
+    """Float ear clipping of a weakly-simple CCW loop (the keyhole bridge
+    duplicates two vertices, whose twins lie exactly ON the bridge edges —
+    hence the STRICT-interior blocker test). Returns triangles or None;
+    the caller re-checks area coverage, so a wrong clip cannot ship."""
+
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    pts = list(loop)
+    tris = []
+    guard = 0
+    while len(pts) > 3:
+        guard += 1
+        if guard > 20000:
+            return None
+        nn = len(pts)
+        clipped = False
+        for i in range(nn):
+            a, b, c = pts[(i - 1) % nn], pts[i], pts[(i + 1) % nn]
+            if orient(a, b, c) <= eps:
+                continue                      # reflex or degenerate
+            blocked = False
+            for p in pts:
+                if p == a or p == b or p == c:
+                    continue
+                if (orient(a, b, p) > eps and orient(b, c, p) > eps
+                        and orient(c, a, p) > eps):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            tris.append((a, b, c))
+            pts.pop(i)
+            clipped = True
+            break
+        if not clipped:
+            return None
+    if orient(*pts) <= eps:
+        return None
+    tris.append((pts[0], pts[1], pts[2]))
+    return tris
+
+
+def _annulus_band(outer_xy, cx, cy, r, n):
+    """Triangulate (convex polygon) minus (inscribed circle n-gon) with NO
+    new vertices: bridge the hole to the outer loop through a keyhole and
+    ear-clip the merged weakly-simple polygon. No Steiner points means no
+    T-vertices on the outer edges the side faces share. Returns CCW
+    triangles as ((x,y),)*3, or None if the defensive coverage check
+    fails (the caller then keeps the un-stitched mesh).
+
+    The ring points are computed with EXACTLY the sub-expressions
+    tess.lathe uses, so the hole rim re-uses the cylinder wall's vertex
+    floats verbatim and the stitch is seamless by construction."""
+    ring = []
+    for k in range(n):
+        a = 2 * math.pi * k / n
+        ring.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    m = len(outer_xy)
+    area2 = sum(outer_xy[i][0] * outer_xy[(i + 1) % m][1]
+                - outer_xy[(i + 1) % m][0] * outer_xy[i][1] for i in range(m))
+    outer = list(outer_xy) if area2 > 0 else list(reversed(outer_xy))
+
+    # Bridge from the ring's rightmost vertex M = ring[0] (angle 0, so
+    # x = cx + r is its strict maximum) to the outer's max-x vertex P:
+    # P.x > M.x because (cx + r, cy) is strictly inside the face, so the
+    # segment M->P moves monotonically into x > M.x and can never re-enter
+    # the disc (which lies wholly in x <= M.x); with a convex outer and
+    # both ends inside, the bridge stays inside the outer loop.
+    p_i = max(range(m), key=lambda i: outer[i][0])
+    o = outer[p_i:] + outer[:p_i]
+    hole_cw = [ring[0]] + ring[:0:-1]
+    merged = [o[0], ring[0]] + hole_cw[1:] + [ring[0], o[0]] + o[1:]
+
+    ext = max(max(abs(x - cx), abs(y - cy)) for x, y in outer)
+    eps = 1e-12 * ext * ext
+    tris = _ear_clip_f(merged, eps)
+    if tris is None:
+        return None
+
+    # defensive: every triangle CCW-positive (the clipper guarantees it)
+    # and the band tiles exactly polygon minus ring — any fold or overlap
+    # breaks the sum (a float check on a float display mesh)
+    def a2(t):
+        (ax, ay), (bx, by), (tx, ty) = t
+        return (bx - ax) * (ty - ay) - (by - ay) * (tx - ax)
+
+    ring_a2 = sum(ring[j][0] * ring[(j + 1) % n][1]
+                  - ring[(j + 1) % n][0] * ring[j][1] for j in range(n))
+    target = abs(area2) - ring_a2
+    band = sum(a2(t) for t in tris)
+    if abs(band - target) > 1e-6 * max(abs(float(target)), 1.0):
+        return None
+    return tris
+
+
+def _solid_mesh_with_holes(solid, holemap, deflection):
+    """Like Solid.tessellate, but the faces in holemap {poly_idx: Cyl} get
+    the contact disc punched out and band-triangulated. Preserves each
+    face's stored winding. Returns None if any band fails (the caller
+    then keeps the plain merged mesh AND the cylinder caps)."""
+    from forgekernel.tess import _nseg
+
+    verts: list = []
+    tris: list = []
+    index: dict = {}
+
+    def vid(x, y, z) -> int:
+        key = (x, y, z)
+        j = index.get(key)
+        if j is None:
+            j = len(verts)
+            index[key] = j
+            verts.append([x, y, z])
+        return j
+
+    for pi, p in enumerate(solid.polys):
+        pts = [(float(v[0]), float(v[1]), float(v[2])) for v in p.verts]
+        c = holemap.get(pi)
+        if c is None:
+            ids = [vid(*q) for q in pts]
+            for a, b in zip(ids[1:], ids[2:]):
+                tris.append([ids[0], a, b])
+            continue
+        zc = pts[0][2]
+        band = _annulus_band([(q[0], q[1]) for q in pts],
+                             float(c.cx), float(c.cy), float(c.r),
+                             _nseg(float(c.r), deflection))
+        if band is None:
+            return None
+        m = len(pts)
+        stored_ccw = sum(pts[i][0] * pts[(i + 1) % m][1]
+                         - pts[(i + 1) % m][0] * pts[i][1]
+                         for i in range(m)) > 0
+        for t in band:
+            ids = [vid(x, y, zc) for x, y in t]
+            tris.append(ids if stored_ccw else [ids[0], ids[2], ids[1]])
+    return {"vertices": verts, "triangles": tris}
+
+
+def _strip_cap_triangles(mesh, zs) -> dict:
+    """Drop triangles lying wholly in a horizontal cap plane z in zs."""
+    zf = {float(z) for z in zs}
+    v = mesh["vertices"]
+
+    def is_cap(t) -> bool:
+        z0 = v[t[0]][2]
+        return z0 in zf and v[t[1]][2] == z0 and v[t[2]][2] == z0
+
+    return {"vertices": v,
+            "triangles": [t for t in mesh["triangles"] if not is_cap(t)]}
+
+
 class DisjointUnion:
     """Union of solids that meet at most tangentially — exact.
 
@@ -866,23 +1118,77 @@ class DisjointUnion:
         return DisjointUnion(self.members + [other])
 
     def tessellate(self, deflection: float = 0.2) -> dict:
-        """Display mesh = the members' meshes merged. Valid as one mesh
-        because the members are disjoint (at most tangent), so the shells
-        never interpenetrate."""
+        """Display mesh = the members' meshes merged — and where a Cyl cap
+        stands on (or hangs under) a member face with its full disc inside,
+        the contact is STITCHED: the face gets the disc punched out (band
+        triangulation over the very ring floats the lathe emits) and the
+        buried cap is dropped, so no triangle in the contact patch has
+        material on both sides. Concatenating the closed shells verbatim
+        kept volume and per-shell pairing right while lying topologically:
+        any slicer or half-edge consumer saw internal walls (W17).
+
+        Contacts outside that shape — several discs on one face, a boss
+        overhanging the face edge, non-Cyl members — keep the merged-shells
+        fallback: each shell stays individually closed, so volume and edge
+        pairing remain right, but the coplanar contact faces remain buried
+        (the honest residual until the canonical-Body converter arrives)."""
+        stitches = _stitch_plan(self.members)
+        solid_holes: dict = {}
+        for si, pi, ci, z in stitches:
+            solid_holes.setdefault(si, {})[pi] = (ci, z)
+        premeshed: dict = {}
+        cap_strip: dict = {}
+        stitched: set = set()
+        for si, holemap in solid_holes.items():
+            sub = _solid_mesh_with_holes(
+                self.members[si],
+                {pi: self.members[ci] for pi, (ci, _) in holemap.items()},
+                deflection)
+            if sub is None:
+                continue        # band failed: cancel — caps stay in place
+            premeshed[si] = sub
+            stitched.add(si)
+            for _, (ci, z) in holemap.items():
+                cap_strip.setdefault(ci, set()).add(z)
+                stitched.add(ci)
+
         verts: list = []
         tris: list = []
-        for m in self.members:
+        shared: dict = {}       # float coords -> index, stitched members only
+
+        def add(sub: dict, dedup: bool) -> None:
+            if dedup:
+                # the hole rim and the wall's bottom ring carry identical
+                # floats by construction; keying on them fuses the seam so
+                # the stitched result pairs edge-for-edge BY INDEX
+                remap = []
+                for vv in sub["vertices"]:
+                    key = (vv[0], vv[1], vv[2])
+                    j = shared.get(key)
+                    if j is None:
+                        j = len(verts)
+                        shared[key] = j
+                        verts.append([vv[0], vv[1], vv[2]])
+                    remap.append(j)
+                tris.extend([remap[a], remap[b], remap[c]]
+                            for a, b, c in sub["triangles"])
+            else:
+                off = len(verts)
+                verts.extend([list(vv) for vv in sub["vertices"]])
+                tris.extend([a + off, b + off, c + off]
+                            for a, b, c in sub["triangles"])
+
+        for mi, m in enumerate(self.members):
+            if mi in premeshed:
+                add(premeshed[mi], True)
+                continue
             if type(m).__name__ == "Body":
                 # a cut can now leave a canonical Body as a member; asking it
                 # for .cx (via AxisStack) is a bare AttributeError, and the
                 # union becomes unrenderable while still measuring fine
                 from forgekernel.body import tessellate as _btess
 
-                sub = _btess(m, deflection)
-                off = len(verts)
-                verts.extend(sub["vertices"])
-                tris.extend([a + off, b + off, c + off]
-                            for a, b, c in sub["triangles"])
+                add(_btess(m, deflection), False)
                 continue
             if not hasattr(m, "tessellate"):    # bare Sphere/Cone: via a stack
                 m = AxisStack(m.cx, m.cy, [m])
@@ -890,9 +1196,9 @@ class DisjointUnion:
                 sub = m.tessellate(deflection)
             except TypeError:                   # planar Solid: meshes exactly
                 sub = m.tessellate()
-            off = len(verts)
-            verts.extend(sub["vertices"])
-            tris.extend([a + off, b + off, c + off] for a, b, c in sub["triangles"])
+            if mi in cap_strip:
+                sub = _strip_cap_triangles(sub, cap_strip[mi])
+            add(sub, mi in stitched)
         return {"vertices": verts, "triangles": tris}
 
     @classmethod
