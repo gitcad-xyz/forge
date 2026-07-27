@@ -252,7 +252,13 @@ def _face_crossings(face, p, d, depth: int) -> int:
 
 
 # deterministic ray directions: +z first, then rational jitters of
-# growing tilt — enough spread that a trim-strip graze clears
+# growing tilt — enough spread that a trim-strip graze clears. The tail
+# uses PRIME denominators: against axis-aligned faces a ray from a
+# symmetric rational point crosses at parameters like ½ + ¾·d_x, which
+# for small round d_x lands exactly on a dyadic gridline and exhausts
+# edge root isolation on every early direction (measured: all eight
+# refused for (2,2,0) against a [0,4]²×[1,3] box); a prime denominator
+# cannot cancel into a dyadic and clears the degeneracy.
 _DIRECTIONS = (
     (F(0), F(0), F(1)),
     (F(1, 3), F(1, 5), F(1)),
@@ -262,10 +268,14 @@ _DIRECTIONS = (
     (F(1), F(1, 3), F(1, 2)),
     (F(-1, 2), F(1), F(2, 3)),
     (F(2, 3), F(-1), F(1, 2)),
+    (F(5, 17), F(3, 23), F(1)),
+    (F(-7, 19), F(5, 13), F(1)),
+    (F(11, 29), F(-4, 31), F(1)),
+    (F(-3, 37), F(-8, 41), F(1)),
 )
 
 
-def classify_point_in_shell(shell, p, depth: int = 5, max_rays: int = 8):
+def classify_point_in_shell(shell, p, depth: int = 5, max_rays: int = 12):
     """Certified membership of point ``p`` in a closed
     :class:`~forgekernel.trimshell.TrimmedShell`: ``"in"`` or ``"out"``,
     or a :class:`PointClassifyUncertified` refusal — never a guess.

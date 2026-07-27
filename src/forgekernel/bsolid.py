@@ -738,3 +738,412 @@ def certified_vector_area(surface: BSplineSurface, strip, inside,
             hi += h
         out.append(CInterval(lo, hi))
     return tuple(out)
+
+
+# -- K7 gap 5: boolean assembly — two patch solids to one audited shell -------
+#
+# boolean_trimmed(op, A, B): per face-pair SSI → certified trim loops →
+# exact partition of each face's parameter domain → certified
+# point-membership classification of every strip-free fragment → stitch
+# and orient into a TrimmedShell → full three-oracle audit. Every
+# topological decision is certified or refused by name; a wrong shell is
+# the only failure mode this module is not allowed to have.
+#
+# ORIENTATION IS PRINCIPLED, NOT ENUMERATED. Each operand face is
+# outward-oriented for its own solid (preflighted: Σ patch flux > 0
+# exactly). The result's outward normal on a kept fragment follows from
+# the monotonicity of the boolean's membership function alone:
+#
+#   union      m = m_A ∨ m_B    monotone increasing in m_A and m_B
+#   intersect  m = m_A ∧ m_B    monotone increasing in m_A and m_B
+#   cut        m = m_A ∧ ¬m_B   increasing in m_A, DECREASING in m_B
+#
+# A kept fragment of ∂A bounds the result where m_B is locally constant,
+# so stepping along A's outward normal flips m_A true→false and (by
+# monotonicity in m_A) exits the result: the result's outward normal is
+# A's own — sense +1, for all three ops. On a kept fragment of ∂B the
+# same step flips m_B true→false; for union/intersect that exits the
+# result (sense +1), for cut it ENTERS it (m = m_A ∧ ¬m_B rises), so the
+# face flips — sense −1. That is the whole sign rule; the derivation
+# that had to try all four sign combinations by hand is retired.
+#
+# The loop ROLE (does the kept region lie inside the loop — outer, CCW —
+# or outside it — hole, CW) orients the pairing audit's traversal. A
+# role mistake can never ship a wrong shell: the certified measures
+# (flux, vector area) never read roles, and the pairing audit fails on a
+# single flipped role while a consistent double flip reverses both
+# traversals and stays opposite — refusal or no-op, never a lie.
+
+class BooleanUnsupported(ValueError):
+    """Structured refusal: a boolean configuration stage 2 cannot turn
+    into a *certified* shell. ``predicate`` names the guard that fired:
+
+    * ``rational_operand`` / ``multispan_operand`` — untested operand
+      representations (certified flux exists per face — K7.1 — but the
+      assembly over them is unproven);
+    * ``operand_not_outward`` — Σ patch flux ≤ 0: the operand's faces
+      are not consistently outward-oriented, so the sign rule above has
+      no premise to stand on;
+    * ``open_branch`` — an intersection curve leaves a face through its
+      border; the stitched loop's border segments would need pairing
+      with the operand's own seam edges, which is unbuilt;
+    * ``region_unresolved`` / ``nested_loops_unresolved`` — the dyadic
+      grid at this depth has no strip-free witness cell inside a trim
+      loop, or mixed certified memberships inside one loop (nested
+      curves); raise the depth;
+    * ``trim_loops_cross`` — the exact domain partition refused the
+      loop arrangement;
+    * ``empty_result`` — no face fragment survives; the empty solid has
+      no TrimmedShell representation.
+
+    Tangent contact and uncertifiable cells refuse upstream with their
+    own names (:class:`forgekernel.ssi.SsiCellUncertified`,
+    :class:`forgekernel.ssi.TrimLoopUnstitchable`,
+    :class:`forgekernel.raycast.PointClassifyUncertified`)."""
+
+    def __init__(self, predicate: str, detail: str) -> None:
+        self.predicate = predicate
+        super().__init__(f"boolean_unsupported[{predicate}]: {detail}")
+
+
+# op → (keep A-fragments inside B?, keep B-fragments inside A?)
+_BOOL_KEEP_INSIDE = {"union": (False, False),
+                     "intersect": (True, True),
+                     "cut": (False, True)}
+# op → sense of kept B-faces (A-faces are always +1); see the derivation
+_BOOL_B_SENSE = {"union": 1, "intersect": 1, "cut": -1}
+
+
+def untrimmed_shell(solid):
+    """A :class:`~forgekernel.bsolid.PatchSolid` (or bare patch list)
+    wrapped as a :class:`~forgekernel.trimshell.TrimmedShell` of whole,
+    untrimmed faces — the certified ray-parity membership target
+    (:func:`forgekernel.raycast.classify_point_in_shell`) for an operand
+    during boolean assembly, and for MC membership oracles in tests."""
+    from forgekernel.trimshell import ShellFace, TrimmedShell
+
+    faces = list(solid.patches) if hasattr(solid, "patches") else list(solid)
+    return TrimmedShell([ShellFace(f, 1, set(), lambda u, v: True)
+                         for f in faces])
+
+
+def _operand_faces(name: str, solid):
+    """Preflight one operand: polynomial single-span patches whose flux
+    sum is certifiably outward (> 0, exact ℚ). Anything else refuses by
+    name — the assembly is only proven over this class."""
+    from forgekernel.nurbs import bezier_patches
+
+    faces = list(solid.patches)
+    for i, f in enumerate(faces):
+        if _is_rational(f):
+            raise BooleanUnsupported(
+                "rational_operand",
+                f"operand {name} face {i} has rational weights — the "
+                f"certified flux exists per face (K7.1) but the boolean "
+                f"assembly over rational operands is untested; refusing "
+                f"rather than risk a wrong shell")
+        if len(bezier_patches(f)) != 1:
+            raise BooleanUnsupported(
+                "multispan_operand",
+                f"operand {name} face {i} has multiple Bézier spans — "
+                f"the SSI strip grid and trim-loop bookkeeping are only "
+                f"proven over single-span faces; split the operand into "
+                f"per-span faces first")
+    total = sum((patch_flux(f) for f in faces), F(0))
+    if total <= 0:
+        raise BooleanUnsupported(
+            "operand_not_outward",
+            f"operand {name}: Σ patch flux = {total} ≤ 0 — the faces are "
+            f"not consistently outward-oriented, so the boolean sign rule "
+            f"has no premise; fix the operand's face orientations")
+    return faces
+
+
+class _FaceGrid:
+    """Strip-free connected components of one face's parameter domain on
+    the dyadic 2^-depth grid — the exact scaffolding a face's certified
+    membership predicate memoizes over.
+
+    The SSI strip encloses every trim curve on the face (subdivision
+    completeness), so membership in the other solid is CONSTANT on each
+    connected component of the strip's complement: one certified
+    ray-parity verdict at a deep-interior representative decides the
+    whole component. 4-adjacency is used for connectivity — conservative
+    (a corner-touching component may split in two), which costs at most
+    one extra certified raycast and can never mislabel a point."""
+
+    def __init__(self, surface, strip, depth: int) -> None:
+        (u0, u1), (v0, v1) = surface.domain()
+        self.u0, self.v0 = F(u0), F(v0)
+        n = 1 << depth
+        self.n = n
+        self.wu = (F(u1) - F(u0)) / n
+        self.wv = (F(v1) - F(v0)) / n
+        marked = set()
+        for (s0, s1, t0, t1) in strip:
+            iu = (F(s0) - self.u0) / self.wu
+            iv = (F(t0) - self.v0) / self.wv
+            if iu.denominator != 1 or iv.denominator != 1 \
+                    or F(s1) - F(s0) != self.wu or F(t1) - F(t0) != self.wv:
+                raise AssertionError(
+                    "SSI strip cell is not aligned to the dyadic grid — "
+                    "strip depth and grid depth must match")
+            marked.add((int(iu), int(iv)))
+        self.marked = marked
+
+        comp: dict = {}
+        cid = 0
+        for i in range(n):
+            for j in range(n):
+                if (i, j) in marked or (i, j) in comp:
+                    continue
+                stack = [(i, j)]
+                comp[(i, j)] = cid
+                while stack:
+                    ci, cj = stack.pop()
+                    for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        q = (ci + di, cj + dj)
+                        if 0 <= q[0] < n and 0 <= q[1] < n \
+                                and q not in marked and q not in comp:
+                            comp[q] = cid
+                            stack.append(q)
+                cid += 1
+        self.comp = comp
+        self.ncomp = cid
+
+        # deep-interior representative per component: the cell furthest
+        # (in grid BFS steps) from the strip — the sample a certified
+        # raycast is least likely to refuse on
+        from collections import deque
+
+        dist: dict = {}
+        dq = deque()
+        for c in marked:
+            dist[c] = 0
+            dq.append(c)
+        while dq:
+            ci, cj = dq.popleft()
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                q = (ci + di, cj + dj)
+                if 0 <= q[0] < n and 0 <= q[1] < n and q not in dist:
+                    dist[q] = dist[(ci, cj)] + 1
+                    dq.append(q)
+        best: dict = {}
+        by_comp: dict = {}
+        for cell, c in comp.items():
+            d = dist.get(cell, 2 * n)
+            by_comp.setdefault(c, []).append((d, cell))
+            if c not in best or d > best[c][0]:
+                best[c] = (d, cell)
+        self.rep = {c: cell for c, (d, cell) in best.items()}
+        self._by_comp = {c: [cell for _, cell in sorted(lst, reverse=True)]
+                         for c, lst in by_comp.items()}
+
+    def candidates(self, c, k: int = 4):
+        """Up to ``k`` witness cells of component ``c``, deepest-interior
+        first — fallbacks for a certified raycast that refuses on a
+        degenerate first sample (any strip-free cell of the component is
+        an equally valid witness: membership is constant on it)."""
+        return self._by_comp[c][:k]
+
+    def cell_mid(self, cell):
+        i, j = cell
+        return (self.u0 + self.wu * F(2 * i + 1, 2),
+                self.v0 + self.wv * F(2 * j + 1, 2))
+
+    def comp_of(self, u, v):
+        """Component id of the grid cell containing (u, v), or ``None``
+        for a strip-marked cell. A query on a gridline takes the
+        upper-right cell — the right convention for the midpoints the
+        flux accumulator asks about (their cell lies inside the queried
+        strip-free box)."""
+        iu = min(self.n - 1, int((F(u) - self.u0) / self.wu))
+        iv = min(self.n - 1, int((F(v) - self.v0) / self.wv))
+        return self.comp.get((iu, iv))
+
+
+def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
+                   depth, raycast_depth):
+    """One operand face → its kept fragment as a
+    :class:`~forgekernel.trimshell.ShellFace`, or ``None`` if the whole
+    face is discarded. ``chains`` is ``[(verts, uvs), …]`` — the face's
+    certified trim loops as shared TrimVertex objects plus this face's
+    own exact (u, v) coordinates."""
+    from forgekernel.raycast import (PointClassifyUncertified,
+                                     classify_point_in_shell)
+    from forgekernel.trim import split_trim_region
+    from forgekernel.trimshell import ShellFace
+
+    def kept_at(u, v):
+        p = surface.eval(u, v)
+        verdict = classify_point_in_shell(other_shell, p,
+                                          depth=raycast_depth)
+        return (verdict == "in") == keep_inside
+
+    def kept_at_any(cands):
+        """First certified verdict over equally-valid witness points —
+        membership is constant on the region they sample, so any
+        certified answer is THE answer; refuse only when all refuse."""
+        last = None
+        for (u, v) in cands:
+            try:
+                return kept_at(u, v)
+            except PointClassifyUncertified as exc:
+                last = exc
+        raise last
+
+    if not strip:
+        # no intersection touches this face: it is entirely in or out of
+        # the other solid — one certified verdict at an interior point
+        # (midpoint first; asymmetric prime-ratio fallbacks break the
+        # degeneracies a symmetric sample can hit against aligned faces)
+        (u0, u1), (v0, v1) = surface.domain()
+        du, dv = F(u1) - F(u0), F(v1) - F(v0)
+        cands = [(F(u0) + du * a, F(v0) + dv * b)
+                 for a, b in ((F(1, 2), F(1, 2)), (F(9, 17), F(8, 19)),
+                              (F(7, 23), F(13, 29)), (F(19, 31), F(11, 37)))]
+        if not kept_at_any(cands):
+            return None
+        return ShellFace(surface, sense, set(), lambda u, v: True)
+
+    # structural cross-check: the loops must form a legal arrangement —
+    # exact partition of the domain, refusing crossings and degeneracies
+    try:
+        split_trim_region(surface, [uvs for _, uvs in chains])
+    except ValueError as exc:
+        raise BooleanUnsupported("trim_loops_cross", str(exc)) from exc
+
+    grid = _FaceGrid(surface, strip, depth)
+    verdicts: dict = {}
+
+    def comp_kept(c):
+        if c not in verdicts:
+            verdicts[c] = kept_at_any(
+                [grid.cell_mid(cell) for cell in grid.candidates(c)])
+        return verdicts[c]
+
+    # loop roles: the kept side of each loop, certified per component
+    roles = []
+    for _, uvs in chains:
+        inside_vals = set()
+        for c in range(grid.ncomp):
+            um, vm = grid.cell_mid(grid.rep[c])
+            if _parity_in([uvs], um, vm):
+                inside_vals.add(comp_kept(c))
+        if not inside_vals:
+            raise BooleanUnsupported(
+                "region_unresolved",
+                f"no strip-free grid cell inside a trim loop at depth "
+                f"{depth} — the loop's interior is thinner than the grid; "
+                f"raise the depth")
+        if len(inside_vals) > 1:
+            raise BooleanUnsupported(
+                "nested_loops_unresolved",
+                "mixed certified memberships inside one trim loop — "
+                "nested intersection curves are untested; refusing "
+                "rather than guess the arrangement")
+        roles.append(inside_vals.pop())
+
+    if not any(comp_kept(c) for c in range(grid.ncomp)):
+        return None
+
+    point_memo: dict = {}
+
+    def inside(u, v):
+        c = grid.comp_of(u, v)
+        if c is not None:
+            return comp_kept(c)
+        # a query finer than the grid whose cell is strip-marked (e.g. a
+        # raycast leaf midpoint): certify the point itself, memoized
+        key = (F(u), F(v))
+        if key not in point_memo:
+            point_memo[key] = kept_at(*key)
+        return point_memo[key]
+
+    face = ShellFace(surface, sense, strip, inside)
+    for (verts, uvs), role in zip(chains, roles):
+        face.add_loop(list(zip(verts, uvs)), outer=role)
+    return face
+
+
+def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
+                    raycast_depth: int = 5, use_rust=None):
+    """Boolean of two closed patch solids as an audited, certified
+    :class:`~forgekernel.trimshell.TrimmedShell` — K7 gap 5.
+
+    ``op`` is ``"union"``, ``"intersect"`` or ``"cut"`` (A − B); ``A``
+    and ``B`` are :class:`PatchSolid`-shaped operands (outward-oriented
+    polynomial single-span Bézier faces — anything else refuses by
+    name). Pipeline: per face-pair SSI (every surviving cell certified
+    or refused), closed trim loops on both parameter domains, exact
+    partition audit of each trimmed face's domain, certified ray-parity
+    membership of every strip-free fragment, senses from the
+    monotonicity rule (module comment), shared-vertex loop topology, and
+    the full three-oracle shell audit before anything is returned. The
+    result's volume is a ``CInterval`` ("certified ± e", ADR-0019) —
+    exact (zero-width) whenever nothing was trimmed.
+
+    Refuses by name (never a wrong shell): tangent contact
+    (:class:`~forgekernel.ssi.SsiCellUncertified`), open/unstitchable
+    branches (:class:`~forgekernel.ssi.TrimLoopUnstitchable` or
+    ``open_branch``), rational/multi-span/inward operands, unresolvable
+    regions, and the empty result (:class:`BooleanUnsupported`)."""
+    from forgekernel.ssi import ssi_strips, ssi_trim_loops
+    from forgekernel.trimshell import TrimmedShell, TrimVertex
+
+    if op not in _BOOL_KEEP_INSIDE:
+        raise ValueError(
+            f"boolean op must be union|intersect|cut, got {op!r}")
+    fa = _operand_faces("A", A)
+    fb = _operand_faces("B", B)
+
+    strips: dict = {("A", i): set() for i in range(len(fa))}
+    strips.update({("B", j): set() for j in range(len(fb))})
+    chains: dict = {key: [] for key in strips}
+    for i, sa in enumerate(fa):
+        for j, sb in enumerate(fb):
+            a_cells, b_cells = ssi_strips(sa, sb, depth, use_rust=use_rust)
+            if not a_cells:
+                continue                      # certified non-intersection
+            res = ssi_trim_loops(sa, sb, depth, use_rust=use_rust)
+            for loop in res["loops"]:
+                if not loop["closed"]:
+                    raise BooleanUnsupported(
+                        "open_branch",
+                        f"the intersection of face A{i} and face B{j} "
+                        f"leaves a parameter domain through its border — "
+                        f"a stitched loop's border segments would need "
+                        f"pairing with the operand's own seam edges, "
+                        f"which is unbuilt; refusing rather than ship an "
+                        f"unauditable shell")
+                verts = [TrimVertex() for _ in loop["points"]]
+                chains[("A", i)].append(
+                    (verts, [(p[0], p[1]) for p in loop["points"]]))
+                chains[("B", j)].append(
+                    (verts, [(p[2], p[3]) for p in loop["points"]]))
+            strips[("A", i)] |= a_cells
+            strips[("B", j)] |= b_cells
+
+    keep_a, keep_b = _BOOL_KEEP_INSIDE[op]
+    shell_a = untrimmed_shell(fa)
+    shell_b = untrimmed_shell(fb)
+    faces = []
+    for side, flist, keep_inside, sense, other in (
+            ("A", fa, keep_a, 1, shell_b),
+            ("B", fb, keep_b, _BOOL_B_SENSE[op], shell_a)):
+        for i, f in enumerate(flist):
+            sf = _assemble_face(f, sense, strips[(side, i)],
+                                chains[(side, i)], keep_inside, other,
+                                depth, raycast_depth)
+            if sf is not None:
+                faces.append(sf)
+    if not faces:
+        raise BooleanUnsupported(
+            "empty_result",
+            f"{op}: no face fragment survives — the result is the empty "
+            f"solid, which has no TrimmedShell representation; test "
+            f"emptiness upstream if empty is an expected answer")
+
+    shell = TrimmedShell(faces)              # exact pairing audit runs here
+    shell.audit(depth=depth if audit_depth is None else audit_depth)
+    return shell

@@ -120,7 +120,7 @@ class ShellFace:
     pairing audit; the *measure* is carried by strip + inside — the
     polyline is never integrated (the honest K7 caveat)."""
 
-    __slots__ = ("surface", "sense", "strip", "inside", "loops")
+    __slots__ = ("surface", "sense", "strip", "inside", "loops", "roles")
 
     def __init__(self, surface, sense: int, strip, inside) -> None:
         if sense not in (1, -1):
@@ -130,10 +130,19 @@ class ShellFace:
         self.strip = set(tuple(F(c) for c in cell) for cell in strip)
         self.inside = inside
         self.loops: list[list[TrimVertex]] = []
+        self.roles: list[bool] = []
 
-    def add_loop(self, verts_with_uv) -> None:
+    def add_loop(self, verts_with_uv, outer: bool | None = None) -> None:
         """Append a trim loop as ``[(vertex, (u, v)), …]``; binds each
-        vertex to this face at its exact coordinates."""
+        vertex to this face at its exact coordinates.
+
+        ``outer`` names the loop's role for the outward-boundary
+        direction: ``True`` — the kept region lies INSIDE the loop
+        (canonical CCW winding); ``False`` — the kept region lies
+        outside and the loop is a hole in it (canonical CW). A boolean
+        keeps either side of an intersection curve, so the role is data,
+        not position; the default (``None``) keeps the original
+        positional convention — first loop outer, the rest holes."""
         items = list(verts_with_uv)
         if len(items) < 3:
             raise ValueError("a trim loop needs >= 3 vertices")
@@ -144,6 +153,8 @@ class ShellFace:
         for a, b in zip(loop, loop[1:] + loop[:1]):
             if a is b:
                 raise ValueError("consecutive duplicate vertex in trim loop")
+        self.roles.append(bool(outer) if outer is not None
+                          else not self.loops)
         self.loops.append(loop)
 
     def _signed_area(self, loop) -> Fraction:
@@ -157,16 +168,16 @@ class ShellFace:
 
     def outward_edges(self):
         """The face's directed trim edges in OUTWARD-boundary order:
-        canonical region-on-left parameter winding (outer CCW, holes CW),
-        reversed when ``sense`` is −1. Yields (vertex, vertex) pairs —
-        object identity is the edge name."""
+        canonical region-on-left parameter winding (outer CCW, holes CW,
+        per the loop's ``role``), reversed when ``sense`` is −1. Yields
+        (vertex, vertex) pairs — object identity is the edge name."""
         for i, loop in enumerate(self.loops):
             ar = self._signed_area(loop)
             if ar == 0:
                 raise ShellAuditError(
                     f"face loop {i}: zero parameter-space area — "
                     f"degenerate trim loop")
-            want_ccw = (i == 0)                      # outer CCW, holes CW
+            want_ccw = self.roles[i]                 # outer CCW, holes CW
             seq = list(loop) if ((ar > 0) == want_ccw) else list(reversed(loop))
             if self.sense < 0:
                 seq = list(reversed(seq))
