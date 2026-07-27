@@ -14,6 +14,7 @@ Gauss-quadrature.
 
 from __future__ import annotations
 
+import math
 from fractions import Fraction
 
 from forgekernel.bsolid import _lagrange_weights, _nodes
@@ -36,6 +37,48 @@ def _bezier2_d(pts):
     p = len(pts) - 1
     return [(F(p) * (F(pts[i + 1][0]) - F(pts[i][0])),
              F(p) * (F(pts[i + 1][1]) - F(pts[i][1]))) for i in range(p)]
+
+
+def _bezier_axis_extrema(bez, dim):
+    """Parameters t in (0,1) where one coordinate of a Bézier is stationary.
+
+    The derivative of a degree-p Bézier is degree p−1, so for p ≤ 3 the
+    stationary parameters are roots of a linear or quadratic with RATIONAL
+    coefficients — closed form. A rational root is returned exactly; an
+    irrational root is returned as the exact rational value of its float
+    (within 1 ulp of the true parameter). Either way the caller evaluates
+    the curve AT that parameter, so the point used for the box lies exactly
+    on the curve — near a stationary point the coordinate error is second
+    order in the 1-ulp parameter error, i.e. far below float resolution.
+    Callers must handle p ≥ 4 themselves (no closed form here)."""
+    coeffs = [c[dim] for c in _bezier2_d(bez)]
+    ts = []
+    if len(coeffs) == 2:                          # quadratic curve: linear B'
+        d0, d1 = coeffs
+        if d0 != d1:
+            t = d0 / (d0 - d1)
+            if 0 < t < 1:
+                ts.append(t)
+        return ts
+    d0, d1, d2 = coeffs                           # cubic curve: quadratic B'
+    a = d0 - 2 * d1 + d2
+    b = 2 * (d1 - d0)
+    c = d0
+    if a == 0:
+        if b != 0:
+            t = -c / b
+            if 0 < t < 1:
+                ts.append(t)
+        return ts
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return ts
+    root = F(math.sqrt(disc))
+    for sgn in (1, -1):
+        t = (-b + sgn * root) / (2 * a)
+        if 0 < t < 1:
+            ts.append(t)
+    return ts
 
 
 def segments_to_beziers(start, segments):
@@ -179,15 +222,33 @@ class SplinePrism:
         return self._area
 
     def bbox_f(self):
+        """Tight bound of the CURVE, not of the Bézier control net.
+
+        A segment's extreme coordinates occur at its endpoints or where the
+        coordinate's derivative vanishes; both are on-curve points. The old
+        control-net hull was initialised from the interior control points —
+        which can sit far off the curve they steer — so the sampling loop
+        below it never tightened anything and dy overstated by 37% on an
+        ordinary cubic blade profile."""
         beziers = segments_to_beziers(self.start, self.segments)
-        xs = [float(c[0]) for b in beziers for c in b]
-        ys = [float(c[1]) for b in beziers for c in b]
-        # control-net hull bounds the curve; sample for a tight-ish box
+        xs: list = []
+        ys: list = []
         for b in beziers:
-            if len(b) > 2:
-                for k in range(9):
-                    x, y = _bezier2(b, F(k, 8))
-                    xs.append(float(x)); ys.append(float(y))
+            for c in (b[0], b[-1]):               # endpoints are on-curve
+                xs.append(float(c[0])); ys.append(float(c[1]))
+            p = len(b) - 1
+            if p <= 1:
+                continue
+            if p <= 3:
+                for dim, acc in ((0, xs), (1, ys)):
+                    for t in _bezier_axis_extrema(b, dim):
+                        acc.append(float(_bezier2(b, t)[dim]))
+            else:
+                # degree ≥ 4: the derivative roots have no closed form here;
+                # keep the conservative control-net hull for this segment
+                # (an outward bound — never cuts inside the solid).
+                for c in b[1:-1]:
+                    xs.append(float(c[0])); ys.append(float(c[1]))
         z0, z1 = float(self.z0), float(self.z0 + self.h)
         return ((min(xs), min(ys), min(z0, z1)),
                 (max(xs), max(ys), max(z0, z1)))

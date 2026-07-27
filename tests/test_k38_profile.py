@@ -79,6 +79,34 @@ def test_splineprism_centroid_is_exact_polygon_centroid() -> None:
     assert all(isinstance(c, Fraction) for c in pr.centroid())
 
 
+def test_splineprism_bbox_hugs_the_curve_not_the_control_net() -> None:
+    """The bbox must bound the CURVE, not the Bézier control net.
+
+    A cubic's control points can sit far outside the curve they steer: for
+    (10,0)-(12,8)-(5,23)-(0,14) the curve tops out at y = 16.7854 (stationary
+    point of the quadratic derivative, closed form) while the control net
+    reaches y = 23 — the old control-hull box overstated dy by 37% and fed
+    `measure` and the bench oracle's sample window."""
+    prof = [{"kind": "line", "to": [10, 0]},
+            {"kind": "spline", "ctrl": [[12, 8], [5, 23]], "to": [0, 14]},
+            {"kind": "line", "to": [0, 0]}]
+    pr = SplinePrism([0, 0], prof, 5)
+    (x0, y0, z0), (x1, y1, z1) = pr.bbox_f()
+    assert (x0, y0, z0, z1) == (0.0, 0.0, 0.0, 5.0)
+    # tight to the curve's true stationary values (independent closed form:
+    # x' = 0 at t = (54-sqrt(2124))/66, y' = 0 at t = (145.402...)/186)
+    assert x1 == pytest.approx(10.350208, abs=1e-4)
+    assert y1 == pytest.approx(16.785443, abs=1e-4)
+    # and still a BOUND: every sampled curve point stays inside the box
+    from forgekernel.profile2d import _bezier2, segments_to_beziers
+    eps = 1e-9
+    for bez in segments_to_beziers([0, 0], prof):
+        for k in range(257):
+            x, y = _bezier2(bez, F(k, 256))
+            assert x0 - eps <= x <= x1 + eps
+            assert y0 - eps <= y <= y1 + eps
+
+
 def test_splineprism_centroid_beats_bbox_for_asymmetric_bezier() -> None:
     # a curved profile that is NOT vertically centred in its bbox — the true
     # area centroid (y = 51/22) differs sharply from the bbox centre (y=3.5),
