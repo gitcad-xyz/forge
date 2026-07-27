@@ -227,61 +227,10 @@ def test_rational_patch_requires_positive_weights() -> None:
 
 
 # -- K7 ordered SSI output: per-branch parameter-space polylines --------------
-
-def test_order_branch_open_line_is_monotonic() -> None:
-    from forgekernel.ssi import _order_branch
-
-    # certified points along u at v=1/2, handed in shuffled; s,t placeholders
-    us = [F(1, 2), F(1, 10), F(9, 10), F(3, 10), F(7, 10)]
-    pts = [(u, F(1, 2), F(0), F(0)) for u in us]
-    ordered, closed = _order_branch(pts)
-    ou = [float(p[0]) for p in ordered]
-    assert ou == sorted(ou) or ou == sorted(ou, reverse=True)
-    assert closed is False
-
-
-def test_order_branch_small_arcs_are_not_falsely_closed() -> None:
-    # regression: a 3-point OPEN arc was always reported closed, because for
-    # n==3 the median-of-two gaps is the larger gap and the triangle
-    # inequality forces wrap <= 2*median. Closure is undecidable at n<4.
-    from forgekernel.ssi import _order_branch
-
-    line3 = [(F(0), F(0), F(0), F(0)), (F(1), F(0), F(0), F(0)),
-             (F(2), F(0), F(0), F(0))]
-    ordered, closed = _order_branch(line3)
-    assert closed is False
-    ou = [float(p[0]) for p in ordered]
-    assert ou == sorted(ou) or ou == sorted(ou, reverse=True)
-    # a non-collinear 3-point arc is also open, not a loop
-    _, closed3 = _order_branch([(F(0), F(0), F(0), F(0)),
-                                (F(1), F(2), F(0), F(0)),
-                                (F(3), F(0), F(0), F(0))])
-    assert closed3 is False
-
-
-def test_order_branch_detects_closed_loop() -> None:
-    import math
-
-    from forgekernel.ssi import _order_branch
-
-    n = 12
-    raw = []
-    for k in range(n):
-        ang = 2 * math.pi * k / n
-        u = F(round(1000 * (0.5 + 0.4 * math.cos(ang))), 1000)
-        v = F(round(1000 * (0.5 + 0.4 * math.sin(ang))), 1000)
-        raw.append((u, v, F(0), F(0)))
-    perm = [0, 5, 2, 9, 4, 11, 6, 1, 8, 3, 10, 7]     # deterministic shuffle
-    ordered, closed = _order_branch([raw[i] for i in perm])
-    assert closed is True
-    # consecutive ordered points are ring neighbours — no jump across the loop
-    angs = [math.atan2(float(p[1]) - 0.5, float(p[0]) - 0.5) for p in ordered]
-    steps = []
-    for i in range(len(angs)):
-        d = (angs[(i + 1) % len(angs)] - angs[i]) % (2 * math.pi)
-        steps.append(min(d, 2 * math.pi - d))
-    assert max(steps) < 2 * (2 * math.pi / n)
-
+# The closed-vs-open decision is no longer made by the float median-gap
+# heuristic these tests used to pin (``_order_branch`` is gone); closure is
+# now the exact strip certificate ``_branch_is_closed``, whose unit and
+# end-to-end tests live in tests/test_k7_closure.py.
 
 def test_ssi_curves_single_open_branch_is_ordered() -> None:
     from forgekernel.nurbs import BSplineSurface
