@@ -494,6 +494,43 @@ def _poly_contains_xy(verts, px, py) -> bool:
     return inside
 
 
+def _emit_product_chain(emit, name: str) -> tuple[int, int]:
+    """The AP214 product + context chain (required for OCCT to transfer a
+    solid). Shared verbatim by both writers so their preambles cannot
+    drift; returns (product_definition_shape, geometric_context)."""
+    appctx = emit("APPLICATION_CONTEXT('automotive_design')")
+    emit(f"APPLICATION_PROTOCOL_DEFINITION('international standard',"
+         f"'automotive_design',2000,#{appctx})")
+    pctx = emit(f"PRODUCT_CONTEXT('',#{appctx},'mechanical')")
+    pdctx = emit(f"PRODUCT_DEFINITION_CONTEXT('part definition',#{appctx},"
+                 f"'design')")
+    prod = emit(f"PRODUCT('{name}','{name}','',(#{pctx}))")
+    emit(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',(#{prod}))")
+    pdf = emit(f"PRODUCT_DEFINITION_FORMATION('','',#{prod})")
+    pdef = emit(f"PRODUCT_DEFINITION('design','',#{pdf},#{pdctx})")
+    pds = emit(f"PRODUCT_DEFINITION_SHAPE('','',#{pdef})")
+    # units + geometric context
+    lu = emit("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))")
+    au = emit("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))")
+    su = emit("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())")
+    unc = emit(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{lu},"
+               f"'distance_accuracy_value','')")
+    ctx = emit(f"(GEOMETRIC_REPRESENTATION_CONTEXT(3)"
+               f"GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc}))"
+               f"GLOBAL_UNIT_ASSIGNED_CONTEXT((#{lu},#{au},#{su}))"
+               f"REPRESENTATION_CONTEXT('',''))")
+    return pds, ctx
+
+
+def _step_header(name: str, body: str) -> str:
+    header = (
+        "ISO-10303-21;\nHEADER;\n"
+        "FILE_DESCRIPTION(('gitcad forge STEP export'),'2;1');\n"
+        f"FILE_NAME('{name}.step','',(''),(''),'forgekernel','','');\n"
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n")
+    return header + body + "\nENDSEC;\nEND-ISO-10303-21;\n"
+
+
 def write_step_planar_solid(solid, *, name: str = "gitcad_part",
                             bores=()) -> str:
     """Emit a forge solid as a valid AP214 STEP file (full product structure +
@@ -530,28 +567,7 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part",
 
     fnum = _real
 
-    # --- product + context chain (required for OCCT to transfer a solid)
-    appctx = emit("APPLICATION_CONTEXT('automotive_design')")
-    emit(f"APPLICATION_PROTOCOL_DEFINITION('international standard',"
-         f"'automotive_design',2000,#{appctx})")
-    pctx = emit(f"PRODUCT_CONTEXT('',#{appctx},'mechanical')")
-    pdctx = emit(f"PRODUCT_DEFINITION_CONTEXT('part definition',#{appctx},"
-                 f"'design')")
-    prod = emit(f"PRODUCT('{name}','{name}','',(#{pctx}))")
-    emit(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',(#{prod}))")
-    pdf = emit(f"PRODUCT_DEFINITION_FORMATION('','',#{prod})")
-    pdef = emit(f"PRODUCT_DEFINITION('design','',#{pdf},#{pdctx})")
-    pds = emit(f"PRODUCT_DEFINITION_SHAPE('','',#{pdef})")
-    # units + geometric context
-    lu = emit("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))")
-    au = emit("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))")
-    su = emit("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())")
-    unc = emit(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{lu},"
-               f"'distance_accuracy_value','')")
-    ctx = emit(f"(GEOMETRIC_REPRESENTATION_CONTEXT(3)"
-               f"GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc}))"
-               f"GLOBAL_UNIT_ASSIGNED_CONTEXT((#{lu},#{au},#{su}))"
-               f"REPRESENTATION_CONTEXT('',''))")
+    pds, ctx = _emit_product_chain(emit, name)
 
     vids: dict = {}
 
@@ -685,10 +701,901 @@ def write_step_planar_solid(solid, *, name: str = "gitcad_part",
     absr = emit(f"ADVANCED_BREP_SHAPE_REPRESENTATION('{name}',(#{brep}),#{ctx})")
     emit(f"SHAPE_DEFINITION_REPRESENTATION(#{pds},#{absr})")
 
-    body = "\n".join(lines)
-    header = (
-        "ISO-10303-21;\nHEADER;\n"
-        "FILE_DESCRIPTION(('gitcad forge STEP export'),'2;1');\n"
-        f"FILE_NAME('{name}.step','',(''),(''),'forgekernel','','');\n"
-        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n")
-    return header + body + "\nENDSEC;\nEND-ISO-10303-21;\n"
+    return _step_header(name, "\n".join(lines))
+
+
+# -- K3.7: freeform-solid topology import (trimmed B-spline faces) ------------
+#
+# The planar walk's "arrives at K3.7" refusal retires here: a
+# MANIFOLD_SOLID_BREP whose faces are B-spline surfaces (planar faces
+# LIFT to bilinear patches) imports as a
+# :class:`forgekernel.trimshell.TrimmedShell`. The mapping:
+#
+#   ADVANCED_FACE -> ShellFace(surface  = StepFile.surface(eid) / lift,
+#                              sense    = +1 iff same_sense (audit-backed:
+#                                         global orientation is re-decided
+#                                         by certified volume sign),
+#                              strip    = de Casteljau control-hull boxes
+#                                         of curved pcurve pieces + chord
+#                                         boxes off the domain border,
+#                              inside   = exact even-odd parity vs the
+#                                         face's chord loops)
+#   FACE_OUTER_BOUND -> add_loop(..., outer=True); FACE_BOUND -> holes
+#   one TrimVertex per STEP VERTEX_POINT entity (identity is the entity);
+#   curved edges subdivide PER EDGE ENTITY at shared breakpoints (a
+#   per-face walk creates T-junctions and the pairing audit refuses).
+#
+# Closure is established BEFORE any orientation decision (the #135
+# order): chain breaks, pcurve-endpoint/vertex disagreements and
+# unpaired trim edges collect into a NonClosedShellError carrying a gap
+# report in user millimetres; heal_tolerance (recorded intent) merges
+# VERTEX_POINT entities whose exact positions agree within tolerance —
+# a vertex-identity merge that can repair a tear but never invent a face.
+#
+# Tiers (ADR-0019, never a bare float): polynomial surfaces whose trim
+# pcurves are all degree 1 in (u, v) get ShellFace.tight = the EXACT
+# span-safe trimmed_patch_flux -> width-0 volume brackets; curved pcurves
+# and one-signed rational surfaces stay certified (hull enclosure /
+# reciprocal rule); analytic surfaces, sign-varying weights, missing
+# pcurves, VERTEX_LOOPs and periodic seams refuse by name.
+
+from forgekernel.nurbs import bezier_segments as _bezier_segments
+
+
+def _bez_split(cps, s):
+    """De Casteljau split of a Bezier control polygon at local s — exact;
+    returns (left, right) control polygons whose hulls each CONTAIN their
+    curve piece (the enclosure property every strip box rests on)."""
+    left = [tuple(cps[0])]
+    rights = [tuple(cps[-1])]
+    work = [tuple(p) for p in cps]
+    while len(work) > 1:
+        work = [tuple((1 - s) * a[c] + s * b[c] for c in range(len(a)))
+                for a, b in zip(work, work[1:])]
+        left.append(work[0])
+        rights.append(work[-1])
+    return left, list(reversed(rights))
+
+
+def _box2(cps):
+    """(u0, u1, v0, v1) bounding box of 2D-embedded control points."""
+    us = [p[0] for p in cps]
+    vs = [p[1] for p in cps]
+    return (min(us), max(us), min(vs), max(vs))
+
+
+def _on_border(a, b, dom):
+    """Does the segment a-b lie ON the domain border? (Border trims never
+    enter the open domain, so they add nothing to the strip.)"""
+    (u0, u1), (v0, v1) = dom
+    if a[0] == b[0] and a[0] in (u0, u1):
+        return True
+    if a[1] == b[1] and a[1] in (v0, v1):
+        return True
+    return False
+
+
+class _TrimTopo(StepFile):
+    """K3.7 topology walk: freeform faces, pcurve chains, shared edge
+    subdivision. Every refusal is by name; every number is exact."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._edges: dict[int, dict] = {}
+
+    def solids(self) -> list[int]:
+        return [e for e, (t, _) in sorted(self.entities.items())
+                if "MANIFOLD_SOLID_BREP" in t]
+
+    # -- geometry helpers -----------------------------------------------------
+
+    def point2(self, ref: str):
+        """Exact 2D parameter-space CARTESIAN_POINT."""
+        eid = int(str(ref).strip().lstrip("#"))
+        types, args = self.entities[eid]
+        if "CARTESIAN_POINT" not in types:
+            raise ValueError(f"import_step: #{eid} is not a CARTESIAN_POINT")
+        vals = [_num(c) for c in _parse_list(_split_args(args)[1])]
+        if len(vals) < 2:
+            raise ValueError(
+                f"import_step: parameter-space point #{eid} has fewer than "
+                f"two coordinates")
+        if any(v != 0 for v in vals[2:]):
+            raise ValueError(
+                f"import_step: parameter-space point #{eid} carries a "
+                f"nonzero third coordinate — not a (u, v) point")
+        return vals[0], vals[1]
+
+    def _direction(self, ref: str):
+        eid = int(str(ref).strip().lstrip("#"))
+        _, dargs = self.entities[eid]
+        vals = [_num(c) for c in _parse_list(_split_args(dargs)[1])]
+        while len(vals) < 3:
+            vals.append(F(0))
+        return tuple(vals[:3])
+
+    def vertex_pos(self, veid: int):
+        _, vargs = self.entities[veid]
+        return self.point(_split_args(vargs)[1])
+
+    def plane_frame(self, surf_eid: int):
+        """(origin, axis, ref_dir) of a PLANE, exact as written."""
+        _, sargs = self.entities[surf_eid]
+        place = _refs(_split_args(sargs)[1])[0]
+        _, pargs = self.entities[place]
+        pa = _split_args(pargs)
+        return (self.point(pa[1]), self._direction(pa[2]),
+                self._direction(pa[3]))
+
+    def pcurve2(self, eid: int) -> BSplineCurve:
+        """A parameter-space trim curve as a 2D-embedded BSplineCurve.
+        Rational pcurves refuse by name (a rational trim in (u, v) has no
+        exact chord/hull story yet)."""
+        types, body = self.entities[eid]
+        if types == ["B_SPLINE_CURVE_WITH_KNOTS"]:
+            a = _split_args(body)
+            degree = int(a[1])
+            cps = [self.point2(r) for r in _parse_list(a[2])]
+            mults = [int(x) for x in _parse_list(a[6])]
+            knots = [_num(x) for x in _parse_list(a[7])]
+            return BSplineCurve(degree, [(u, v, F(0)) for (u, v) in cps],
+                                _expand_knots(mults, knots))
+        if "B_SPLINE_CURVE_WITH_KNOTS" in types:
+            raise ValueError(
+                f"import_step: rational pcurve #{eid} — rational "
+                f"parameter-space trim curves are not supported yet")
+        raise ValueError(
+            f"import_step: pcurve geometry {'/'.join(types)} (#{eid}) — "
+            f"only B-spline pcurves are supported")
+
+    # -- edges ----------------------------------------------------------------
+
+    def edge_rec(self, eid: int) -> dict:
+        rec = self._edges.get(eid)
+        if rec is not None:
+            return rec
+        types, args = self.entities[eid]
+        if "EDGE_CURVE" not in types:
+            raise ValueError(f"import_step: #{eid} is not an EDGE_CURVE")
+        ea = _split_args(args)
+        v1, v2 = _refs(ea[1])[0], _refs(ea[2])[0]
+        basis = _refs(ea[3])[0]
+        ss = ea[4].strip() == ".T."
+        btypes, bargs = self.entities[basis]
+        if "SEAM_CURVE" in btypes:
+            raise ValueError(
+                f"import_step: edge #{eid} rides a SEAM_CURVE — the seam "
+                f"edge of a closed periodic surface refuses by name (split "
+                f"the surface at the seam before export)")
+        pcs: dict[int, BSplineCurve] = {}
+        if "SURFACE_CURVE" in btypes or "BOUNDED_SURFACE_CURVE" in btypes:
+            ba = _split_args(bargs)
+            for ref in _refs(ba[2]):
+                ptypes, pargs = self.entities[ref]
+                if "PCURVE" not in ptypes:
+                    continue
+                pa = _split_args(pargs)
+                surf = _refs(pa[1])[0]
+                defrep = _refs(pa[2])[0]
+                _, da = self.entities[defrep]
+                c2 = _refs(_split_args(da)[1])[0]
+                pcs[surf] = self.pcurve2(c2)
+        curve3 = basis
+        if "SURFACE_CURVE" in btypes or "BOUNDED_SURFACE_CURVE" in btypes:
+            curve3 = _refs(_split_args(bargs)[1])[0]
+        rec = {"v1": v1, "v2": v2, "ss": ss, "basis": basis,
+               "curve3": curve3, "pcs": pcs, "breaks": None, "pts3": {}}
+        self._edges[eid] = rec
+        return rec
+
+    def edge_breaks(self, eid: int, subdiv: int):
+        """The edge's SHARED breakpoint parameters — the union of every
+        pcurve's knots, dyadically refined per span when any pcurve is
+        curved. Shared per EDGE ENTITY: both adjacent faces evaluate
+        their own pcurve at the same parameters, so the loop vertices
+        pair exactly (a per-face refinement mints T-junctions and the
+        pairing audit refuses). ``None`` for a pcurve-less edge."""
+        rec = self.edge_rec(eid)
+        if rec["breaks"] is not None or not rec["pcs"]:
+            return rec["breaks"]
+        pcs = list(rec["pcs"].values())
+        doms = {(pc.U[pc.p], pc.U[len(pc.cp)]) for pc in pcs}
+        if len(doms) != 1:
+            raise ValueError(
+                f"import_step: the pcurves of edge #{eid} disagree about "
+                f"the edge's parameter range — the file's representations "
+                f"are inconsistent")
+        lo, hi = doms.pop()
+        knots = sorted({k for pc in pcs for k in pc.U if lo <= k <= hi})
+        if any(pc.p >= 2 for pc in pcs):
+            n = 2 ** subdiv
+            breaks: list = []
+            for a, b in zip(knots, knots[1:]):
+                step = (b - a) / n
+                breaks.extend(a + step * i for i in range(n))
+            breaks.append(hi)
+        else:
+            breaks = knots
+        rec["breaks"] = breaks
+        return breaks
+
+    def edge_on_face(self, eid: int, surf_eid: int):
+        """(uv points at the shared breakpoints, hull boxes of curved
+        pieces) for this edge's pcurve on this surface — points exact ON
+        the trim curve, boxes provably ENCLOSING it (de Casteljau)."""
+        rec = self.edge_rec(eid)
+        pc = rec["pcs"][surf_eid]
+        breaks = rec["breaks"]
+        pts = [pc.eval(t)[:2] for t in breaks]
+        boxes: list = []
+        if pc.p >= 2:
+            for (a, b, cps) in _bezier_segments(pc):
+                inner = [t for t in breaks if a < t < b]
+                cur, last = cps, a
+                for t in inner:
+                    s = (t - last) / (b - last)
+                    left, cur = _bez_split(cur, s)
+                    boxes.append(_box2(left))
+                    last = t
+                boxes.append(_box2(cur))
+        return pts, boxes
+
+
+def read_step_freeform_solid(text: str, *, heal_tolerance=None,
+                             report: dict | None = None, depth: int = 4,
+                             trim_subdiv: int = 3):
+    """Import the first freeform (B-spline-faced) solid in a STEP file as
+    an audited :class:`~forgekernel.trimshell.TrimmedShell`.
+
+    Closure is established BEFORE any orientation decision (#135): a
+    shell that does not close refuses with a gap report in millimetres,
+    healable only by the recorded-intent vertex merge. Global orientation
+    is decided by the certified volume sign — audit-backed, never
+    flag-trusted — and the full three-oracle audit runs at the door.
+    Volume brackets are width-0 (exact tier) for polynomial faces with
+    degree-1 pcurves, certified otherwise; refusals are by name."""
+    import math
+
+    from forgekernel.brep import (NonClosedShellError, SnapClusterError,
+                                  boundary_gap_report)
+    from forgekernel.bsolid import _parity_in, trimmed_patch_flux
+    from forgekernel.interval import CInterval
+    from forgekernel.trimshell import (ShellAuditUncertified, ShellFace,
+                                       TrimmedShell, TrimVertex)
+
+    rep = report if report is not None else {}
+    topo = _TrimTopo(text)
+    sids = topo.solids()
+    if not sids:
+        raise ValueError("import_step: no MANIFOLD_SOLID_BREP in file")
+    if len(sids) > 1:
+        rep.setdefault("dropped", []).extend(
+            f"MANIFOLD_SOLID_BREP #{e}: multi-solid file — only the first "
+            f"solid imports (compounds are a later stage)"
+            for e in sids[1:])
+
+    # -- pre-pass: face specs, surface-kind refusals, seam/loop refusals ------
+    _, sargs = topo.entities[sids[0]]
+    shell_eid = _refs(_split_args(sargs)[1])[0]
+    _, shargs = topo.entities[shell_eid]
+    face_specs: list[dict] = []
+    for feid in _refs(_split_args(shargs)[1]):
+        ftypes, fargs = topo.entities[feid]
+        if "ADVANCED_FACE" not in ftypes and "FACE_SURFACE" not in ftypes:
+            continue
+        fa = _split_args(fargs)
+        surf_eid = _refs(fa[2])[0]
+        same_sense = fa[3].strip() == ".T."
+        stypes = topo.entities[surf_eid][0]
+        if ("B_SPLINE_SURFACE_WITH_KNOTS" not in stypes
+                and "PLANE" not in stypes):
+            raise ValueError(
+                f"import_step: analytic/procedural surface "
+                f"{'/'.join(stypes)} (#{surf_eid}) on a freeform shell — "
+                f"an exact quadric needs irrational weights the rational "
+                f"B-spline importer cannot hold; only B-spline and planar "
+                f"faces import on this path")
+        loops = []
+        for beid in _refs(fa[1]):
+            btypes, bargs = topo.entities[beid]
+            outer = "FACE_OUTER_BOUND" in btypes
+            if not outer and "FACE_BOUND" not in btypes:
+                raise ValueError(
+                    f"import_step: face bound #{beid} of type "
+                    f"{'/'.join(btypes)} — only FACE_OUTER_BOUND/"
+                    f"FACE_BOUND are supported")
+            loop_eid = _refs(_split_args(bargs)[1])[0]
+            ltypes, largs = topo.entities[loop_eid]
+            if "VERTEX_LOOP" in ltypes:
+                raise ValueError(
+                    f"import_step: VERTEX_LOOP bound on face #{feid} — a "
+                    f"degenerate (zero-length) trim bound refuses by name")
+            if "EDGE_LOOP" not in ltypes:
+                raise ValueError(
+                    f"import_step: loop #{loop_eid} of type "
+                    f"{'/'.join(ltypes)} — only EDGE_LOOP trims import")
+            oedges = []
+            for oe in _refs(_split_args(largs)[1]):
+                otypes, oargs = topo.entities[oe]
+                oa = _split_args(oargs)
+                oedges.append((_refs(oa[3])[0], oa[4].strip() == ".T."))
+            loops.append((outer, oedges))
+        if not loops:
+            raise ValueError(
+                f"import_step: face #{feid} carries no trim bounds — an "
+                f"unbounded face cannot close a shell")
+        counts: dict[int, int] = {}
+        for _outer, oedges in loops:
+            for eid, _fwd in oedges:
+                counts[eid] = counts.get(eid, 0) + 1
+        for eid, n in counts.items():
+            if n > 1:
+                raise ValueError(
+                    f"import_step: edge #{eid} is used twice by face "
+                    f"#{feid} — the seam edge of a closed periodic "
+                    f"surface refuses by name (split the surface at the "
+                    f"seam before export)")
+        face_specs.append({"feid": feid, "surf": surf_eid,
+                           "same_sense": same_sense, "loops": loops})
+    if not face_specs:
+        raise ValueError("import_step: the CLOSED_SHELL carries no faces")
+
+    # -- vertex identity: one TrimVertex per VERTEX_POINT entity; heal is
+    #    the recorded-intent merge of entities within tolerance ---------------
+    vset: set[int] = set()
+    for spec in face_specs:
+        for _outer, oedges in spec["loops"]:
+            for eid, _fwd in oedges:
+                r = topo.edge_rec(eid)
+                vset.add(r["v1"])
+                vset.add(r["v2"])
+    vpos = {v: topo.vertex_pos(v) for v in vset}
+    parent = {v: v for v in vset}
+
+    def find(v: int) -> int:
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+
+    healed = None
+    tol2 = None
+    if heal_tolerance is not None:
+        tol = heal_tolerance if isinstance(heal_tolerance, Fraction) \
+            else Fraction(str(heal_tolerance))
+        tol2 = tol * tol
+        vl = sorted(vset)
+        for i, a in enumerate(vl):
+            for b in vl[i + 1:]:
+                d2 = sum((vpos[a][c] - vpos[b][c]) ** 2 for c in range(3))
+                if d2 <= tol2:
+                    parent[find(a)] = find(b)
+        clusters: dict[int, list[int]] = {}
+        for v in vset:
+            clusters.setdefault(find(v), []).append(v)
+        moved, max_move2 = 0, F(0)
+        for _root, members in sorted(clusters.items()):
+            if len(members) < 2:
+                continue
+            worst = max(
+                sum((vpos[a][c] - vpos[b][c]) ** 2 for c in range(3))
+                for i, a in enumerate(members) for b in members[i + 1:])
+            if worst > tol2:
+                raise SnapClusterError(
+                    f"import_step: heal tolerance chains {len(members)} "
+                    f"vertices into a cluster wider than itself",
+                    cluster=[tuple(float(c) for c in vpos[m])
+                             for m in members],
+                    diameter_sq=worst, tolerance=tol)
+            rep_pos = min(vpos[m] for m in members)
+            for m in members:
+                d2 = sum((vpos[m][c] - rep_pos[c]) ** 2 for c in range(3))
+                if d2 > 0:
+                    moved += 1
+                    max_move2 = max(max_move2, d2)
+        if moved:
+            healed = {"tolerance": float(tol), "moved": moved,
+                      "max_move_mm": math.sqrt(float(max_move2)),
+                      # the freeform heal merges vertex IDENTITIES; every
+                      # face's parameter-space trim is untouched, so the
+                      # flux — hence the reported volume — cannot change
+                      "volume_change_bound_mm3": 0.0,
+                      "dropped_faces": []}
+
+    # -- main pass: build one ShellFace per ADVANCED_FACE ---------------------
+    verts_obj: dict = {}
+    gap_segs: list[dict] = []
+    faces = []
+
+    def vert(key) -> TrimVertex:
+        vx = verts_obj.get(key)
+        if vx is None:
+            vx = verts_obj[key] = TrimVertex()
+        return vx
+
+    for spec in face_specs:
+        surf_eid = spec["surf"]
+        stypes = topo.entities[surf_eid][0]
+        planar = "PLANE" in stypes
+        project = None
+        if not planar:
+            surface = topo.surface(surf_eid)
+            ws = [w for row in surface.w for w in row]
+            rational = any(w != 1 for w in ws)
+            if rational and not (all(w > 0 for w in ws)
+                                 or all(w < 0 for w in ws)):
+                raise ValueError(
+                    f"import_step: sign-varying weights on surface "
+                    f"#{surf_eid} — a pole crosses the patch; refusing by "
+                    f"name rather than bracketing through a singularity")
+            dom = ((surface.U[surface.p], surface.U[surface.nu]),
+                   (surface.V[surface.q], surface.V[surface.nv]))
+
+            def eval3(u, v, _s=surface):
+                return _s.eval(u, v)
+        else:
+            surface = None
+            rational = False
+            O, ax, rd = topo.plane_frame(surf_eid)
+            has_pc = any(surf_eid in topo.edge_rec(eid)["pcs"]
+                         for _o, oedges in spec["loops"]
+                         for eid, _f in oedges)
+            aa = sum(c * c for c in ax)
+            rr = sum(c * c for c in rd)
+            ar = sum(ax[c] * rd[c] for c in range(3))
+            if has_pc and (aa != 1 or rr != 1 or ar != 0):
+                raise ValueError(
+                    f"import_step: PLANE #{surf_eid} carries pcurves but "
+                    f"its placement is not an exact orthonormal frame — "
+                    f"parameter-space trims cannot be mapped exactly")
+            if has_pc:
+                d1 = rd
+            else:
+                d1 = tuple(rd[c] * aa - ax[c] * ar for c in range(3))
+                if all(c == 0 for c in d1):
+                    raise ValueError(
+                        f"import_step: PLANE #{surf_eid} ref direction is "
+                        f"parallel to its axis — no frame")
+            d2v_ = (ax[1] * d1[2] - ax[2] * d1[1],
+                    ax[2] * d1[0] - ax[0] * d1[2],
+                    ax[0] * d1[1] - ax[1] * d1[0])
+            d11 = sum(c * c for c in d1)
+            d22 = sum(c * c for c in d2v_)
+            dom = None                       # bbox of the trim, found below
+
+            def eval3(u, v, _O=O, _d1=d1, _d2=d2v_):
+                return tuple(_O[c] + u * _d1[c] + v * _d2[c]
+                             for c in range(3))
+
+            def project(p, _O=O, _d1=d1, _d2=d2v_, _d11=d11, _d22=d22):
+                r = tuple(p[c] - _O[c] for c in range(3))
+                return (sum(r[c] * _d1[c] for c in range(3)) / _d11,
+                        sum(r[c] * _d2[c] for c in range(3)) / _d22)
+
+        floops = []                          # (outer, [(key, veid, uv)])
+        chords: list = []                    # straight boundary pieces
+        hull_boxes: list = []                # curved-piece enclosures
+        curved_face = False
+        for outer, oedges in spec["loops"]:
+            entries: list = []
+            first_info = None
+            last_info = None
+            for eid, fwd in oedges:
+                rec = topo.edge_rec(eid)
+                breaks = topo.edge_breaks(eid, trim_subdiv)
+                v_lo = rec["v1"] if rec["ss"] else rec["v2"]
+                v_hi = rec["v2"] if rec["ss"] else rec["v1"]
+                if surf_eid in rec["pcs"]:
+                    pts, boxes = topo.edge_on_face(eid, surf_eid)
+                    if rec["pcs"][surf_eid].p >= 2:
+                        curved_face = True
+                        hull_boxes.extend(boxes)
+                    else:
+                        chords.extend(zip(pts, pts[1:]))
+                    keys = ([("v", find(v_lo))]
+                            + [("e", eid, t) for t in breaks[1:-1]]
+                            + [("v", find(v_hi))])
+                    vids_ = [v_lo] + [None] * (len(breaks) - 2) + [v_hi]
+                    # cross-face agreement: both faces' pcurves must place
+                    # every shared breakpoint at the SAME exact 3D point
+                    for t, uv in zip(breaks, pts):
+                        p3 = eval3(uv[0], uv[1])
+                        prev = rec["pts3"].get(t)
+                        if prev is None:
+                            rec["pts3"][t] = p3
+                        elif prev != p3:
+                            raise ValueError(
+                                f"import_step: edge #{eid}: the two "
+                                f"faces' pcurves disagree about the 3D "
+                                f"point at parameter {t} — the file's "
+                                f"representations are inconsistent")
+                else:
+                    if not planar:
+                        raise ValueError(
+                            f"import_step: edge #{eid} has no pcurve on "
+                            f"B-spline surface #{surf_eid} — curve "
+                            f"inversion is not built; re-export with "
+                            f"parameter-space pcurves")
+                    ctypes = topo.entities[rec["curve3"]][0]
+                    straight = "LINE" in ctypes
+                    if not straight and "B_SPLINE_CURVE_WITH_KNOTS" in ctypes:
+                        ca = _split_args(topo.entities[rec["curve3"]][1])
+                        straight = int(ca[1]) <= 1
+                    if not straight:
+                        raise ValueError(
+                            f"import_step: curved edge #{eid} "
+                            f"({'/'.join(ctypes)}) without a pcurve on "
+                            f"planar face #{spec['feid']} — projecting "
+                            f"its chord would silently change the volume")
+                    if breaks is not None and len(breaks) != 2:
+                        raise ValueError(
+                            f"import_step: edge #{eid} subdivides on an "
+                            f"adjacent face but has no pcurve on planar "
+                            f"face #{spec['feid']}")
+                    pts = [project(vpos[v_lo]), project(vpos[v_hi])]
+                    chords.append((pts[0], pts[1]))
+                    keys = [("v", find(v_lo)), ("v", find(v_hi))]
+                    vids_ = [v_lo, v_hi]
+                # endpoint fidelity: the trim's corner must BE the vertex
+                for uv, veid in ((pts[0], v_lo), (pts[-1], v_hi)):
+                    p3 = eval3(uv[0], uv[1])
+                    d2p = sum((p3[c] - vpos[veid][c]) ** 2
+                              for c in range(3))
+                    if d2p != 0 and not (tol2 is not None and d2p <= tol2):
+                        gap_segs.append({"a": p3, "b": vpos[veid],
+                                         "coverage": 1})
+                seq = list(zip(keys, vids_, pts))
+                if fwd != rec["ss"]:
+                    seq.reverse()
+                if last_info is not None and last_info[0] != seq[0][0]:
+                    gap_segs.append({"a": vpos[last_info[1]],
+                                     "b": vpos[seq[0][1]], "coverage": 1})
+                if first_info is None:
+                    first_info = (seq[0][0], seq[0][1])
+                last_info = (seq[-1][0], seq[-1][1])
+                entries.extend(seq[:-1])
+            if last_info is not None and first_info is not None \
+                    and last_info[0] != first_info[0]:
+                gap_segs.append({"a": vpos[last_info[1]],
+                                 "b": vpos[first_info[1]], "coverage": 1})
+            dedup: list = []
+            for item in entries:
+                if not dedup or dedup[-1][0] != item[0]:
+                    dedup.append(item)
+            if len(dedup) > 1 and dedup[0][0] == dedup[-1][0]:
+                dedup.pop()
+            floops.append((outer, dedup))
+
+        # domain: fixed for a B-spline surface (trim must stay inside);
+        # a lifted plane takes the exact bbox of everything it must hold
+        if planar:
+            us = [uv[0] for _o, es in floops for _k, _v, uv in es]
+            vs = [uv[1] for _o, es in floops for _k, _v, uv in es]
+            for (bu0, bu1, bv0, bv1) in hull_boxes:
+                us.extend((bu0, bu1))
+                vs.extend((bv0, bv1))
+            u0d, u1d = min(us), max(us)
+            v0d, v1d = min(vs), max(vs)
+            if u0d == u1d or v0d == v1d:
+                raise ValueError(
+                    f"import_step: planar face #{spec['feid']} has a "
+                    f"degenerate (zero-extent) trim")
+            dom = ((u0d, u1d), (v0d, v1d))
+            surface = BSplineSurface(
+                1, 1,
+                [[eval3(u0d, v0d), eval3(u0d, v1d)],
+                 [eval3(u1d, v0d), eval3(u1d, v1d)]],
+                [u0d, u0d, u1d, u1d], [v0d, v0d, v1d, v1d])
+        else:
+            (u0d, u1d), (v0d, v1d) = dom
+            for _o, es in floops:
+                for _k, _v, uv in es:
+                    if not (u0d <= uv[0] <= u1d and v0d <= uv[1] <= v1d):
+                        raise ValueError(
+                            f"import_step: trim of face #{spec['feid']} "
+                            f"leaves the surface's parameter domain")
+
+        strip = list(hull_boxes)
+        for a, b in chords:
+            if not _on_border(a, b, dom):
+                strip.append((min(a[0], b[0]), max(a[0], b[0]),
+                              min(a[1], b[1]), max(a[1], b[1])))
+
+        loops_uv = [[uv for _k, _v, uv in es] for _o, es in floops]
+
+        def inside(u, v, _L=loops_uv):
+            return _parity_in(_L, u, v)
+
+        face = ShellFace(surface, 1 if spec["same_sense"] else -1,
+                         strip, inside)
+        for (outer, es) in floops:
+            face.add_loop([(vert(k), uv) for k, _v, uv in es], outer=outer)
+        if not curved_face and not rational:
+            # EXACT tier: every trim edge is its own chord, so the exact
+            # span-safe Green's-theorem flux applies; the audit's strip
+            # bracket intersects with it to width 0
+            oriented = []
+            for (outer, _es), uv_loop in zip(floops, loops_uv):
+                area = F(0)
+                m = len(uv_loop)
+                for i in range(m):
+                    (au, av) = uv_loop[i]
+                    (bu, bv) = uv_loop[(i + 1) % m]
+                    area += au * bv - bu * av
+                if (area > 0) != outer:
+                    uv_loop = list(reversed(uv_loop))
+                oriented.append(uv_loop)
+            face.tight = CInterval.exact(
+                trimmed_patch_flux(surface, oriented))
+        faces.append(face)
+
+    # -- closure BEFORE orientation (the #135 order) --------------------------
+    directed: dict = {}
+    for fi, face in enumerate(faces):
+        for a, b in face.outward_edges():
+            directed.setdefault((id(a), id(b)), []).append((fi, a, b))
+    seen = set()
+    for (ia, ib), uses in sorted(directed.items()):
+        key = (min(ia, ib), max(ia, ib))
+        if key in seen:
+            continue
+        seen.add(key)
+        total = len(uses) + len(directed.get((ib, ia), []))
+        if total != 2:
+            fi, a, b = uses[0]
+            f = faces[fi]
+            gap_segs.append({"a": f.surface.eval(*a.uv(f)),
+                             "b": f.surface.eval(*b.uv(f)),
+                             "coverage": total - 2 if total > 2 else 1})
+    if gap_segs:
+        gr = boundary_gap_report(gap_segs)
+        raise NonClosedShellError(
+            "import_step: the freeform shell does not close"
+            + (" (after healing — a vertex merge cannot invent a missing "
+               "face)" if healed else "")
+            + f" — {gr['open_edges']} open trim edges/vertex gaps, "
+              f"{gr['open_perimeter_mm']:.6g} mm open perimeter",
+            segments=gap_segs, report=gr, healed=healed)
+
+    shell = TrimmedShell(faces)      # pairing-direction audit at the door
+
+    # -- global orientation by certified volume sign, audit-backed ------------
+    d_used = None
+    for d in (depth, depth + 1, depth + 2):
+        vol = shell.volume(depth=d)
+        if vol.hi < 0:
+            for f in faces:
+                f.sense = -f.sense
+            d_used = d
+            break
+        if vol.lo > 0:
+            d_used = d
+            break
+    if d_used is None:
+        raise ShellAuditUncertified(
+            f"import_step: the volume bracket straddles zero up to depth "
+            f"{depth + 2} — orientation is uncertified; raise depth "
+            f"(tighten-or-refuse, never a guess)")
+
+    last_exc = None
+    audit = None
+    for d in (d_used, d_used + 1):
+        try:
+            audit = shell.audit(depth=d)
+            break
+        except ShellAuditUncertified as exc:
+            last_exc = exc
+    if audit is None:
+        raise last_exc
+
+    if healed is not None:
+        rep["healed"] = healed
+    rep["faces"] = len(faces)
+    rep["edges"] = audit["edges"]
+    rep["volume_bracket_mm3"] = (float(audit["volume"].lo),
+                                 float(audit["volume"].hi))
+    return shell
+
+
+def read_step_solid(text: str, *, heal_tolerance=None,
+                    report: dict | None = None, depth: int = 4,
+                    trim_subdiv: int = 3):
+    """Route a STEP solid to its importer: all-PLANE faces take the exact
+    planar path (a :class:`~forgekernel.brep.Solid`); any other surface
+    routes the whole solid to :func:`read_step_freeform_solid` (a
+    :class:`~forgekernel.trimshell.TrimmedShell`, or a refusal by
+    name)."""
+    sf = StepFile(text)
+    sids = [e for e, (t, _) in sorted(sf.entities.items())
+            if "MANIFOLD_SOLID_BREP" in t]
+    if not sids:
+        raise ValueError("import_step: no MANIFOLD_SOLID_BREP in file")
+    _, args = sf.entities[sids[0]]
+    shell_eid = _refs(_split_args(args)[1])[0]
+    _, shargs = sf.entities[shell_eid]
+    freeform = False
+    for feid in _refs(_split_args(shargs)[1]):
+        ftypes, fargs = sf.entities[feid]
+        if "ADVANCED_FACE" not in ftypes and "FACE_SURFACE" not in ftypes:
+            continue
+        surf = _refs(_split_args(fargs)[2])[0]
+        if "PLANE" not in sf.entities[surf][0]:
+            freeform = True
+            break
+    if freeform:
+        return read_step_freeform_solid(text, heal_tolerance=heal_tolerance,
+                                        report=report, depth=depth,
+                                        trim_subdiv=trim_subdiv)
+    return read_step_planar_solid(text, heal_tolerance=heal_tolerance,
+                                  report=report)
+
+
+# -- K3.7: native STEP export of a PatchSolid (B-spline faces) ----------------
+
+
+def _side_pts(patch, side):
+    if side == "u0":
+        return tuple(patch.cp[0][j] for j in range(patch.nv))
+    if side == "u1":
+        return tuple(patch.cp[-1][j] for j in range(patch.nv))
+    if side == "v0":
+        return tuple(patch.cp[i][0] for i in range(patch.nu))
+    return tuple(patch.cp[i][-1] for i in range(patch.nu))
+
+
+def _knot_lists(U):
+    """(multiplicities, distinct knots) STEP lists of a knot vector."""
+    mults: list[int] = []
+    knots: list = []
+    for k in U:
+        if knots and knots[-1] == k:
+            mults[-1] += 1
+        else:
+            knots.append(k)
+            mults.append(1)
+    return mults, knots
+
+
+def write_step_patch_solid(psolid, *, name: str = "gitcad_part") -> str:
+    """Emit a :class:`~forgekernel.bsolid.PatchSolid` as an AP214
+    MANIFOLD_SOLID_BREP of B_SPLINE_SURFACE_WITH_KNOTS faces with
+    full-domain trims: one EDGE_CURVE per proven seam, each carrying a
+    SURFACE_CURVE with a 3D B-spline basis and one degree-1
+    parameter-space pcurve per adjacent face, vertices deduplicated by
+    exact 3D coordinates.
+
+    Requires the solid's ``seams`` — the side-gluing topology proven by
+    exact control-point equality. Without it the writer cannot know
+    which borders are one edge, and emitting CLOSED_SHELL over unproven
+    topology would be a well-formed falsehood; it refuses by name.
+    Polynomial patches only (rational export is a later stage)."""
+    patches = list(psolid.patches)
+    seams = getattr(psolid, "seams", None)
+    if seams is None:
+        raise ValueError(
+            "write_step_patch_solid: the solid carries no proven seam "
+            "topology (seams=None) — cannot emit CLOSED_SHELL over "
+            "unproven shared edges; derive seams by exact control-point "
+            "equality first")
+    for i, p in enumerate(patches):
+        if any(w != F(1) for row in p.w for w in row):
+            raise ValueError(
+                f"write_step_patch_solid: patch {i} is rational — "
+                f"polynomial patches only")
+    side_map: dict = {}
+    for idx, (ka, kb, _flip) in enumerate(seams):
+        side_map[ka] = idx
+        side_map[kb] = idx
+    for fi in range(len(patches)):
+        for s in ("u0", "u1", "v0", "v1"):
+            if (fi, s) not in side_map:
+                raise ValueError(
+                    f"write_step_patch_solid: side {s} of patch {fi} is "
+                    f"not on any proven seam — the shell's topology is "
+                    f"incomplete")
+
+    lines: list[str] = []
+    nid = [0]
+
+    def emit(body: str) -> int:
+        nid[0] += 1
+        lines.append(f"#{nid[0]} = {body};")
+        return nid[0]
+
+    pds, ctx = _emit_product_chain(emit, name)
+    ctx2 = emit("( GEOMETRIC_REPRESENTATION_CONTEXT(2) "
+                "PARAMETRIC_REPRESENTATION_CONTEXT() "
+                "REPRESENTATION_CONTEXT('2d parameter space','') )")
+
+    def cp3(p) -> int:
+        return emit(f"CARTESIAN_POINT('',({_dec(p[0])},{_dec(p[1])},"
+                    f"{_dec(p[2])}))")
+
+    def cp2(u, v) -> int:
+        return emit(f"CARTESIAN_POINT('',({_dec(u)},{_dec(v)}))")
+
+    surf_ids = []
+    for p in patches:
+        rows = ",".join(
+            "(" + ",".join(f"#{cp3(p.cp[i][j])}" for j in range(p.nv)) + ")"
+            for i in range(p.nu))
+        mu, ku = _knot_lists(p.U)
+        mv, kv = _knot_lists(p.V)
+        surf_ids.append(emit(
+            f"B_SPLINE_SURFACE_WITH_KNOTS('',{p.p},{p.q},({rows}),"
+            f".UNSPECIFIED.,.F.,.F.,.F.,"
+            f"({','.join(str(m) for m in mu)}),"
+            f"({','.join(str(m) for m in mv)}),"
+            f"({','.join(_dec(k) for k in ku)}),"
+            f"({','.join(_dec(k) for k in kv)}),.UNSPECIFIED.)"))
+
+    vids: dict = {}
+
+    def vertex(pt) -> int:
+        key = (pt[0], pt[1], pt[2])
+        if key not in vids:
+            vids[key] = emit(f"VERTEX_POINT('',#{cp3(pt)})")
+        return vids[key]
+
+    def side_dom(patch, side):
+        if side in ("u0", "u1"):
+            return patch.V[patch.q], patch.V[patch.nv]
+        return patch.U[patch.p], patch.U[patch.nu]
+
+    def side_uv(patch, side):
+        """(start, end) uv corners of a side, in its own t-increasing
+        order."""
+        a0, a1 = patch.U[patch.p], patch.U[patch.nu]
+        b0, b1 = patch.V[patch.q], patch.V[patch.nv]
+        return {"u0": ((a0, b0), (a0, b1)), "u1": ((a1, b0), (a1, b1)),
+                "v0": ((a0, b0), (a1, b0)), "v1": ((a0, b1), (a1, b1))}[side]
+
+    edge_ids = []
+    for (ka, kb, flip) in seams:
+        (fi, si), (fj, sj) = ka, kb
+        cps = _side_pts(patches[fi], si)
+        t0, t1 = side_dom(patches[fi], si)
+        deg = len(cps) - 1
+        refs = ",".join(f"#{cp3(c)}" for c in cps)
+        m = deg + 1
+        c3 = emit(f"B_SPLINE_CURVE_WITH_KNOTS('',{deg},({refs}),"
+                  f".UNSPECIFIED.,.F.,.F.,({m},{m}),"
+                  f"({_dec(t0)},{_dec(t1)}),.UNSPECIFIED.)")
+        pcs = []
+        for (face_idx, side, rev) in ((fi, si, False), (fj, sj, flip)):
+            a, b = side_uv(patches[face_idx], side)
+            if rev:
+                a, b = b, a
+            c2 = emit(f"B_SPLINE_CURVE_WITH_KNOTS('',1,"
+                      f"(#{cp2(*a)},#{cp2(*b)}),.UNSPECIFIED.,.F.,.F.,"
+                      f"(2,2),({_dec(t0)},{_dec(t1)}),.UNSPECIFIED.)")
+            dr = emit(f"DEFINITIONAL_REPRESENTATION('',(#{c2}),#{ctx2})")
+            pcs.append(emit(f"PCURVE('',#{surf_ids[face_idx]},#{dr})"))
+        sc = emit(f"SURFACE_CURVE('',#{c3},"
+                  f"({','.join('#' + str(pc) for pc in pcs)}),.PCURVE_S1.)")
+        edge_ids.append(emit(f"EDGE_CURVE('',#{vertex(cps[0])},"
+                             f"#{vertex(cps[-1])},#{sc},.T.)"))
+
+    face_ids = []
+    for fi, p in enumerate(patches):
+        oes = []
+        for (s, fwd) in (("v0", True), ("u1", True),
+                         ("v1", False), ("u0", False)):
+            idx = side_map[(fi, s)]
+            ka, _kb, flip = seams[idx]
+            canon_here = (ka == (fi, s)) or (not flip)
+            flag = fwd if canon_here else (not fwd)
+            oes.append(emit(f"ORIENTED_EDGE('',*,*,#{edge_ids[idx]},"
+                            f"{'.T.' if flag else '.F.'})"))
+        loop = emit(f"EDGE_LOOP('',({','.join('#' + str(o) for o in oes)}))")
+        bound = emit(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+        face_ids.append(emit(f"ADVANCED_FACE('',(#{bound}),"
+                             f"#{surf_ids[fi]},.T.)"))
+
+    shell = emit(f"CLOSED_SHELL('',"
+                 f"({','.join('#' + str(x) for x in face_ids)}))")
+    brep = emit(f"MANIFOLD_SOLID_BREP('{name}',#{shell})")
+    absr = emit(f"ADVANCED_BREP_SHAPE_REPRESENTATION('{name}',(#{brep}),"
+                f"#{ctx})")
+    emit(f"SHAPE_DEFINITION_REPRESENTATION(#{pds},#{absr})")
+    return _step_header(name, "\n".join(lines))
