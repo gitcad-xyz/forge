@@ -68,14 +68,40 @@ def _triple(a, b, c):
     return a[0] * cx[0] + a[1] * cx[1] + a[2] * cx[2]
 
 
+def _interior_knots(surface: BSplineSurface):
+    """The distinct interior knots (u-list, v-list) of a surface — empty
+    on single-span (Bézier) input."""
+    p, q = surface.p, surface.q
+    lo_u, hi_u = surface.U[p], surface.U[surface.nu]
+    lo_v, hi_v = surface.V[q], surface.V[surface.nv]
+    iu = sorted({F(u) for u in surface.U if lo_u < u < hi_u})
+    iv = sorted({F(v) for v in surface.V if lo_v < v < hi_v})
+    return iu, iv
+
+
 def patch_flux(surface: BSplineSurface) -> Fraction:
     """(1/3)∮∮ S·(S_u×S_v) du dv over the surface's parameter domain —
     the patch's contribution to the enclosed signed volume. EXACT ℚ for
-    polynomial surfaces (raises for rational — K7.1 certified path)."""
+    polynomial surfaces (raises for rational — K7.1 certified path).
+
+    Interior knots make the integrand PIECEWISE polynomial — one global
+    quadrature integrates the wrong polynomial and returns a silently
+    wrong Fraction (the shipped defect: a piecewise-bilinear tent
+    reported 8/9 where the truth is 4/3). Multi-span surfaces therefore
+    split exactly at the knots (Boehm insertion, ``bezier_patches``) and
+    sum the per-Bézier fluxes: flux is invariant under the
+    orientation-preserving reparameterization of each span, so the sum
+    is the same exact ℚ number the single quadrature only pretended to
+    compute."""
     if any(w != F(1) for row in surface.w for w in row):
         raise ValueError("exact flux: polynomial patches only — rational "
                          "patches take the certified bracket patch_flux_ci "
                          "(K7.1)")
+    iu, iv = _interior_knots(surface)
+    if iu or iv:
+        from forgekernel.nurbs import bezier_patches
+        return sum((patch_flux(bezier_surface(net))
+                    for *_, net in bezier_patches(surface)), F(0))
     p, q = surface.p, surface.q
     (u0, u1), (v0, v1) = surface.domain()
     u0, u1, v0, v1 = F(u0), F(u1), F(v0), F(v1)
@@ -108,7 +134,16 @@ def trimmed_patch_flux(surface: BSplineSurface, loops) -> Fraction:
     Exactness holds for polynomial patches AND polygonal trim loops. When
     the loops are the polyline sampling of a curved SSI trim boundary, the
     result is exact for THAT polygon — i.e. it carries the boundary's
-    discretization error, not a rounding one (the honest K7 caveat)."""
+    discretization error, not a rounding one (the honest K7 caveat).
+
+    Interior knots make F piecewise polynomial (the same shipped defect
+    as :func:`patch_flux`): the antiderivative G must be accumulated
+    span by span in u, and each straight trim edge must be split where
+    it crosses an interior u- or v-knot line — between crossings
+    G(u(τ), v(τ)) is one polynomial of degree ≤ 3p + 3q − 1, so the
+    same 3(p+q)-node rule stays exact per sub-segment. Single-span
+    input takes exactly the original path (no splits, same nodes) and
+    returns the identical Fraction."""
     if any(w != F(1) for row in surface.w for w in row):
         raise ValueError("exact trimmed flux: polynomial patches only — "
                          "rational patches take the certified bracket "
@@ -116,6 +151,7 @@ def trimmed_patch_flux(surface: BSplineSurface, loops) -> Fraction:
     p, q = surface.p, surface.q
     (ud0, _), _ = surface.domain()
     ud0 = F(ud0)
+    iu, iv = _interior_knots(surface)
     inn = _nodes(3 * p)
     inw = _lagrange_weights(inn)
     otn = _nodes(3 * (p + q))
@@ -125,9 +161,14 @@ def trimmed_patch_flux(surface: BSplineSurface, loops) -> Fraction:
         S, Su, Sv = surface_partials2(surface, u, v)[:3]
         return _triple(S, Su, Sv)
 
-    def Gpt(u, v):                 # ∫_{ud0}^{u} F(u',v) du' via σ∈[0,1] map
-        span = u - ud0
-        return span * sum(w * Fpt(ud0 + s * span, v) for w, s in zip(inw, inn))
+    def _seg(a, b, v):             # ∫_a^b F(u',v) du' within ONE u-span
+        span = b - a
+        return span * sum(w * Fpt(a + s * span, v) for w, s in zip(inw, inn))
+
+    def Gpt(u, v):                 # ∫_{ud0}^{u} F(u',v) du', split at u-knots
+        breaks = [ud0] + [k for k in iu if ud0 < k < u] + [u]
+        return sum(_seg(breaks[i], breaks[i + 1], v)
+                   for i in range(len(breaks) - 1))
 
     total = F(0)
     for loop in loops:
@@ -139,9 +180,21 @@ def trimmed_patch_flux(surface: BSplineSurface, loops) -> Fraction:
             if dvv == 0:           # a horizontal edge adds nothing to ∮ G dv
                 continue
             duu = ub - ua
+            # split τ∈[0,1] where the edge crosses an interior knot line:
+            # G(u(τ), v(τ)) is polynomial only between such crossings
+            cuts = {F(0), F(1)}
+            if duu != 0:
+                cuts.update(t for kk in iu
+                            if 0 < (t := (kk - ua) / duu) < 1)
+            cuts.update(t for kk in iv
+                        if 0 < (t := (kk - va) / dvv) < 1)
+            ts = sorted(cuts)
             edge = F(0)
-            for w, tau in zip(otw, otn):
-                edge += w * Gpt(ua + tau * duu, va + tau * dvv)
+            for t0, t1 in zip(ts, ts[1:]):
+                dt = t1 - t0
+                for w, tau in zip(otw, otn):
+                    tt = t0 + tau * dt
+                    edge += dt * w * Gpt(ua + tt * duu, va + tt * dvv)
             total += dvv * edge
     return total / 3
 
