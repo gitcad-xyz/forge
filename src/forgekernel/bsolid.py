@@ -157,12 +157,23 @@ def trimmed_solid_volume(faces) -> Fraction:
 
 class PatchSolid:
     """A closed solid whose boundary is a list of outward-oriented
-    polynomial Bézier patches. Volume exact in ℚ via the flux theorem."""
+    polynomial Bézier patches. Volume exact in ℚ via the flux theorem.
+
+    ``seams`` (optional) is the operand's exact side-gluing topology:
+    a tuple of ``((fi, si), (fj, sj), flip)`` records meaning side
+    ``si`` of face ``fi`` is the SAME 3D curve as side ``sj`` of face
+    ``fj`` (control points exactly equal, reversed when ``flip``); a
+    side is one of ``"u0" | "u1" | "v0" | "v1"``. The boolean assembly
+    needs it to pair trim edges that leave a face through its border
+    (open SSI branches); a converter that knows its topology exactly
+    (:meth:`forgekernel.loft.LoftSolid.to_patches`) emits it, and
+    ``None`` simply means open-branch booleans refuse on this operand."""
 
     provenance = "exact"
 
-    def __init__(self, patches) -> None:
+    def __init__(self, patches, seams=None) -> None:
         self.patches = list(patches)
+        self.seams = seams
         if not self.patches:
             raise ValueError("PatchSolid needs at least one boundary patch")
 
@@ -785,8 +796,21 @@ class BooleanUnsupported(ValueError):
       are not consistently outward-oriented, so the sign rule above has
       no premise to stand on;
     * ``open_branch`` — an intersection curve leaves a face through its
-      border; the stitched loop's border segments would need pairing
-      with the operand's own seam edges, which is unbuilt;
+      border and an operand it crosses carries NO seam topology
+      (``PatchSolid.seams is None``): border segments can only be paired
+      with the operand's own seam edges when those seams are declared
+      and proven (:meth:`forgekernel.loft.LoftSolid.to_patches` emits
+      them);
+    * ``seam_topology_invalid`` / ``seam_mismatch`` — a declared seam
+      set does not cover every face side exactly once, or a record's two
+      sides do not carry exactly equal 3D control points (the equality
+      the certified-point transfer leans on);
+    * ``seam_crossing_unmatched`` / ``seam_crossing_ambiguous`` — the
+      two per-face-pair solves of one seam crossing cannot be identified
+      1:1 (count mismatch, different continuing face, or crossings
+      closer than the detection resolution can separate);
+    * ``assembly_degenerate`` — two distinct trim vertices landed on the
+      same exact parameter point of one face;
     * ``region_unresolved`` / ``nested_loops_unresolved`` — the dyadic
       grid at this depth has no strip-free witness cell inside a trim
       loop, or mixed certified memberships inside one loop (nested
@@ -1066,6 +1090,488 @@ def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
     return face
 
 
+# -- open branches: seam topology, crossing canonicalization, chain gluing ----
+#
+# A curve that leaves a face through its border continues on the
+# adjacent face of the SAME operand. Each side detects its own certified
+# border crossing (a separate Newton solve), so the same 3D crossing
+# exists twice with slightly different exact coordinates. The assembly
+# CANONICALIZES: one solve is kept, and its coordinates are transferred
+# to the adjacent face through the seam's exact control-point equality —
+# S_adj(mapped uv) == S_own(uv) EXACTLY, so the kept residual
+# certificate (|S_own(uv) − S_other(s,t)|² < 1e-20) applies verbatim to
+# the adjacent face. Identity becomes the object: one TrimVertex per
+# crossing, bound to three faces.
+
+_SIDE_NAMES = ("u0", "u1", "v0", "v1")
+
+
+def _side_corner_bits(side, which):
+    """Corner (u-bit, v-bit) at the ``which`` end (0 = low border
+    parameter, 1 = high) of a face side."""
+    return {"u0": (0, which), "u1": (1, which),
+            "v0": (which, 0), "v1": (which, 1)}[side]
+
+
+class _SeamTopology:
+    """One operand's validated seam topology for a boolean assembly.
+
+    Construction PROVES the declared records against the control nets:
+    every face side glued exactly once, and each record's two side
+    curves carry exactly equal control points (reversed under ``flip``).
+    Provides the exact affine border-parameter maps, and the operand's
+    shared corner vertices (union-find over seam-end incidences — one
+    :class:`~forgekernel.trimshell.TrimVertex` per geometric corner)."""
+
+    def __init__(self, name, faces, seams) -> None:
+        from forgekernel.loft import _side_cps
+        from forgekernel.trimshell import TrimVertex
+
+        self.name = name
+        self.faces = faces
+        self.side_map: dict = {}
+        for (ka, kb, flip) in seams:
+            for k, other in ((ka, kb), (kb, ka)):
+                if k in self.side_map:
+                    raise BooleanUnsupported(
+                        "seam_topology_invalid",
+                        f"operand {name}: side {k} appears in more than "
+                        f"one seam record")
+                self.side_map[k] = (other, bool(flip))
+        for fi in range(len(faces)):
+            for s in _SIDE_NAMES:
+                if (fi, s) not in self.side_map:
+                    raise BooleanUnsupported(
+                        "seam_topology_invalid",
+                        f"operand {name}: side ({fi}, {s!r}) is glued to "
+                        f"nothing — a closed seamed skin covers every "
+                        f"side exactly once")
+        for (ka, kb, flip) in seams:
+            ca = _side_cps(faces[ka[0]], ka[1])
+            cb = _side_cps(faces[kb[0]], kb[1])
+            if flip:
+                cb = tuple(reversed(cb))
+            if tuple(ca) != tuple(cb):
+                raise BooleanUnsupported(
+                    "seam_mismatch",
+                    f"operand {name}: seam {ka} ↔ {kb} sides do not carry "
+                    f"exactly equal 3D control points — the certified "
+                    f"transfer across this seam has no exact premise")
+
+        # shared corner vertices: union-find over seam end incidences
+        parent: dict = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for (ka, kb, flip) in seams:
+            for which in (0, 1):
+                mate_which = which if not flip else 1 - which
+                union((ka[0], _side_corner_bits(ka[1], which)),
+                      (kb[0], _side_corner_bits(kb[1], mate_which)))
+        self._find = find
+        self._corner_vx: dict = {}
+        self._TrimVertex = TrimVertex
+
+    def _dom(self, fi):
+        (a, b), (c, d) = self.faces[fi].domain()
+        return F(a), F(b), F(c), F(d)
+
+    def corner_uv(self, fi, bits):
+        u0, u1, v0, v1 = self._dom(fi)
+        return ((u0, u1)[bits[0]], (v0, v1)[bits[1]])
+
+    def corner_vertex(self, fi, bits):
+        root = self._find((fi, bits))
+        vx = self._corner_vx.get(root)
+        if vx is None:
+            vx = self._corner_vx[root] = self._TrimVertex()
+        return vx
+
+    def side_range(self, fi, side):
+        u0, u1, v0, v1 = self._dom(fi)
+        return (v0, v1) if side in ("u0", "u1") else (u0, u1)
+
+    def side_tau(self, side, uv):
+        return uv[1] if side in ("u0", "u1") else uv[0]
+
+    def side_point(self, fi, side, tau):
+        u0, u1, v0, v1 = self._dom(fi)
+        return {"u0": (u0, tau), "u1": (u1, tau),
+                "v0": (tau, v0), "v1": (tau, v1)}[side]
+
+    def mate(self, fi, side, tau):
+        """The glued side and the EXACT corresponding border parameter."""
+        (fj, sj), flip = self.side_map[(fi, side)]
+        lo, hi = self.side_range(fi, side)
+        t = (F(tau) - lo) / (hi - lo)
+        if flip:
+            t = 1 - t
+        lo2, hi2 = self.side_range(fj, sj)
+        return (fj, sj), lo2 + t * (hi2 - lo2)
+
+    def canon_key(self, fi, side):
+        other, _ = self.side_map[(fi, side)]
+        a, b = (fi, side), other
+        return (a, b) if a <= b else (b, a)
+
+    def canon_tau(self, fi, side, tau):
+        """Border parameter normalized into the seam's slot-0 side."""
+        lo, hi = self.side_range(fi, side)
+        t = (F(tau) - lo) / (hi - lo)
+        key = self.canon_key(fi, side)
+        if (fi, side) != key[0]:
+            _, flip = self.side_map[(fi, side)]
+            if flip:
+                t = 1 - t
+        return t
+
+
+def _canonicalize_crossings(open_recs, topos, depth: int) -> None:
+    """Identify the two per-face-pair solves of every seam crossing and
+    merge them into ONE canonical vertex + coordinates (mutates the
+    chain records in place).
+
+    The slot-0 solve is kept; the slot-1 chain's endpoint is rewritten
+    to the seam-mapped coordinates (exact) and to the slot-0 solve's
+    other-operand coordinates, and its endpoint vertex is replaced by
+    the slot-0 vertex object. Soundness: the seam sides carry exactly
+    equal control points, so S_slot1(mapped uv) == S_slot0(uv) exactly
+    and the slot-0 residual certificate transfers verbatim. Matching is
+    1:1 within each seam, refusing count mismatches, different
+    continuing faces, matches wider than the detection resolution, and
+    crossings the resolution cannot separate."""
+    for X, own in (("A", 0), ("B", 1)):
+        topo = topos[X]
+        if topo is None:
+            continue
+        oth = 1 - own
+        entries: dict = {}
+        for rec in open_recs:
+            for e in (0, 1):
+                end = rec["ends"][e]
+                if end is None or end[0] != X:
+                    continue
+                fi = rec["pair"][own]
+                pt = rec["pts"][0 if e == 0 else -1]
+                uv = (pt[0], pt[1]) if X == "A" else (pt[2], pt[3])
+                side = end[1]
+                tau = topo.side_tau(side, uv)
+                key = topo.canon_key(fi, side)
+                slot = 0 if (fi, side) == key[0] else 1
+                entries.setdefault(key, []).append(
+                    (topo.canon_tau(fi, side, tau), slot, rec, e, tau,
+                     fi, side))
+        w = F(1, 1 << depth)
+        for key, ents in entries.items():
+            s0 = sorted((x for x in ents if x[1] == 0), key=lambda x: x[0])
+            s1 = sorted((x for x in ents if x[1] == 1), key=lambda x: x[0])
+            if len(s0) != len(s1):
+                raise BooleanUnsupported(
+                    "seam_crossing_unmatched",
+                    f"operand {X} seam {key}: {len(s0)} crossing(s) "
+                    f"certified from one side, {len(s1)} from the other "
+                    f"— the curve's continuation across the seam was not "
+                    f"detected; raise the depth")
+            for k, (e0, e1) in enumerate(zip(s0, s1)):
+                if abs(e0[0] - e1[0]) > 2 * w:
+                    raise BooleanUnsupported(
+                        "seam_crossing_unmatched",
+                        f"operand {X} seam {key}: nearest crossing "
+                        f"candidates are {float(abs(e0[0] - e1[0])):.3g} "
+                        f"apart in the seam parameter — beyond the "
+                        f"2·2^-{depth} identification bound")
+                if k + 1 < len(s0) and (
+                        s0[k + 1][0] - e0[0] <= 4 * w
+                        or s1[k + 1][0] - e1[0] <= 4 * w):
+                    raise BooleanUnsupported(
+                        "seam_crossing_ambiguous",
+                        f"operand {X} seam {key}: two crossings closer "
+                        f"than 4·2^-{depth} in the seam parameter — the "
+                        f"1:1 identification is not certified; raise "
+                        f"the depth")
+                _, _, rec0, i0, tau0, f0, side0 = e0
+                _, _, rec1, i1, _, f1, side1 = e1
+                if rec0["pair"][oth] != rec1["pair"][oth]:
+                    raise BooleanUnsupported(
+                        "seam_crossing_unmatched",
+                        f"operand {X} seam {key}: matched crossing ends "
+                        f"lie on different faces of the other operand "
+                        f"({rec0['pair'][oth]} vs {rec1['pair'][oth]})")
+                (fj, sj), tau_m = topo.mate(f0, side0, tau0)
+                if (fj, sj) != (f1, side1):
+                    raise BooleanUnsupported(
+                        "seam_crossing_unmatched",
+                        f"operand {X} seam {key}: slot-1 end sits on side "
+                        f"({f1}, {side1!r}), expected ({fj}, {sj!r})")
+                uvj = topo.side_point(f1, side1, tau_m)
+                p0 = rec0["pts"][0 if i0 == 0 else -1]
+                if X == "A":
+                    newpt = (uvj[0], uvj[1], p0[2], p0[3])
+                else:
+                    newpt = (p0[0], p0[1], uvj[0], uvj[1])
+                idx = 0 if i1 == 0 else -1
+                rec1["pts"][idx] = newpt
+                rec1["verts"][idx] = rec0["verts"][0 if i0 == 0 else -1]
+
+
+def _face_paths(side_idx: int, face_index: int, recs):
+    """One face's trim curves, glued: chains of the face concatenated at
+    shared canonical endpoint vertices (crossings of the OTHER operand's
+    seams, interior to this face). Returns ``(paths, cycles)``, each
+    entry ``(verts, uvs)`` in this face's own parameters — paths end on
+    THIS operand's borders, cycles are closed."""
+    X = "A" if side_idx == 0 else "B"
+    mine = [r for r in recs if r["pair"][side_idx] == face_index]
+
+    def coords(r):
+        return [(p[0], p[1]) if side_idx == 0 else (p[2], p[3])
+                for p in r["pts"]]
+
+    cycles = []
+    open_items = []
+    for r in mine:
+        if r["closed"]:
+            cycles.append((list(r["verts"]), coords(r)))
+        else:
+            open_items.append(r)
+    if not open_items:
+        return [], cycles
+
+    by_id = {id(r): r for r in open_items}
+    glue: dict = {}
+    for r in open_items:
+        for e in (0, 1):
+            if r["ends"][e][0] != X:            # other operand's seam:
+                vid = id(r["verts"][0 if e == 0 else -1])
+                glue.setdefault(vid, []).append((id(r), e))
+    for vid, uses in glue.items():
+        if len(uses) != 2:
+            raise BooleanUnsupported(
+                "seam_crossing_unmatched",
+                f"a glued crossing vertex is used by {len(uses)} chain "
+                f"end(s) on one face, not 2 — the curve's continuation "
+                f"across the other operand's seam is incomplete")
+
+    used: set = set()
+
+    def walk(rid, e, stop_vid=None):
+        """Traverse from end ``e`` of chain ``rid`` gluing across shared
+        vertices; stops at a terminal (own-border) end or when the walk
+        returns to ``stop_vid`` (cycle). Returns (verts, uvs, closed)."""
+        seq_v: list = []
+        seq_p: list = []
+        while True:
+            r = by_id[rid]
+            used.add(rid)
+            pts = coords(r)
+            verts = list(r["verts"])
+            if e == 1:
+                pts = list(reversed(pts))
+                verts = list(reversed(verts))
+            if seq_p and seq_p[-1] == pts[0]:
+                pts, verts = pts[1:], verts[1:]
+            seq_p += pts
+            seq_v += verts
+            exit_e = 1 - e
+            end = r["ends"][exit_e]
+            exit_vert = r["verts"][0 if exit_e == 0 else -1]
+            if end[0] == X:
+                return seq_v, seq_p, False
+            if stop_vid is not None and id(exit_vert) == stop_vid:
+                # cycle closed: drop the repeated closing vertex
+                if seq_v and seq_v[-1] is seq_v[0]:
+                    seq_v, seq_p = seq_v[:-1], seq_p[:-1]
+                return seq_v, seq_p, True
+            nxt = [u for u in glue[id(exit_vert)] if u != (rid, exit_e)]
+            rid2, e2 = nxt[0]
+            if rid2 in used and stop_vid is None:
+                raise BooleanUnsupported(
+                    "seam_crossing_unmatched",
+                    "chain gluing revisited a chain while walking from a "
+                    "border terminal — inconsistent crossing topology")
+            rid, e = rid2, e2
+
+    paths = []
+    for r in open_items:
+        if id(r) in used:
+            continue
+        term = next((e for e in (0, 1) if r["ends"][e][0] == X), None)
+        if term is not None:
+            verts, uvs, _ = walk(id(r), term)
+            paths.append((verts, uvs))
+    for r in open_items:
+        if id(r) not in used:
+            start_vid = id(r["verts"][0])
+            verts, uvs, closed = walk(id(r), 0, stop_vid=start_vid)
+            if not closed:
+                raise BooleanUnsupported(
+                    "seam_crossing_unmatched",
+                    "leftover glued chains neither reach a border nor "
+                    "close a cycle")
+            cycles.append((verts, uvs))
+    return paths, cycles
+
+
+def _assemble_face_open(surface, sense, strip, paths, cycles, keep_inside,
+                        other_shell, depth, raycast_depth, topo, fi):
+    """Open-branch counterpart of :func:`_assemble_face`: the face's
+    domain is partitioned by border-anchored trim paths (plus closed
+    loops), every region is certified kept/discarded through its
+    strip-free grid components, and kept faces carry FULL border loops —
+    corner vertices and border sub-edges shared through the operand's
+    seam topology, so the exact pairing audit closes over seam edges."""
+    from forgekernel.raycast import (PointClassifyUncertified,
+                                     classify_point_in_shell)
+    from forgekernel.trim import _classify_in_loops, split_domain_by_paths
+    from forgekernel.trimshell import ShellFace
+
+    def kept_at(u, v):
+        p = surface.eval(u, v)
+        verdict = classify_point_in_shell(other_shell, p,
+                                          depth=raycast_depth)
+        return (verdict == "in") == keep_inside
+
+    def kept_at_any(cands):
+        last = None
+        for (u, v) in cands:
+            try:
+                return kept_at(u, v)
+            except PointClassifyUncertified as exc:
+                last = exc
+        raise last
+
+    corner_items = [(topo.corner_vertex(fi, bits), topo.corner_uv(fi, bits))
+                    for bits in ((0, 0), (1, 0), (1, 1), (0, 1))]   # CCW
+
+    if not strip:
+        (u0, u1), (v0, v1) = surface.domain()
+        du, dv = F(u1) - F(u0), F(v1) - F(v0)
+        cands = [(F(u0) + du * a, F(v0) + dv * b)
+                 for a, b in ((F(1, 2), F(1, 2)), (F(9, 17), F(8, 19)),
+                              (F(7, 23), F(13, 29)), (F(19, 31), F(11, 37)))]
+        if not kept_at_any(cands):
+            return None
+        face = ShellFace(surface, sense, set(), lambda u, v: True)
+        face.add_loop(corner_items, outer=True)
+        return face
+
+    vmap: dict = {}
+
+    def register(vx, uv):
+        key = (F(uv[0]), F(uv[1]))
+        old = vmap.get(key)
+        if old is not None and old is not vx:
+            raise BooleanUnsupported(
+                "assembly_degenerate",
+                f"two distinct trim vertices at the same exact parameter "
+                f"point ({key[0]}, {key[1]}) of one face")
+        vmap[key] = vx
+
+    for verts, uvs in list(paths) + list(cycles):
+        for vx, uv in zip(verts, uvs):
+            register(vx, uv)
+    for vx, uv in corner_items:
+        register(vx, uv)
+
+    regions = split_domain_by_paths(surface, [uvs for _, uvs in paths],
+                                    [uvs for _, uvs in cycles])
+    grid = _FaceGrid(surface, strip, depth)
+    verdicts: dict = {}
+
+    def comp_kept(c):
+        if c not in verdicts:
+            verdicts[c] = kept_at_any(
+                [grid.cell_mid(cell) for cell in grid.candidates(c)])
+        return verdicts[c]
+
+    region_comps: list = [[] for _ in regions]
+    for c in range(grid.ncomp):
+        placed = False
+        for cell in grid.candidates(c, k=8):
+            um, vm = grid.cell_mid(cell)
+            hit = None
+            for ri, reg in enumerate(regions):
+                cls = _classify_in_loops(reg, um, vm)
+                if cls == "in":
+                    hit = ri
+                    break
+                if cls == "on":
+                    hit = "on"
+                    break
+            if isinstance(hit, int):
+                region_comps[hit].append(c)
+                placed = True
+                break
+        if not placed:
+            raise BooleanUnsupported(
+                "region_unresolved",
+                f"a strip-free component's witness points all landed on "
+                f"trim-region boundaries at depth {depth}; raise the "
+                f"depth")
+
+    kept_regions = []
+    for ri, reg in enumerate(regions):
+        comps = region_comps[ri]
+        if not comps:
+            raise BooleanUnsupported(
+                "region_unresolved",
+                f"no strip-free grid cell inside a trim region at depth "
+                f"{depth} — the region is thinner than the grid; raise "
+                f"the depth")
+        vals = {comp_kept(c) for c in comps}
+        if len(vals) > 1:
+            raise BooleanUnsupported(
+                "region_unresolved",
+                "mixed certified memberships inside one trim region — "
+                "the arrangement disagrees with the certified verdicts; "
+                "raise the depth")
+        if vals.pop():
+            kept_regions.append(ri)
+    if not kept_regions:
+        return None
+
+    point_memo: dict = {}
+
+    def inside(u, v):
+        c = grid.comp_of(u, v)
+        if c is not None:
+            return comp_kept(c)
+        key = (F(u), F(v))
+        if key not in point_memo:
+            point_memo[key] = kept_at(*key)
+        return point_memo[key]
+
+    face = ShellFace(surface, sense, strip, inside)
+
+    def vertex_of(uv):
+        key = (F(uv[0]), F(uv[1]))
+        vx = vmap.get(key)
+        if vx is None:
+            raise BooleanUnsupported(
+                "assembly_degenerate",
+                f"trim-region vertex ({key[0]}, {key[1]}) is neither a "
+                f"chain point, a border crossing, nor a corner")
+        return vx
+
+    for ri in kept_regions:
+        reg = regions[ri]
+        face.add_loop([(vertex_of(uv), uv) for uv in reg[0]], outer=True)
+        for hole in reg[1:]:
+            face.add_loop([(vertex_of(uv), uv) for uv in hole],
+                          outer=False)
+    return face
+
+
 def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
                     raycast_depth: int = 5, use_rust=None):
     """Boolean of two closed patch solids as an audited, certified
@@ -1075,20 +1581,32 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
     and ``B`` are :class:`PatchSolid`-shaped operands (outward-oriented
     polynomial single-span Bézier faces — anything else refuses by
     name). Pipeline: per face-pair SSI (every surviving cell certified
-    or refused), closed trim loops on both parameter domains, exact
-    partition audit of each trimmed face's domain, certified ray-parity
+    or refused), certified chains on both parameter domains, exact
+    partition of each trimmed face's domain, certified ray-parity
     membership of every strip-free fragment, senses from the
     monotonicity rule (module comment), shared-vertex loop topology, and
     the full three-oracle shell audit before anything is returned. The
     result's volume is a ``CInterval`` ("certified ± e", ADR-0019) —
     exact (zero-width) whenever nothing was trimmed.
 
+    OPEN branches — curves that leave a face through its border, the
+    unavoidable shape of a loft × loft boolean (two z-fibered solids
+    can never meet in a closed single-face-pair loop) — are assembled
+    when every operand they cross carries proven seam topology
+    (``PatchSolid.seams``, emitted by
+    :meth:`forgekernel.loft.LoftSolid.to_patches`): each seam crossing
+    is canonicalized to ONE certified vertex transferred across the
+    seam by exact control-point equality, chains glue across the other
+    operand's seams, and kept faces carry full border loops so the
+    exact pairing audit closes over seam edges too.
+
     Refuses by name (never a wrong shell): tangent contact
-    (:class:`~forgekernel.ssi.SsiCellUncertified`), open/unstitchable
-    branches (:class:`~forgekernel.ssi.TrimLoopUnstitchable` or
-    ``open_branch``), rational/multi-span/inward operands, unresolvable
-    regions, and the empty result (:class:`BooleanUnsupported`)."""
-    from forgekernel.ssi import ssi_strips, ssi_trim_loops
+    (:class:`~forgekernel.ssi.SsiCellUncertified`), unstitchable chains
+    (:class:`~forgekernel.ssi.TrimLoopUnstitchable`), open branches over
+    a seamless operand (``open_branch``), invalid/unmatched seam
+    topology, rational/multi-span/inward operands, unresolvable regions,
+    and the empty result (:class:`BooleanUnsupported`)."""
+    from forgekernel.ssi import ssi_chains, ssi_strips
     from forgekernel.trimshell import TrimmedShell, TrimVertex
 
     if op not in _BOOL_KEEP_INSIDE:
@@ -1099,42 +1617,66 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
 
     strips: dict = {("A", i): set() for i in range(len(fa))}
     strips.update({("B", j): set() for j in range(len(fb))})
-    chains: dict = {key: [] for key in strips}
+    recs: list = []
     for i, sa in enumerate(fa):
         for j, sb in enumerate(fb):
             a_cells, b_cells = ssi_strips(sa, sb, depth, use_rust=use_rust)
             if not a_cells:
                 continue                      # certified non-intersection
-            res = ssi_trim_loops(sa, sb, depth, use_rust=use_rust)
-            for loop in res["loops"]:
-                if not loop["closed"]:
-                    raise BooleanUnsupported(
-                        "open_branch",
-                        f"the intersection of face A{i} and face B{j} "
-                        f"leaves a parameter domain through its border — "
-                        f"a stitched loop's border segments would need "
-                        f"pairing with the operand's own seam edges, "
-                        f"which is unbuilt; refusing rather than ship an "
-                        f"unauditable shell")
-                verts = [TrimVertex() for _ in loop["points"]]
-                chains[("A", i)].append(
-                    (verts, [(p[0], p[1]) for p in loop["points"]]))
-                chains[("B", j)].append(
-                    (verts, [(p[2], p[3]) for p in loop["points"]]))
+            res = ssi_chains(sa, sb, depth, use_rust=use_rust)
+            for ch in res["chains"]:
+                recs.append({"pair": (i, j), "pts": list(ch["points"]),
+                             "verts": [TrimVertex() for _ in ch["points"]],
+                             "closed": ch["closed"], "ends": ch["ends"]})
             strips[("A", i)] |= a_cells
             strips[("B", j)] |= b_cells
+
+    open_recs = [r for r in recs if not r["closed"]]
+    topo_a = topo_b = None
+    if open_recs:
+        needs = {X: any(end is not None and end[0] == X
+                        for r in open_recs for end in r["ends"])
+                 for X in ("A", "B")}
+        for X, solid, flist in (("A", A, fa), ("B", B, fb)):
+            if not needs[X]:
+                continue
+            if getattr(solid, "seams", None) is None:
+                raise BooleanUnsupported(
+                    "open_branch",
+                    f"an intersection curve leaves a face of operand {X} "
+                    f"through its border, and the operand carries no "
+                    f"seam topology (PatchSolid.seams is None) — border "
+                    f"segments can only be paired with declared, "
+                    f"control-point-proven seam edges (LoftSolid."
+                    f"to_patches emits them); refusing rather than ship "
+                    f"an unauditable shell")
+            topo = _SeamTopology(X, flist, solid.seams)
+            if X == "A":
+                topo_a = topo
+            else:
+                topo_b = topo
+        _canonicalize_crossings(open_recs, {"A": topo_a, "B": topo_b},
+                                depth)
 
     keep_a, keep_b = _BOOL_KEEP_INSIDE[op]
     shell_a = untrimmed_shell(fa)
     shell_b = untrimmed_shell(fb)
     faces = []
-    for side, flist, keep_inside, sense, other in (
-            ("A", fa, keep_a, 1, shell_b),
-            ("B", fb, keep_b, _BOOL_B_SENSE[op], shell_a)):
+    for side_idx, side, flist, keep_inside, sense, other, topo in (
+            (0, "A", fa, keep_a, 1, shell_b, topo_a),
+            (1, "B", fb, keep_b, _BOOL_B_SENSE[op], shell_a, topo_b)):
         for i, f in enumerate(flist):
-            sf = _assemble_face(f, sense, strips[(side, i)],
-                                chains[(side, i)], keep_inside, other,
-                                depth, raycast_depth)
+            paths, cycles = _face_paths(side_idx, i, recs)
+            if topo is None:
+                # closed-loop mode: identical to the landed stage-2 path
+                sf = _assemble_face(f, sense, strips[(side, i)], cycles,
+                                    keep_inside, other, depth,
+                                    raycast_depth)
+            else:
+                sf = _assemble_face_open(f, sense, strips[(side, i)],
+                                         paths, cycles, keep_inside,
+                                         other, depth, raycast_depth,
+                                         topo, i)
             if sf is not None:
                 faces.append(sf)
     if not faces:

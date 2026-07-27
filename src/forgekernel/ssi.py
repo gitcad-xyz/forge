@@ -292,7 +292,7 @@ def _solve3f(M, b):
 
 
 def _resolve_cell_pairs(pairs, cell, newton, extra: int = _RESOLVE_LEVELS,
-                        cap: int = 256, tries: int = 8):
+                        cap: int = 256, tries: int = 8, constrained=None):
     """Certified existence/exclusion for ONE surviving cell whose first
     Newton refinement failed to certify — the test that turns a silent
     drop into a classification.
@@ -350,6 +350,29 @@ def _resolve_cell_pairs(pairs, cell, newton, extra: int = _RESOLVE_LEVELS,
             if ok and u0 <= u <= u1 and v0 <= v <= v1:
                 return ("point", (u, v, s, t))      # certified existence
         cur = nxt
+    # Last resort, tried only AFTER the whole budget (so every input that
+    # resolved before still resolves to the identical answer): a curve
+    # endpoint sitting exactly ON a domain border — e.g. the border cell
+    # of one surface touching a dyadic gridline of the other — stalls
+    # unconstrained Newton against the clamp and is no matched corner.
+    # Pin each hugged border EXACTLY (``constrained`` wraps
+    # :func:`_refine_constrained`) and let the exact residual decide.
+    if constrained is not None and cur:
+        seen = set()
+        for a, b in cur[:tries]:
+            hugged = constrained["hugged"]((a, b))
+            mid = ((a.u0 + a.u1) / 2, (a.v0 + a.v1) / 2,
+                   (b.u0 + b.u1) / 2, (b.v0 + b.v1) / 2)
+            cands = [dict(hugged)] if len(hugged) > 1 else []
+            cands += [{i: val} for i, val in hugged.items()]
+            for fixed in cands:
+                key = tuple(sorted(fixed.items()))
+                if not fixed or key in seen:
+                    continue
+                seen.add(key)
+                pt, ok, _ = constrained["solve"](mid, fixed)
+                if ok and u0 <= pt[0] <= u1 and v0 <= pt[1] <= v1:
+                    return ("point", pt)
     return ("unresolved", None)
 
 
@@ -534,8 +557,9 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
     point-bearing A-cell box to its certified (u, v, s, t), ``branches``
     clusters those cells (connected components in A's parameter domain),
     ``stats`` is {"cells", "empty_cells", "tightened"}, and ``bcells``
-    maps each point-bearing A-cell to one of its surviving B-side cell
-    boxes (used for border-proximity tolerances in B's domain)."""
+    maps each point-bearing A-cell to the LIST of its surviving B-side
+    cell boxes (border-proximity tolerances in B's domain; entry 0 is
+    the historical representative)."""
     boxes = _ssi_boxes(A, B, depth, use_rust)
     if not boxes:
         return None
@@ -545,6 +569,29 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
 
     def newton(um, vm, sm, tm, iters=12):
         return _refine_global(A, B, um, vm, sm, tm, iters)
+
+    adom, bdom = A.domain(), B.domain()
+    bounds = (tuple(map(F, adom[0])), tuple(map(F, adom[1])),
+              tuple(map(F, bdom[0])), tuple(map(F, bdom[1])))
+
+    def hugged(pair):
+        """Domain borders a surviving leaf pair's boxes sit exactly on:
+        {param index: exact border value} — the pin candidates for a
+        border-constrained certification probe."""
+        a, b = pair
+        box = (a.u0, a.u1, a.v0, a.v1, b.u0, b.u1, b.v0, b.v1)
+        out = {}
+        for i in range(4):
+            lo, hi = bounds[i]
+            if box[2 * i] == lo:
+                out[i] = lo
+            elif box[2 * i + 1] == hi:
+                out[i] = hi
+        return out
+
+    constrained = {"hugged": hugged,
+                   "solve": lambda pt, fixed: _refine_constrained(
+                       A, B, pt, fixed)}
 
     spans = None
     points: dict = {}
@@ -558,17 +605,18 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
         u, v, s, t, ok, _ = newton(um, vm, sm, tm)
         if ok:
             points[abox] = (u, v, s, t)
-            bcells[abox] = b0
+            bcells[abox] = list(bbs)
             continue
         if spans is None:
             from forgekernel.nurbs import bezier_patches
             spans = (list(bezier_patches(A)), list(bezier_patches(B)))
         grp = [(_cell_patch(spans[0], abox), _cell_patch(spans[1], bb))
                for bb in bbs]
-        verdict, pt = _resolve_cell_pairs(grp, abox, newton)
+        verdict, pt = _resolve_cell_pairs(grp, abox, newton,
+                                          constrained=constrained)
         if verdict == "point":
             points[abox] = pt
-            bcells[abox] = b0
+            bcells[abox] = list(bbs)
             tightened += 1
         elif verdict == "empty":
             empty += 1
@@ -988,13 +1036,15 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
         ends = (items[0], items[-1])
         ends_touch_border = any(
             _cell_hits_border(acell, adom)
-            or _cell_hits_border(bcells[acell], bdom)
+            or _cell_hits_border(bcells[acell][0], bdom)
             for acell, _ in ends)
         ends_adjacent = _boxes_touch_2d(items[0][0], items[-1][0])
         stitched = None
         if ends_touch_border:
-            p0 = _extend_end(A, B, chain[0], ends[0][0], bcells[ends[0][0]])
-            p1 = _extend_end(A, B, chain[-1], ends[1][0], bcells[ends[1][0]])
+            p0 = _extend_end(A, B, chain[0], ends[0][0],
+                             bcells[ends[0][0]][0])
+            p1 = _extend_end(A, B, chain[-1], ends[1][0],
+                             bcells[ends[1][0]][0])
             if p0 is not None and p1 is not None:
                 stitched = (p0, p1)
             elif not ends_adjacent:
@@ -1037,6 +1087,126 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
             f"{gap:.3g} in A's domain) and touch no border — open branch "
             f"with no certified closure; raise depth or treat as tangency")
     return {"loops": out, "empty_certified": not out, **stats}
+
+
+def _border_sides(dom, p):
+    """The side names ("u0"|"u1"|"v0"|"v1") of the domain rectangle that
+    point ``p`` lies EXACTLY on — [] for an interior point, two names for
+    a corner. Exact ℚ."""
+    (u0, u1), (v0, v1) = dom
+    u, v = F(p[0]), F(p[1])
+    out = []
+    if u == F(u0):
+        out.append("u0")
+    if u == F(u1):
+        out.append("u1")
+    if v == F(v0):
+        out.append("v0")
+    if v == F(v1):
+        out.append("v1")
+    return out
+
+
+def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
+    """SSI branches as certified CHAINS — the boolean assembly's input.
+
+    Unlike :func:`ssi_trim_loops` (which must close every branch on both
+    domains and therefore refuses a curve that leaves the OTHER surface
+    through its border), this returns each branch as it is: a closed
+    chain, or an open chain whose two ends are residual-certified border
+    crossings. Each end is classified exactly: on A's border, on B's
+    border (the side is named), or refused —
+
+    * an end on BOTH domains' borders at once refuses
+      (``seam_corner`` — a double crossing needs corner topology);
+    * an end strictly interior to both domains refuses
+      (``open_interior`` — tangential retreat, not a crossing);
+    * an end near a border with no certified crossing refuses
+      (``border_uncertified``).
+
+    Returns ``{"chains": [{"closed": bool, "points": [(u,v,s,t), …],
+    "ends": (end0, end1)}, …], "empty_certified": bool, "cells": n,
+    "empty_cells": n, "tightened": n}`` where each end is ``None`` (for
+    a closed chain) or ``("A"|"B", side)``. Every surviving SSI cell is
+    classified upstream (certified / proven empty /
+    :class:`SsiCellUncertified`)."""
+    res = _ssi_resolved(A, B, depth, use_rust)
+    if res is None:
+        return {"chains": [], "empty_certified": True, "cells": 0,
+                "empty_cells": 0, "tightened": 0}
+    points, branches, stats, bcells = res
+    adom, bdom = A.domain(), B.domain()
+    out = []
+    for bi, group in enumerate(branches):
+        items = _order_chain([(abox, points[abox]) for abox in group])
+        chain = [pt for _, pt in items]
+        if len(chain) < 3:
+            raise TrimLoopUnstitchable(
+                bi, "resolution",
+                f"only {len(chain)} certified point(s) at depth {depth} — "
+                f"too few to form a chain; raise depth")
+        ends_adjacent = _boxes_touch_2d(items[0][0], items[-1][0])
+        ends = []
+        for e, (acell, pt) in enumerate((items[0], items[-1])):
+            a_on = _border_sides(adom, pt[0:2])
+            b_on = _border_sides(bdom, pt[2:4])
+            if not a_on and not b_on:
+                touches = (_cell_hits_border(acell, adom)
+                           or any(_cell_hits_border(b, bdom)
+                                  for b in bcells[acell]))
+                if touches:
+                    p2 = _extend_end(A, B, pt, acell, bcells[acell][0])
+                    if p2 is not None:
+                        if e == 0:
+                            chain = [p2] + chain
+                        else:
+                            chain = chain + [p2]
+                        a_on = _border_sides(adom, p2[0:2])
+                        b_on = _border_sides(bdom, p2[2:4])
+                    elif not ends_adjacent:
+                        raise TrimLoopUnstitchable(
+                            bi, "border_uncertified",
+                            "open chain end near a domain border but no "
+                            "residual-certified border crossing was found")
+            if a_on and b_on:
+                raise TrimLoopUnstitchable(
+                    bi, "seam_corner",
+                    f"chain end lies on A's border ({a_on[0]}) AND B's "
+                    f"border ({b_on[0]}) at once — a double crossing "
+                    f"needs corner topology; refusing to guess")
+            if len(a_on) > 1 or len(b_on) > 1:
+                raise TrimLoopUnstitchable(
+                    bi, "seam_corner",
+                    "chain end lies exactly on a domain corner")
+            if a_on:
+                ends.append(("A", a_on[0]))
+            elif b_on:
+                ends.append(("B", b_on[0]))
+            else:
+                ends.append(None)
+        # drop exact consecutive repeats introduced by border extension
+        chain = [p for i, p in enumerate(chain) if i == 0 or p != chain[i - 1]]
+        if ends[0] is None and ends[1] is None:
+            if not ends_adjacent:
+                gap = sum((float(chain[0][i] - chain[-1][i])) ** 2
+                          for i in (0, 1)) ** 0.5
+                raise TrimLoopUnstitchable(
+                    bi, "open_interior",
+                    f"chain ends are non-adjacent interior cells "
+                    f"(parameter gap {gap:.3g} in A's domain) and touch "
+                    f"no border — no certified closure")
+            out.append({"closed": True, "points": chain,
+                        "ends": (None, None)})
+            continue
+        if ends[0] is None or ends[1] is None:
+            raise TrimLoopUnstitchable(
+                bi, "open_interior",
+                "one chain end crosses a border but the other ends "
+                "strictly interior to both domains — the curve ends "
+                "mid-face; refusing to guess a closure")
+        out.append({"closed": False, "points": chain,
+                    "ends": (ends[0], ends[1])})
+    return {"chains": out, "empty_certified": not out, **stats}
 
 
 def polyline(points_xyz):

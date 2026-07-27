@@ -296,7 +296,74 @@ def split_trim_region(surface, loops):
             a, b = lp[k], lp[(k + 1) % m]
             if a != b:
                 raw.append((a, b))
+    return _partition_raw(((u0, u1), (v0, v1)), raw)
 
+
+def split_domain_by_paths(surface, paths, loops=()):
+    """Exact-ℚ partition of a face's parameter domain by OPEN trim paths
+    (each anchored on the domain border at both ends) plus optional
+    closed loops — the arrangement an open-branch boolean face runs on.
+
+    ``paths`` are polylines with exact rational vertices whose first and
+    last vertex lie EXACTLY on the domain border (certified border
+    crossings from :func:`forgekernel.ssi.ssi_chains`, canonicalized by
+    the boolean assembly); ``loops`` are closed as in
+    :func:`split_trim_region`. The domain border is part of the
+    subdivision, so the traced regions PARTITION the domain — Σ region
+    areas == domain area, audited in exact ℚ. Paths and loops must not
+    properly cross; a crossing refuses by name."""
+    dom = surface.domain() if hasattr(surface, "domain") else surface
+    (u0, u1), (v0, v1) = ((F(dom[0][0]), F(dom[0][1])),
+                          (F(dom[1][0]), F(dom[1][1])))
+    pts_paths = [[_as_uv(p) for p in path] for path in paths]
+    for i, path in enumerate(pts_paths):
+        if len(path) < 2:
+            raise ValueError(
+                f"split_domain_by_paths: path {i} needs >= 2 vertices")
+        for (u, v) in path:
+            if not (u0 <= u <= u1 and v0 <= v <= v1):
+                raise ValueError(
+                    f"split_domain_by_paths: path {i} vertex ({u},{v}) "
+                    f"lies outside the parameter domain")
+        for p in (path[0], path[-1]):
+            on = (p[0] == u0 or p[0] == u1 or p[1] == v0 or p[1] == v1)
+            if not on:
+                raise ValueError(
+                    f"split_domain_by_paths: path {i} end ({p[0]},{p[1]}) "
+                    f"is not on the domain border — an open trim path "
+                    f"must enter and leave through the border")
+    lps = [[_as_uv(p) for p in lp] for lp in loops]
+    for i, lp in enumerate(lps):
+        if len(lp) < 3:
+            raise ValueError(
+                f"split_domain_by_paths: loop {i} needs >= 3 vertices")
+        for (u, v) in lp:
+            if not (u0 <= u <= u1 and v0 <= v <= v1):
+                raise ValueError(
+                    f"split_domain_by_paths: loop {i} vertex ({u},{v}) "
+                    f"lies outside the parameter domain")
+
+    corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    raw = [(corners[k], corners[(k + 1) % 4]) for k in range(4)]
+    for path in pts_paths:
+        for a, b in zip(path, path[1:]):
+            if a != b:
+                raw.append((a, b))
+    for lp in lps:
+        m = len(lp)
+        for k in range(m):
+            a, b = lp[k], lp[(k + 1) % m]
+            if a != b:
+                raw.append((a, b))
+    return _partition_raw(((u0, u1), (v0, v1)), raw)
+
+
+def _partition_raw(dom, raw):
+    """Shared arrangement core: split raw segments at all incident
+    vertices, dedupe, refuse proper crossings and dangling edges, trace
+    faces with exact predicates, attach holes, audit Σ areas == domain
+    area. See :func:`split_trim_region` for the contract."""
+    (u0, u1), (v0, v1) = dom
     verts = set()
     for a, b in raw:
         verts.add(a)

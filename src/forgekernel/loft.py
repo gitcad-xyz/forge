@@ -95,6 +95,79 @@ def _poly_integ01(a):
     return sum(ci / (i + 1) for i, ci in enumerate(a))
 
 
+def _bernstein3(c):
+    """Cubic power-basis coefficients [c0..c3] → the four Bernstein
+    control values [b0..b3] of the same polynomial on [0,1]. Exact ℚ."""
+    c0, c1, c2, c3 = (c + [F(0)] * 4)[:4]
+    return [c0,
+            c0 + c1 / 3,
+            c0 + 2 * c1 / 3 + c2 / 3,
+            c0 + c1 + c2 + c3]
+
+
+def _shoelace(loop):
+    s = F(0)
+    m = len(loop)
+    for k in range(m):
+        (ax, ay), (bx, by) = loop[k], loop[(k + 1) % m]
+        s += ax * by - bx * ay
+    return s / 2
+
+
+def _strictly_convex_ccw(loop) -> bool:
+    m = len(loop)
+    for k in range(m):
+        a, b, c = loop[k], loop[(k + 1) % m], loop[(k + 2) % m]
+        cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        if cr <= 0:
+            return False
+    return True
+
+
+def _side_cps(patch, side):
+    """The exact 3D control points of one border side of a Bézier patch,
+    as a tuple — the side's Bézier curve (identical parameterization to
+    the patch's own border parameter)."""
+    if side == "u0":
+        return tuple(patch.cp[0][j] for j in range(patch.nv))
+    if side == "u1":
+        return tuple(patch.cp[-1][j] for j in range(patch.nv))
+    if side == "v0":
+        return tuple(patch.cp[i][0] for i in range(patch.nu))
+    return tuple(patch.cp[i][-1] for i in range(patch.nu))
+
+
+def _derive_seams(patches):
+    """Match every face side to the unique other side carrying the SAME
+    3D Bézier curve (control points exactly equal, or exactly reversed
+    → ``flip``). This is derivation-by-exact-equality, not bookkeeping:
+    the emitted seam topology is *proven* against the control nets, so
+    a boolean may later transfer certified points across a seam exactly.
+    Raises when any side is degenerate, unmatched, or matched more than
+    once — a skin whose topology cannot be proven emits no seams."""
+    sides = {}
+    for fi, p in enumerate(patches):
+        for s in ("u0", "u1", "v0", "v1"):
+            crv = _side_cps(p, s)
+            if len(set(crv)) == 1:
+                raise ValueError(f"degenerate side {s} of face {fi}")
+            sides[(fi, s)] = crv
+    buckets: dict = {}
+    for key, crv in sides.items():
+        canon = min(crv, tuple(reversed(crv)))
+        buckets.setdefault(canon, []).append(key)
+    seams = []
+    for canon, keys in sorted(buckets.items()):
+        if len(keys) != 2:
+            raise ValueError(
+                f"side curve shared by {len(keys)} face side(s), not 2: "
+                f"{sorted(keys)}")
+        ka, kb = sorted(keys)
+        flip = sides[ka] != sides[kb]
+        seams.append((ka, kb, flip))
+    return tuple(seams)
+
+
 class LoftSolid:
     """Exact-volume smooth loft through ``sections`` = [(loop, z), …] with
     equal vertex counts. ``loop`` is a list of (x, y)."""
@@ -168,6 +241,94 @@ class LoftSolid:
         if Vs == 0:
             raise ValueError("loft: degenerate (zero signed volume)")
         return (Ix / Vs, Iy / Vs, Iz / Vs)
+
+    def to_patches(self):
+        """The loft's EXACT Bézier skin as an outward-oriented
+        :class:`~forgekernel.bsolid.PatchSolid` — K7 gap 8, the piece
+        that lets two lofted solids meet the freeform boolean.
+
+        The boundary is already piecewise-polynomial: each wall (one
+        section-polygon edge × one spline segment) is the ruled surface
+        between two per-vertex natural-spline curves — a degree (1, 3)
+        Bézier patch whose control points are the spline coefficients in
+        Bernstein form — and the caps are planar (one bilinear quad for
+        strictly convex 4-gon sections, a triangle fan otherwise). No
+        approximation anywhere: the skin's divergence-theorem volume
+        equals :meth:`volume` as one exact rational.
+
+        For convex quad sections the returned solid also carries
+        ``seams`` — the side-gluing topology proven by exact 3D
+        control-point equality (see
+        :class:`~forgekernel.bsolid.PatchSolid`) — which the boolean
+        assembly needs to pair trim edges across face borders. Fan caps
+        have degenerate patch sides, so those skins ship ``seams=None``
+        (volume stays exact; open-branch booleans refuse by name).
+
+        Wall faces come first, segment-major (``wall(j, seg)`` at index
+        ``seg·m + j``), then bottom cap face(s), then top."""
+        from forgekernel.bsolid import PatchSolid
+        from forgekernel.nurbs import bezier_surface
+
+        areas = [_shoelace(loop) for loop, _ in self.sections]
+        if any(a == 0 for a in areas):
+            raise ValueError("loft to_patches: a section has zero area")
+        if len({a > 0 for a in areas}) != 1:
+            raise ValueError(
+                "loft to_patches: sections with mixed orientation — the "
+                "skin's outward normals would be inconsistent; orient "
+                "every section loop the same way")
+        sections = self.sections
+        if areas[0] < 0:                    # normalize to CCW → outward walls
+            sections = [(list(reversed(loop)), z) for loop, z in sections]
+
+        m, n = self.m, self.n
+        xs = [[sections[k][0][j][0] for k in range(n)] for j in range(m)]
+        ys = [[sections[k][0][j][1] for k in range(n)] for j in range(m)]
+        zs = [sections[k][1] for k in range(n)]
+        Mx = [natural_spline_M(xs[j]) for j in range(m)]
+        My = [natural_spline_M(ys[j]) for j in range(m)]
+        Mz = natural_spline_M(zs)
+
+        patches = []
+        for seg in range(n - 1):
+            bz = _bernstein3(_seg_cubic(zs[seg], zs[seg + 1],
+                                        Mz[seg], Mz[seg + 1]))
+            curves = []
+            for j in range(m):
+                bx = _bernstein3(_seg_cubic(xs[j][seg], xs[j][seg + 1],
+                                            Mx[j][seg], Mx[j][seg + 1]))
+                by = _bernstein3(_seg_cubic(ys[j][seg], ys[j][seg + 1],
+                                            My[j][seg], My[j][seg + 1]))
+                curves.append([(bx[k], by[k], bz[k]) for k in range(4)])
+            for j in range(m):
+                # ruled wall: u across the section edge j→j+1 (CCW), v up
+                # the segment; S_u×S_v = (CCW tangent)×(up) points outward
+                patches.append(bezier_surface([curves[j],
+                                               curves[(j + 1) % m]]))
+
+        bot = [(x, y, zs[0]) for (x, y) in sections[0][0]]
+        top = [(x, y, zs[-1]) for (x, y) in sections[-1][0]]
+        convex4 = (m == 4 and _strictly_convex_ccw(sections[0][0])
+                   and _strictly_convex_ccw(sections[-1][0]))
+        if convex4:
+            q, p = bot, top
+            # bottom: S_u×S_v = (Q3−Q0)×(Q1−Q0) → −z (outward, down)
+            patches.append(bezier_surface([[q[0], q[1]], [q[3], q[2]]]))
+            # top: S_u×S_v = (P1−P0)×(P3−P0) → +z (outward, up)
+            patches.append(bezier_surface([[p[0], p[3]], [p[1], p[2]]]))
+        else:
+            # planar triangle fans (degenerate bilinear patches): the flux
+            # stays exact and signed, so overlapping fan triangles of a
+            # non-convex section cancel exactly in the volume
+            for k in range(1, m - 1):
+                patches.append(bezier_surface(
+                    [[bot[0], bot[0]], [bot[k + 1], bot[k]]]))    # −z out
+            for k in range(1, m - 1):
+                patches.append(bezier_surface(
+                    [[top[0], top[0]], [top[k], top[k + 1]]]))    # +z out
+
+        seams = _derive_seams(patches) if convex4 else None
+        return PatchSolid(patches, seams=seams)
 
     def bbox_f(self):
         lo = [float("inf")] * 3
