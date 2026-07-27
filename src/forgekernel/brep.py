@@ -571,26 +571,263 @@ def prismatoid(bottom: list[tuple], z0, top: list[tuple], z1,
     return Solid(polys)
 
 
-def draft_box(solid: Solid, t: Fraction, neutral_z: Fraction) -> Solid:
-    """Draft ALL four vertical faces of an axis-aligned rectangular prism
-    into a frustum, exact. Inset at height z is (z-neutral_z)*t on each
-    side. General (non-rectangular) prism draft arrives at K2.3."""
-    lo, hi = solid.bbox()
-    x0, y0, z0 = lo
-    x1, y1, z1 = hi
-    # verify rectangular footprint: all vertices at the 4 xy corners
-    corners = {(x0, y0), (x1, y0), (x1, y1), (x0, y1)}
-    for p in solid.polys:
-        for vx, vy, _vz in p.verts:
-            if (vx, vy) not in corners:
-                raise ValueError("draft of a non-rectangular prism arrives at K2.3")
+def _rational_sqrt(q: Fraction) -> Fraction | None:
+    """√q as an exact Fraction when q is a square in ℚ, else None."""
+    import math as _m
 
-    def rect(z):
-        d = (z - neutral_z) * t
-        return [(x0 + d, y0 + d), (x1 - d, y0 + d),
-                (x1 - d, y1 - d), (x0 + d, y1 - d)]
+    if q < 0:
+        return None
+    n, d = q.numerator, q.denominator
+    rn, rd = _m.isqrt(n), _m.isqrt(d)
+    return Fraction(rn, rd) if rn * rn == n and rd * rd == d else None
 
-    return prismatoid(rect(z0), z0, rect(z1), z1, "draft")
+
+def _prism_footprint(solid: Solid) -> tuple[list[tuple], Fraction, Fraction]:
+    """Recover ``(ccw_loop, z0, z1)`` from a Solid that is EXACTLY the +z
+    extrusion of one simple polygon — verified by REBUILDING the claimed
+    prism and requiring the exact symmetric difference to be empty.
+
+    The predecessor gate here only checked that every vertex sat on one of
+    the 4 bbox xy-corners, which a triangular prism over 3 bbox corners
+    satisfies — it was then silently drafted as the FULL-BOX frustum (the
+    §10 ``_box_check`` defect class: a subset test standing in for an
+    equality test). The footprint itself is now the gate.
+    """
+    from forgekernel import csg
+
+    zs = sorted({v[2] for p in solid.polys for v in p.verts})
+    if len(zs) != 2:
+        raise ValueError(
+            "draft: solid is not a prism (vertices at more than two z "
+            "levels) — general drafted solids arrive at K2.3")
+    z0, z1 = zs
+    # bottom-cap fragments: polys entirely at z0 (walls span both levels)
+    bottom = [p for p in solid.polys if all(v[2] == z0 for v in p.verts)]
+    if not bottom:
+        raise ValueError("draft: no bottom cap found — arrives at K2.3")
+    # union boundary of the cap = directed xy edges that do not cancel
+    net: dict[tuple, int] = {}
+    for p in bottom:
+        n = len(p.verts)
+        for i in range(n):
+            a, b = p.verts[i], p.verts[(i + 1) % n]
+            e = ((a[0], a[1]), (b[0], b[1]))
+            r = (e[1], e[0])
+            if net.get(r, 0) > 0:
+                net[r] -= 1
+            else:
+                net[e] = net.get(e, 0) + 1
+    boundary = [e for e, c in net.items() if c > 0]
+    if any(c > 1 for c in net.values()):
+        raise ValueError(
+            "draft: non-manifold footprint boundary — arrives at K2.3")
+    nxt = {}
+    for a, b in boundary:
+        if a in nxt:
+            raise ValueError(
+                "draft: footprint with holes or multiple loops arrives "
+                "at K2.3")
+        nxt[a] = b
+    start = boundary[0][0]
+    loop, cur = [start], nxt[start]
+    while cur != start:
+        loop.append(cur)
+        cur = nxt.get(cur)
+        if cur is None or len(loop) > len(boundary):
+            raise ValueError(
+                "draft: footprint boundary does not close into one loop — "
+                "arrives at K2.3")
+    if len(loop) != len(boundary):
+        raise ValueError(
+            "draft: footprint with holes or multiple loops arrives at K2.3")
+    if _loop_area2(loop) < 0:
+        loop.reverse()
+    # merge consecutive collinear edges (same carrier, same sense) so a
+    # wall split by an authoring midpoint is one logical footprint edge
+    merged: list[tuple] = []
+    m = len(loop)
+    for i in range(m):
+        p0, p1, p2 = loop[i - 1], loop[i], loop[(i + 1) % m]
+        d1 = (p1[0] - p0[0], p1[1] - p0[1])
+        d2 = (p2[0] - p1[0], p2[1] - p1[1])
+        crossz = d1[0] * d2[1] - d1[1] * d2[0]
+        if crossz == 0:
+            if d1[0] * d2[0] + d1[1] * d2[1] <= 0:
+                raise ValueError(
+                    "draft: zero-width spike in the footprint — arrives "
+                    "at K2.3")
+            continue                      # collinear same-sense: drop p1
+        merged.append(p1)
+    if len(merged) < 3:
+        raise ValueError("draft: degenerate footprint — arrives at K2.3")
+    # THE GATE: the solid must equal the extrusion of its own footprint,
+    # exactly (empty symmetric difference), not merely resemble it
+    rebuilt = Solid.prism(merged, z1 - z0).translated((F(0), F(0), z0))
+    if csg.cut(solid, rebuilt).volume() != 0 or \
+            csg.cut(rebuilt, solid).volume() != 0:
+        raise ValueError(
+            "draft: solid is not the extrusion of its bottom footprint — "
+            "general drafted solids arrive at K2.3")
+    return merged, z0, z1
+
+
+def draft_prism(solid: Solid, t, neutral_z=None, parting_z=None,
+                drafted_walls=None) -> Solid:
+    """Draft the vertical walls of an extruded prism about pull +z — exact.
+
+    ``t`` is the RATIONAL TANGENT of the draft angle (the spec; degree sugar
+    lives in ``kernel.draft``). Each drafted wall's carrier line moves inward
+    by ``d(z) = (z − neutral_z)·t`` for a single pull, or by
+    ``d(z) = |z − parting_z|·t`` for a parting-line draft — the wall splits
+    at the parting plane into two half-drafts and the section is widest AT
+    that plane. Note a neutral plane above the base gives d < 0 below it:
+    the taper is a transform, not a cut, so material is ADDED outside the
+    original footprint there (flare) — intentional, mold-maker semantics.
+
+    ``drafted_walls``: ``None`` drafts every wall; otherwise an iterable of
+    frozensets of the two xy endpoints naming each wall to draft.
+
+    Exact-field membership (why the guards are shaped this way): with every
+    footprint edge axis-aligned the drafted planes have normals like
+    (1, 0, ±t) and every inset vertex re-solves rationally — pure ℚ. A
+    non-axis-aligned edge direction (dx, dy) needs the unit normal
+    √(dx²+dy²): rational only for Pythagorean directions, one radical
+    (SurdVal) otherwise — both arrive at K2.3.
+    """
+    from forgekernel import csg
+
+    t = F(t)
+    if not isinstance(t, Fraction):
+        raise ValueError(
+            "draft tangent must be rational (ℚ) — surd tangents arrive "
+            "with the general tower (K2.3)")
+    loop, z0, z1 = _prism_footprint(solid)
+    n = len(loop)
+    dirs = []
+    for i in range(n):
+        (x1_, y1_), (x2_, y2_) = loop[i], loop[(i + 1) % n]
+        dx, dy = x2_ - x1_, y2_ - y1_
+        if dx != 0 and dy != 0:
+            if _rational_sqrt(dx * dx + dy * dy) is not None:
+                raise ValueError(
+                    f"draft: Pythagorean-direction footprint edge "
+                    f"({float(dx):g},{float(dy):g}) stays in ℚ but the "
+                    "rational-miter inset arrives at K2.3")
+            raise ValueError(
+                f"draft: footprint edge direction ({float(dx):g},"
+                f"{float(dy):g}) needs √(dx²+dy²) — leaves ℚ for ℚ[√d] "
+                "(SurdVal/BiSurd tower), arrives at K2.3")
+        dirs.append((dx, dy))
+    # which walls draft?
+    if drafted_walls is None:
+        flags = [True] * n
+    else:
+        wanted = list(dict.fromkeys(frozenset(w) for w in drafted_walls))
+        if not wanted:
+            raise ValueError(
+                "draft of zero walls is the identity — name at least one "
+                "wall, or pass None to draft them all")
+        edge_sets = [frozenset({loop[i], loop[(i + 1) % n]})
+                     for i in range(n)]
+        flags = [False] * n
+        for w in wanted:
+            try:
+                flags[edge_sets.index(w)] = True
+            except ValueError:
+                raise ValueError(
+                    "draft: selected wall does not match a footprint edge "
+                    "of this prism (collinear-split walls arrive at K2.3)")
+    # neutral / parting bands: list of (z_lo, z_hi, d(z_lo), d(z_hi))
+    if parting_z is not None:
+        zp = F(parting_z)
+        if not z0 < zp < z1:
+            raise ValueError(
+                f"draft: parting plane z={float(zp):g} must lie strictly "
+                f"inside the prism z∈({float(z0):g},{float(z1):g})")
+        bands = [(z0, zp, t * (zp - z0), F(0)),
+                 (zp, z1, F(0), t * (z1 - zp))]
+    else:
+        nz = F(0) if neutral_z is None else F(neutral_z)
+        bands = [(z0, z1, t * (z0 - nz), t * (z1 - nz))]
+    d_extremes = [d for b in bands for d in (b[2], b[3])]
+    d_max_abs = max(abs(d) for d in d_extremes)
+
+    def inset(d: Fraction) -> list[tuple]:
+        # each edge's carrier moves +d along its inward normal (CCW left)
+        carriers = []                     # ('x'|'y', coordinate)
+        for i in range(n):
+            dx, dy = dirs[i]
+            off = d if flags[i] else F(0)
+            if dy == 0:                   # horizontal: inward is (0, ±1)
+                carriers.append(("y", loop[i][1] + (off if dx > 0 else -off)))
+            else:                         # vertical: inward is (∓1, 0)
+                carriers.append(("x", loop[i][0] + (-off if dy > 0 else off)))
+        out = []
+        for i in range(n):
+            a, b = carriers[i - 1], carriers[i]   # vertex between edges
+            if a[0] == b[0]:              # cannot happen post-merge
+                raise ValueError(
+                    "draft: consecutive parallel footprint edges — arrives "
+                    "at K2.3")
+            x = a[1] if a[0] == "x" else b[1]
+            y = a[1] if a[0] == "y" else b[1]
+            out.append((x, y))
+        return out
+
+    # GUARDS — exact, and refusals name the measured distance-to-event.
+    # (1) no edge may collapse or flip anywhere in the band: each inset
+    # vertex coordinate is affine in d, so signed length along the original
+    # direction is affine in d and positivity at the band extremes is
+    # positivity throughout.
+    for d in d_extremes:
+        if d == 0:
+            continue
+        ring = inset(d)
+        for i in range(n):
+            dx, dy = dirs[i]
+            v = (ring[(i + 1) % n][0] - ring[i][0],
+                 ring[(i + 1) % n][1] - ring[i][1])
+            signed = v[0] * dx + v[1] * dy
+            if signed <= 0:
+                orig = abs(dx) + abs(dy)          # axis-aligned length
+                raise ValueError(
+                    f"draft consumes footprint edge {i} (length "
+                    f"{float(orig):g} shrinks past zero at draft depth "
+                    f"d={float(d):g}) — reduce the tangent or the band "
+                    "height, or exclude the edge")
+        if _loop_area2(ring) <= 0:
+            raise ValueError(
+                "draft consumes the whole footprint at depth "
+                f"d={float(d):g} — reduce the tangent or the band height")
+    # (2) simplicity, conservatively: every inset vertex moves ≤ d_max in
+    # L∞, so if every pair of NON-ADJACENT original edges is farther apart
+    # than 2·d_max in L∞ no new crossing can appear at any depth. Exact:
+    # axis-aligned segments have rational L∞ gaps.
+    if d_max_abs > 0:
+        segs = []
+        for i in range(n):
+            (ax, ay), (bx, by) = loop[i], loop[(i + 1) % n]
+            segs.append((min(ax, bx), max(ax, bx), min(ay, by), max(ay, by)))
+        for i in range(n):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue              # adjacent around the loop
+                sa, sb = segs[i], segs[j]
+                gx = max(sa[0] - sb[1], sb[0] - sa[1], F(0))
+                gy = max(sa[2] - sb[3], sb[2] - sa[3], F(0))
+                gap = max(gx, gy)
+                if gap <= 2 * d_max_abs:
+                    raise ValueError(
+                        f"draft moves non-adjacent walls (edges {i},{j}) "
+                        f"within touching range: gap {float(gap):g} ≤ "
+                        f"2·d_max {float(2 * d_max_abs):g} — reduce the "
+                        "tangent or the band height")
+    pieces = [prismatoid(inset(d_lo), lo_z, inset(d_hi), hi_z, "draft")
+              for lo_z, hi_z, d_lo, d_hi in bands]
+    out = pieces[0]
+    for piece in pieces[1:]:
+        out = csg.union(out, piece)
+    return out
 
 
 def shell_box(solid: Solid, thickness) -> Solid:

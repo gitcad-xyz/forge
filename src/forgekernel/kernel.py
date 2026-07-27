@@ -135,15 +135,29 @@ def chamfer(s: Solid, distance) -> Solid:
     return chamfer_planar(s, distance, logical_edges(s))
 
 
-def draft(s: Solid, angle_deg: float, neutral_z=0, faces=None) -> Solid:
-    """Draft vertical faces by angle (tan converted exactly at input)."""
+def draft(s: Solid, angle_deg: float | None = None, neutral_z=0, *,
+          tan=None, parting_z=None) -> Solid:
+    """Draft the vertical walls of a prism about pull +z.
+
+    ``tan`` — the exact rational tangent of the draft angle — is the spec;
+    ``angle_deg`` is sugar that snaps to the exact binary Fraction of a FLOAT
+    tangent (denominator ~2^57 — fine for display, not for a contract).
+    ``parting_z`` splits every wall into two half-drafts meeting at the
+    parting plane (which is then the neutral plane). Wall selection is a
+    seam-level concern (face ids live above the kernel): use
+    ``brep.draft_prism(drafted_walls=...)`` directly for a subset.
+    """
     import math as _m
 
-    from forgekernel.brep import draft_box
+    from forgekernel.brep import draft_prism
     from forgekernel.exact import F
 
-    t = F(_m.tan(_m.radians(angle_deg)))
-    return draft_box(s, t, F(neutral_z))
+    if (angle_deg is None) == (tan is None):
+        raise ValueError(
+            "draft wants exactly one of angle_deg (float sugar) or tan "
+            "(the exact rational tangent)")
+    t = F(tan) if tan is not None else F(_m.tan(_m.radians(angle_deg)))
+    return draft_prism(s, t, neutral_z=neutral_z, parting_z=parting_z)
 
 
 def shell(s: Solid, thickness) -> Solid:

@@ -352,6 +352,126 @@ def test_draft_nonrect_refuses() -> None:
         draft(tri, 3.0)
 
 
+def test_draft_of_prism_on_bbox_corners_refuses() -> None:
+    """#133 defect regression: the old gate only checked that every vertex sat
+    on one of the 4 bbox xy-corners, so a TRIANGULAR prism over 3 of them
+    passed and came back as the FULL-BOX frustum — 218.26 of drafted solid
+    from 120.0 of material, silently. The gate must be the footprint itself,
+    not a corner subset."""
+    import pytest as _pytest
+
+    from forgekernel.brep import Solid
+    from forgekernel.kernel import draft
+
+    tri = Solid.prism([(0, 0), (10, 0), (10, 6)], 4)   # all verts ON corners
+    with _pytest.raises(ValueError, match="K2.3"):
+        draft(tri, 5.0)
+
+
+def test_draft_L_prism_matches_independent_closed_form() -> None:
+    """Rectilinear single-pull draft stays in ℚ. Oracle is the closed form
+    derived from the inset-area identity A(d) = A − P·d + 4d² (the 4 is
+    n_convex − n_reflex, forced by Σturning = 360°), integrated in z:
+    V = A(b−a) − (P·t/2)(b²−a²) + (4/3)t²(b³−a³) — computed HERE from the
+    loop's literal A and P, never from kernel output."""
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Solid, draft_prism
+
+    loop = [(0, 0), (9, 0), (9, 3), (4, 3), (4, 7), (0, 7)]
+    A, P, H, t = Q(43), Q(32), Q(4), Q(1, 8)   # A,P by hand from the loop
+    d = draft_prism(Solid.prism(loop, H), t, neutral_z=0)
+    closed = A * H - (P * t / 2) * H ** 2 + Q(4, 3) * t ** 2 * H ** 3
+    assert d.volume() == closed
+    assert d.watertight_violations() == []
+
+
+def test_draft_parting_line_splits_into_two_half_drafts() -> None:
+    """Parting plane mid-face: each wall splits at z=z_p into two half-drafts,
+    inset d(z) = t·|z−z_p|, widest section AT the parting plane. Oracle:
+    V = A·H − (P·t/2)(p²+q²) + (4/3)t²(p³+q³), p below / q above the plane.
+    The shared coplanar face of the two glued prismatoids is load-bearing —
+    pinned by the exact volume AND the watertightness check (trap 7)."""
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Solid, draft_prism
+
+    A, P, t, zp = Q(60), Q(32), Q(1, 10), Q(3, 2)
+    d = draft_prism(Solid.box(10, 6, 4), t, parting_z=zp)
+    p, q = zp, 4 - zp
+    closed = A * 4 - (P * t / 2) * (p ** 2 + q ** 2) \
+        + Q(4, 3) * t ** 2 * (p ** 3 + q ** 3)
+    assert d.volume() == closed == Q(16999, 75)
+    assert d.watertight_violations() == []
+    lo, hi = d.bbox()
+    assert (lo, hi) == ((0, 0, 0), (10, 6, 4))   # widest AT the parting plane
+
+
+def test_draft_selected_walls_only() -> None:
+    """Drafting ONE wall of a box leaves the other three vertical: no corner
+    d² term (those need BOTH incident edges drafted), so the oracle is
+    V = A·H − (L·t/2)(b²−a²) for the one drafted edge of length L."""
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Solid, draft_prism
+
+    wall = frozenset({(Q(0), Q(0)), (Q(10), Q(0))})    # the y=0 wall, L=10
+    d = draft_prism(Solid.box(10, 6, 4), Q(1, 10), neutral_z=0,
+                    drafted_walls=[wall])
+    assert d.volume() == Q(240) - (Q(10) * Q(1, 10) / 2) * 16 == Q(232)
+    assert d.watertight_violations() == []
+
+
+def test_draft_guard_refuses_edge_collapse() -> None:
+    """t·H big enough to consume a wall must refuse loudly, never build the
+    ear-clipped wrong solid (the L-prism silent-topology-flip trap class)."""
+    import pytest as _pytest
+
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Solid, draft_prism
+
+    with _pytest.raises(ValueError, match="consume|collaps|gap"):
+        draft_prism(Solid.box(10, 6, 4), Q(1), neutral_z=0)   # d_max=4 > 6/2
+
+
+def test_draft_neutral_above_base_flares_by_design() -> None:
+    """A neutral plane above the base gives d < 0 below it: the taper is a
+    TRANSFORM, not a cut, so material is added outside the original
+    footprint there (trap 4 of the derivation — pinned deliberately so a
+    future 'fix' cannot silently clamp mold-maker semantics)."""
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Solid, draft_prism
+
+    d = draft_prism(Solid.box(10, 6, 4), Q(1, 10), neutral_z=1)
+    a, b = Q(-1), Q(3)                     # z0−nz, z1−nz
+    closed = Q(60) * (b - a) - (Q(32) * Q(1, 10) / 2) * (b ** 2 - a ** 2) \
+        + Q(4, 3) * Q(1, 100) * (b ** 3 - a ** 3)
+    assert d.volume() == closed == Q(17068, 75)
+    lo, _hi = d.bbox()
+    assert (lo[0], lo[1]) == (Q(-1, 10), Q(-1, 10))   # the flare, kept
+    assert d.watertight_violations() == []
+
+
+def test_draft_rational_tangent_is_the_spec() -> None:
+    """tan(1°) as a float snap has a ~2^57 denominator; the exact spec is the
+    rational tangent. kernel.draft accepts tan= and refuses the ambiguous
+    both/neither forms."""
+    import pytest as _pytest
+
+    from fractions import Fraction as Q
+
+    from forgekernel.kernel import box, draft
+
+    d = draft(box(10, 6, 4), tan=Q(1, 10))
+    assert d.volume() == Q(16144, 75)
+    with _pytest.raises(ValueError, match="exactly one"):
+        draft(box(10, 6, 4), 3.0, tan=Q(1, 10))
+    with _pytest.raises(ValueError, match="exactly one"):
+        draft(box(10, 6, 4))
+
+
 # -- W-C: shell (hollow box, exact) -------------------------------------------
 
 def test_shell_box_exact() -> None:
