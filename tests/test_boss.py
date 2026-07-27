@@ -192,6 +192,71 @@ def test_overhanging_boss_keeps_the_merged_shell_fallback() -> None:
     assert _nonmanifold(mesh) == 0
 
 
+def test_union_to_body_stitches_the_contact_disc() -> None:
+    """The canonical Body of a boss-on-plate union is ONE shell, not two.
+
+    to_body(DisjointUnion) concatenated the member bodies' faces verbatim,
+    so the canonical record itself carried the plate's full top rectangle
+    AND the boss's bottom cap — coplanar faces buried in material. The
+    seam meshes THROUGH the canonical form (ADR-0021, one mesher), so this
+    is where the buried triangles actually shipped from.
+
+    Stitched: the plate's top face gains the contact circle as an inner
+    loop (the very Circle record the boss wall's bottom rim carries, so
+    edge pairing closes) and the boss's bottom cap disk is dropped."""
+    from forgekernel import body as B
+    from forgekernel.body import Circle, Plane
+
+    plate = Solid.box(30, 30, 5)
+    boss = Cyl(15, 15, 6, 5, 15)
+    bd = B.to_body(DisjointUnion([plate, boss]))
+    assert B.manifold_violations(bd) == []
+    assert float(B.volume(bd)) == pytest.approx(30 * 30 * 5 + math.pi * 36 * 10)
+
+    # structural: exactly one planar face at z=5 — the plate top WITH a
+    # circular inner loop — and no full-disk cap face left there
+    at5 = [f for f in bd.faces if isinstance(f.surface, Plane)
+           and f.surface.n[0] == 0 and f.surface.n[1] == 0
+           and f.surface.d / f.surface.n[2] == 5]
+    assert len(at5) == 1
+    assert len(at5[0].loops) == 2
+    hole = at5[0].loops[1].edges
+    assert len(hole) == 1 and isinstance(hole[0].curve, Circle)
+    assert hole[0].curve.r == 6
+
+    # and the mesh of the canonical body buries nothing in the disc
+    mesh = B.tessellate(bd, 0.05)
+    verts = mesh["vertices"]
+    flat = [[verts[i] for i in t] for t in mesh["triangles"]
+            if all(verts[i][2] == 5.0 for i in t)]
+
+    def covered(px, py) -> int:
+        hits = 0
+        for a, b, c in flat:
+            d1 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])
+            d2 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0])
+            d3 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0])
+            if (d1 >= 0 and d2 >= 0 and d3 >= 0) or \
+               (d1 <= 0 and d2 <= 0 and d3 <= 0):
+                hits += 1
+        return hits
+    assert sum(covered(15 + dx, 15 + dy)
+               for dx in (-3.7, -1.3, 0.0, 1.9, 3.1)
+               for dy in (-3.9, -1.1, 0.7, 2.3, 3.3)) == 0
+
+
+def test_union_to_body_keeps_fallback_when_the_stitch_shape_is_absent() -> None:
+    # overhanging boss: contact is a partial disc, so the converter must
+    # keep the two closed member shells (volume still exact, still manifold)
+    from forgekernel import body as B
+
+    plate = Solid.box(30, 30, 5)
+    boss = Cyl(30, 15, 6, 5, 15)                 # centre on the plate edge
+    bd = B.to_body(DisjointUnion([plate, boss]))
+    assert B.manifold_violations(bd) == []
+    assert float(B.volume(bd)) == pytest.approx(30 * 30 * 5 + math.pi * 36 * 10)
+
+
 def test_revolve_solid_can_sit_off_axis() -> None:
     loop = [(0, 0), (2, 0), (2, 5), (0, 5)]              # a plain cylinder r=2
     at_origin, moved = RevolveSolid(loop), RevolveSolid(loop, 7, -3)

@@ -2977,6 +2977,120 @@ def lathe_body(segs, cx, cy) -> Body:
     return Body(tuple(faces))
 
 
+def _horiz_face_z(f):
+    """z of a horizontal planar face (exact), else None."""
+    if not isinstance(f.surface, Plane) or not f.loops:
+        return None
+    n = f.surface.n
+    if n[0] != 0 or n[1] != 0:
+        return None
+    return f.surface.d / n[2]
+
+
+def _disc_strictly_on_face(f, cx, cy, r) -> bool:
+    """Exact: the disc (cx, cy, radius r) lies strictly inside the face's
+    outer loop and strictly clear of every inner loop (existing holes).
+    Strictness keeps tangent contacts on the merged-shells fallback rather
+    than minting a degenerate zero-width sliver of face."""
+    from forgekernel.quadric import _dist2_point_seg
+
+    outer = f.loops[0].edges
+    if len(outer) == 1 and isinstance(outer[0].curve, Circle):
+        cc = outer[0].curve                   # a disk cap (e.g. a wider boss)
+        if cc.r <= r:
+            return False
+        if ((cx - cc.c[0]) ** 2 + (cy - cc.c[1]) ** 2) >= (cc.r - r) ** 2:
+            return False
+    else:
+        if any(isinstance(e.curve, Circle) for e in outer):
+            return False                      # mixed boundary: out of scope
+        pts = [(e.v0[0], e.v0[1]) for e in outer]
+        m = len(pts)
+        inside = False
+        for i in range(m):
+            (x1, y1), (x2, y2) = pts[i], pts[(i + 1) % m]
+            if (y1 > cy) != (y2 > cy):
+                if cx < x1 + (cy - y1) * (x2 - x1) / (y2 - y1):
+                    inside = not inside
+        if not inside:
+            return False
+        r2 = r * r
+        for i in range(m):
+            (x1, y1), (x2, y2) = pts[i], pts[(i + 1) % m]
+            if _dist2_point_seg(cx, cy, x1, y1, x2, y2) <= r2:
+                return False
+    for lp in f.loops[1:]:
+        if len(lp.edges) == 1 and isinstance(lp.edges[0].curve, Circle):
+            h = lp.edges[0].curve
+            # the disc must sit wholly on MATERIAL: strictly clear of the
+            # hole in both directions (no overlap, no containment, no touch)
+            if ((cx - h.c[0]) ** 2 + (cy - h.c[1]) ** 2) <= (r + h.r) ** 2:
+                return False
+        else:
+            return False                      # unknown hole shape: no stitch
+    return True
+
+
+def _union_stitches(members, bodies) -> list:
+    """Cap-on-face contacts inside a DisjointUnion, at the BODY level:
+    [(face_owner_idx, face_idx, cyl_idx, z)] where members[cyl_idx] is a
+    Cyl whose bottom (or top) cap sits at exactly the z of a horizontal
+    planar face of bodies[face_owner_idx] with its full disc strictly on
+    that face. All predicates exact. The union's own disjointness proof
+    guarantees the member behind such a face lies on the far side, so a
+    z + containment match IS the contact.
+
+    Anything more entangled — several discs on one face, one cap meeting
+    several faces — is dropped (both counters must read exactly one), and
+    the converter keeps the merged-shells fallback for those members."""
+    from collections import Counter
+
+    from forgekernel.quadric import Cyl
+
+    cands = []
+    for ci, c in enumerate(members):
+        if not isinstance(c, Cyl):
+            continue
+        for si, sb in enumerate(bodies):
+            if si == ci:
+                continue
+            for fi, f in enumerate(sb.faces):
+                try:
+                    z = _horiz_face_z(f)
+                    if z is None:
+                        continue
+                    if F(c.z0) == z:
+                        end = "lo"
+                    elif F(c.z1) == z:
+                        end = "hi"
+                    else:
+                        continue
+                    if not _disc_strictly_on_face(f, F(c.cx), F(c.cy),
+                                                  F(c.r)):
+                        continue
+                except (TypeError, ZeroDivisionError, AttributeError):
+                    continue                  # exotic coordinates: no stitch
+                cands.append((si, fi, ci, end, z))
+    per_face = Counter((si, fi) for si, fi, _, _, _ in cands)
+    per_cap = Counter((ci, end) for _, _, ci, end, _ in cands)
+    return [(si, fi, ci, z) for si, fi, ci, end, z in cands
+            if per_face[(si, fi)] == 1 and per_cap[(ci, end)] == 1]
+
+
+def _find_cap_disk(face_list, c, z):
+    """Index of the cylinder body's full-disk cap face at z, else None."""
+    for i, f in enumerate(face_list):
+        if f is None or not isinstance(f.surface, Plane):
+            continue
+        if len(f.loops) != 1 or len(f.loops[0].edges) != 1:
+            continue
+        e = f.loops[0].edges[0]
+        if (isinstance(e.curve, Circle) and e.curve.r == F(c.r)
+                and e.curve.c == (F(c.cx), F(c.cy), z)):
+            return i
+    return None
+
+
 def to_body(shape) -> Body:
     """Convert any forge representation to the canonical B-rep, or raise."""
     from forgekernel.brep import Solid
@@ -3007,10 +3121,33 @@ def to_body(shape) -> Body:
     if isinstance(shape, Sphere):
         return from_sphere(shape)
     if isinstance(shape, DisjointUnion):
-        faces = []
-        for m in shape.members:
-            faces.extend(to_body(m).faces)
-        return Body(tuple(faces))
+        # Concatenating the member bodies' faces verbatim left the contact
+        # patches BURIED: the flagship boss-on-plate carried the plate's
+        # full top rectangle AND the boss's bottom cap, coplanar inside
+        # material — volume and per-shell pairing stayed right while every
+        # consumer of the canonical form (the one mesher, ADR-0021) saw
+        # internal walls (W17). Where a Cyl cap sits on a member's face
+        # with its whole disc strictly on material, stitch: punch the
+        # contact circle into the face as an inner loop (the very Circle
+        # record the cylinder wall's rim carries, so edge pairing closes)
+        # and drop the buried cap disk. Everything else keeps the
+        # merged-shells fallback, honest residual until general boolean
+        # face classification lands.
+        bodies = [to_body(m) for m in shape.members]
+        face_lists = [list(b.faces) for b in bodies]
+        for si, fi, ci, z in _union_stitches(shape.members, bodies):
+            c = shape.members[ci]
+            di = _find_cap_disk(face_lists[ci], c, z)
+            if di is None:
+                continue        # unexpected cylinder body shape: no stitch
+            f = face_lists[si][fi]
+            circ = _circle_at(c.cx, c.cy, z, c.r)
+            v = (F(c.cx) + F(c.r), F(c.cy), z)
+            face_lists[si][fi] = Face(
+                f.surface, f.loops + (Loop((Edge(circ, v, v),)),), f.sense)
+            face_lists[ci][di] = None
+        return Body(tuple(f for fl in face_lists for f in fl
+                          if f is not None))
     raise ValueError(
         f"no canonical-B-rep converter for {type(shape).__name__} yet "
         "(ADR-0021 converters land per representation)")

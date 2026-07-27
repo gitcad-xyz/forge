@@ -72,8 +72,11 @@ SHAPES = [
     # neither of these has a planar base to hang topology on: both used to
     # refuse outright, which is the O(ops x reps) gap ADR-0021 removes
     ("bare cylinder", lambda: Cyl(0, 0, 5, 0, 12), 4, 6),
+    # ONE stitched shell since W17: the plate top carries the contact circle
+    # as a hole and the boss's buried bottom cap is gone — 9 faces, not the
+    # old 10 that pinned two overlapping shells with faces inside material
     ("boss", lambda: DisjointUnion([Solid.box(30, 30, 3), Cyl(15, 15, 4, 3, 9)]),
-     10, 18),
+     9, 18),
 ]
 
 
