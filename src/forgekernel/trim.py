@@ -31,6 +31,7 @@ it belongs to the later Green's-over-trim-loops step, not this type.
 from __future__ import annotations
 
 from fractions import Fraction as F
+from functools import cmp_to_key
 
 
 def _as_uv(pt):
@@ -191,3 +192,197 @@ class TrimmedPatch:
                     if _segments_properly_cross(h0, h1, o0, o1):
                         raise ValueError(
                             f"hole {i} crosses the outer boundary")
+
+
+# -- K7 gap 4: exact partition of a parameter domain by trim loops ------------
+
+def _on_closed_segment(p, a, b) -> bool:
+    """Is p exactly on the closed segment a→b? Exact ℚ."""
+    cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+    if cross != 0:
+        return False
+    return (min(a[0], b[0]) <= p[0] <= max(a[0], b[0])
+            and min(a[1], b[1]) <= p[1] <= max(a[1], b[1]))
+
+
+def _classify_in_loops(loops, u, v) -> str:
+    """Even-odd point-in-region over a list of loops — the exact rule
+    :meth:`TrimmedPatch.classify` uses, available on bare loop lists."""
+    for loop in loops:
+        m = len(loop)
+        for k in range(m):
+            if _on_closed_segment((u, v), loop[k], loop[(k + 1) % m]):
+                return "on"
+    inside = False
+    for loop in loops:
+        m = len(loop)
+        for k in range(m):
+            a, b = loop[k], loop[(k + 1) % m]
+            if (a[1] > v) != (b[1] > v):
+                x_int = a[0] + (v - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+                if u < x_int:
+                    inside = not inside
+    return "in" if inside else "out"
+
+
+def _angle_cmp(o):
+    """Exact counterclockwise angular comparator for directions out of
+    ``o``: half-plane split (angle in [0,π) before [π,2π)), then the
+    cross-product sign within a half. No trigonometry, pure ℚ."""
+    def cmp(p, q):
+        dpx, dpy = p[0] - o[0], p[1] - o[1]
+        dqx, dqy = q[0] - o[0], q[1] - o[1]
+        hp = 0 if (dpy > 0 or (dpy == 0 and dpx > 0)) else 1
+        hq = 0 if (dqy > 0 or (dqy == 0 and dqx > 0)) else 1
+        if hp != hq:
+            return hp - hq
+        cr = dpx * dqy - dpy * dqx
+        return -1 if cr > 0 else (1 if cr < 0 else 0)
+    return cmp
+
+
+def _cycle_signed_area(cyc):
+    s = F(0)
+    m = len(cyc)
+    for k in range(m):
+        a, b = cyc[k], cyc[(k + 1) % m]
+        s += a[0] * b[1] - b[0] * a[1]
+    return s / 2
+
+
+def split_trim_region(surface, loops):
+    """Exact-ℚ partition of a face's parameter domain by trim loops —
+    the polygon-with-holes split a boolean's face classification runs on.
+
+    ``surface`` is anything with ``domain()`` (or a bare
+    ``((u0,u1),(v0,v1))`` pair); ``loops`` are closed trim loops with
+    exact rational vertices — e.g. the ``loop_a`` / ``loop_b`` sides of
+    :func:`forgekernel.ssi.ssi_trim_loops`. Loops may share segments and
+    corners with the domain border (stitched open branches); they must
+    not properly cross each other or themselves — a crossing refuses by
+    name rather than guessing an arrangement.
+
+    Method: the domain border and every loop edge are split at all
+    incident vertices, deduplicated into an exact planar subdivision,
+    and the faces are traced with exact orientation predicates (angular
+    order by half-plane + cross-product sign — no floats anywhere).
+    Counterclockwise (positive-area) cycles are region outers; each
+    clockwise cycle is attached as a hole to the smallest region that
+    strictly contains it; the unbounded face is discarded.
+
+    Returns a list of regions, each a loop list ``[outer, holes…]`` in
+    the :class:`TrimmedPatch` convention (outer CCW, holes CW). The
+    regions PARTITION the domain: Σ region areas == domain area, checked
+    in exact ℚ before returning — a failed audit raises rather than
+    shipping a wrong partition."""
+    dom = surface.domain() if hasattr(surface, "domain") else surface
+    (u0, u1), (v0, v1) = ((F(dom[0][0]), F(dom[0][1])),
+                          (F(dom[1][0]), F(dom[1][1])))
+    lps = [[_as_uv(p) for p in lp] for lp in loops]
+    for i, lp in enumerate(lps):
+        if len(lp) < 3:
+            raise ValueError(f"split_trim_region: loop {i} needs >= 3 vertices")
+        for (u, v) in lp:
+            if not (u0 <= u <= u1 and v0 <= v <= v1):
+                raise ValueError(
+                    f"split_trim_region: loop {i} vertex ({u},{v}) lies "
+                    f"outside the parameter domain")
+
+    corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    raw = [(corners[k], corners[(k + 1) % 4]) for k in range(4)]
+    for lp in lps:
+        m = len(lp)
+        for k in range(m):
+            a, b = lp[k], lp[(k + 1) % m]
+            if a != b:
+                raw.append((a, b))
+
+    verts = set()
+    for a, b in raw:
+        verts.add(a)
+        verts.add(b)
+    edges = set()
+    for a, b in raw:
+        d = (b[0] - a[0], b[1] - a[1])
+        mids = [p for p in verts
+                if p != a and p != b and _on_closed_segment(p, a, b)]
+        mids.sort(key=lambda p: (p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1])
+        chain = [a] + mids + [b]
+        for x, y in zip(chain, chain[1:]):
+            if x != y:
+                edges.add((x, y) if x < y else (y, x))
+    edges = sorted(edges)
+
+    for i in range(len(edges)):
+        a, b = edges[i]
+        for j in range(i + 1, len(edges)):
+            c, d = edges[j]
+            if a in (c, d) or b in (c, d):
+                continue
+            if _segments_properly_cross(a, b, c, d):
+                raise ValueError(
+                    "split_trim_region: trim loops cross — refusing to "
+                    "guess the arrangement")
+
+    adj: dict = {}
+    for a, b in edges:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    for o, lst in adj.items():
+        if len(lst) < 2:
+            raise ValueError(
+                f"split_trim_region: dangling trim edge at ({o[0]},{o[1]})")
+        lst.sort(key=cmp_to_key(_angle_cmp(o)))
+    idx = {o: {p: i for i, p in enumerate(lst)} for o, lst in adj.items()}
+
+    # face tracing: arriving a→b, leave b along the clockwise-next edge
+    # from the reversal — every directed edge lands in exactly one cycle
+    visited = set()
+    cycles = []
+    for a in adj:
+        for b in adj[a]:
+            if (a, b) in visited:
+                continue
+            cyc = []
+            e = (a, b)
+            while e not in visited:
+                visited.add(e)
+                cyc.append(e[0])
+                x, y = e
+                lst = adj[y]
+                e = (y, lst[(idx[y][x] - 1) % len(lst)])
+            cycles.append(cyc)
+
+    pos, neg = [], []
+    for cyc in cycles:
+        ar = _cycle_signed_area(cyc)
+        if ar > 0:
+            pos.append([ar, cyc, []])
+        elif ar < 0:
+            neg.append(cyc)
+        else:
+            raise ValueError(
+                "split_trim_region: zero-area face cycle — degenerate "
+                "trim loop")
+    for cyc in neg:
+        best = None
+        for rec in pos:
+            verdicts = {_classify_in_loops([rec[1]], p[0], p[1]) for p in cyc}
+            if "out" in verdicts or "in" not in verdicts:
+                continue
+            if best is None or rec[0] < best[0]:
+                best = rec
+        if best is not None:
+            best[2].append(cyc)              # a hole (already clockwise)
+        # else: the unbounded face — dropped
+
+    regions = []
+    total = F(0)
+    for ar, cyc, holes in pos:
+        regions.append([cyc] + holes)
+        total += ar + sum(_cycle_signed_area(h) for h in holes)
+    if total != (u1 - u0) * (v1 - v0):
+        raise ValueError(
+            f"split_trim_region: partition audit failed — region areas "
+            f"sum to {total}, domain area is {(u1 - u0) * (v1 - v0)}")
+    return regions

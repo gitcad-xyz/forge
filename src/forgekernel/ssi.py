@@ -530,10 +530,12 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
     with :class:`SsiCellUncertified` — never a silent drop.
 
     Returns ``None`` for detection-level certified emptiness, else
-    ``(points, branches, stats)`` where ``points`` maps each point-bearing
-    A-cell box to its certified (u, v, s, t), ``branches`` clusters those
-    cells (connected components in A's parameter domain), and ``stats``
-    is {"cells", "empty_cells", "tightened"}."""
+    ``(points, branches, stats, bcells)`` where ``points`` maps each
+    point-bearing A-cell box to its certified (u, v, s, t), ``branches``
+    clusters those cells (connected components in A's parameter domain),
+    ``stats`` is {"cells", "empty_cells", "tightened"}, and ``bcells``
+    maps each point-bearing A-cell to one of its surviving B-side cell
+    boxes (used for border-proximity tolerances in B's domain)."""
     boxes = _ssi_boxes(A, B, depth, use_rust)
     if not boxes:
         return None
@@ -546,6 +548,7 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
 
     spans = None
     points: dict = {}
+    bcells: dict = {}
     unresolved = []
     empty = tightened = 0
     for abox, bbs in groups.items():
@@ -555,6 +558,7 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
         u, v, s, t, ok, _ = newton(um, vm, sm, tm)
         if ok:
             points[abox] = (u, v, s, t)
+            bcells[abox] = b0
             continue
         if spans is None:
             from forgekernel.nurbs import bezier_patches
@@ -564,6 +568,7 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
         verdict, pt = _resolve_cell_pairs(grp, abox, newton)
         if verdict == "point":
             points[abox] = pt
+            bcells[abox] = b0
             tightened += 1
         elif verdict == "empty":
             empty += 1
@@ -573,7 +578,7 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
         raise SsiCellUncertified(unresolved, depth, _RESOLVE_LEVELS)
     branches = _cluster(list(points))
     return points, branches, {"cells": len(groups), "empty_cells": empty,
-                              "tightened": tightened}
+                              "tightened": tightened}, bcells
 
 
 def ssi_strips(A, B, depth: int = 4, use_rust: bool | None = None):
@@ -604,7 +609,7 @@ def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
         return {"branches": 0, "points": [], "uncertified": 0,
                 "empty_certified": True, "cells": 0, "empty_cells": 0,
                 "tightened": 0}
-    points, branches, stats = res
+    points, branches, stats, _ = res
     return {"branches": len(branches), "points": list(points.values()),
             "uncertified": 0, "empty_certified": not points, **stats}
 
@@ -669,7 +674,7 @@ def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):
     if res is None:
         return {"curves": [], "uncertified": 0, "empty_certified": True,
                 "cells": 0, "empty_cells": 0, "tightened": 0}
-    points, branches, stats = res
+    points, branches, stats, _ = res
     branch_of = {abox: bi for bi, group in enumerate(branches) for abox in group}
     per_branch: dict[int, list] = {bi: [] for bi in range(len(branches))}
     for abox, pt in points.items():
@@ -718,6 +723,320 @@ def _refine_global(A, B, u, v, s, t, iters: int = 12):
     pb_ = B.eval(sr, tr)
     res2 = sum((pa_[c] - pb_[c]) ** 2 for c in range(3))
     return ur, vr, sr, tr, res2 < F(1, 10 ** 20), res2
+
+
+# -- K7 gap 2: SSI branches → trim loops on BOTH parameter domains ------------
+
+class TrimLoopUnstitchable(ValueError):
+    """Structured refusal: an SSI branch could not be turned into a
+    closed trim loop on both parameter domains.
+
+    Causes, each named in the message:
+
+    * ``open_interior`` — an open branch's endpoint lies strictly inside
+      a domain and no domain-border crossing certifies near it. The
+      curve genuinely ends mid-face (it leaves the OTHER patch through
+      that patch's edge); closing the loop there needs the other
+      surface's edge curves — boolean-assembly work, refused here rather
+      than guessed.
+    * ``border_uncertified`` — an endpoint sits near a border but the
+      constrained Newton solve found no residual-certified crossing
+      (near-tangential exit).
+    * ``resolution`` — too few certified points to form a loop at this
+      depth; raise the depth.
+
+    Never returns a partial or guessed loop: a wrong trim loop builds a
+    wrong shell (ADR-0019)."""
+
+    def __init__(self, branch: int, reason: str, detail: str = "") -> None:
+        self.branch = branch
+        self.reason = reason
+        msg = f"trim_loop_unstitchable[{reason}]: branch {branch}"
+        if detail:
+            msg += f" — {detail}"
+        super().__init__(msg)
+
+
+def _solve_lsqf(M, b):
+    """Small dense float solve (k ≤ 3) by Gaussian elimination with
+    partial pivoting; None if singular. Float is fine: the answer is only
+    a Newton step — the certificate downstream is exact."""
+    k = len(b)
+    a = [list(M[i]) + [b[i]] for i in range(k)]
+    for col in range(k):
+        piv = max(range(col, k), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-30:
+            return None
+        a[col], a[piv] = a[piv], a[col]
+        for r in range(k):
+            if r != col:
+                f = a[r][col] / a[col][col]
+                a[r] = [a[r][c] - f * a[col][c] for c in range(k + 1)]
+    return [a[i][k] / a[i][i] for i in range(k)]
+
+
+def _refine_constrained(A, B, pt, fixed, iters: int = 16):
+    """Newton on A(u,v) − B(s,t) = 0 with some parameters FIXED exactly
+    (typically at domain-border values), least-squares over the free
+    ones, then the same EXACT residual certificate as :func:`refine_point`.
+
+    ``fixed`` maps parameter index (0=u, 1=v, 2=s, 3=t) → exact ℚ value.
+    Returns ``((u, v, s, t), ok, res2)`` — the fixed entries are carried
+    through exactly, so a border-constrained solution lies EXACTLY on
+    the border; ``ok`` iff the exact |A−B|² < 1e-20."""
+    (au0, au1), (av0, av1) = A.domain()
+    (bu0, bu1), (bv0, bv1) = B.domain()
+    bounds = ((au0, au1), (av0, av1), (bu0, bu1), (bv0, bv1))
+    vals = [float(x) for x in pt]
+    for i, val in fixed.items():
+        vals[i] = float(val)
+    free = [i for i in range(4) if i not in fixed]
+    if not free:
+        raise ValueError("all four parameters fixed — nothing to solve")
+
+    def _rat():
+        return tuple(fixed[i] if i in fixed
+                     else F(vals[i]).limit_denominator(10 ** 12)
+                     for i in range(4))
+
+    for _ in range(iters):
+        ur, vr, sr, tr = _rat()
+        Sa, Au, Av = A.partials(ur, vr)
+        Sb, Bu, Bv = B.partials(sr, tr)
+        r = [float(Sa[c] - Sb[c]) for c in range(3)]
+        if max(abs(x) for x in r) < 1e-14:
+            break
+        cols = (Au, Av, Bu, Bv)
+        J = [[(1 if i < 2 else -1) * float(cols[i][c]) for i in free]
+             for c in range(3)]
+        k = len(free)
+        JtJ = [[sum(J[c][a_] * J[c][b_] for c in range(3)) for b_ in range(k)]
+               for a_ in range(k)]
+        Jtr = [sum(J[c][a_] * r[c] for c in range(3)) for a_ in range(k)]
+        step = _solve_lsqf(JtJ, [-x for x in Jtr])
+        if step is None:
+            break
+        for j, i in enumerate(free):
+            lo, hi = bounds[i]
+            vals[i] = min(float(hi), max(float(lo), vals[i] + step[j]))
+    out = _rat()
+    pa = A.eval(out[0], out[1])
+    pb = B.eval(out[2], out[3])
+    res2 = sum((pa[c] - pb[c]) ** 2 for c in range(3))
+    return out, res2 < F(1, 10 ** 20), res2
+
+
+def _order_chain(items):
+    """Greedy nearest-neighbour ordering of ``[(a_cell, point), …]`` in
+    A's (u, v), started from an endpoint via the double-sweep diameter
+    heuristic — :func:`_order_branch`'s rule, carrying the cells along.
+    Float ordering over exact points (a report artifact; the points stay
+    the certified data)."""
+    n = len(items)
+    if n <= 1:
+        return list(items)
+    uv = [(float(p[0]), float(p[1])) for _, p in items]
+
+    def d2(i, j):
+        return (uv[i][0] - uv[j][0]) ** 2 + (uv[i][1] - uv[j][1]) ** 2
+
+    start = max(range(n), key=lambda i: d2(i, 0))
+    todo = set(range(n))
+    todo.discard(start)
+    order = [start]
+    while todo:
+        last = order[-1]
+        nxt = min(todo, key=lambda i: d2(i, last))
+        order.append(nxt)
+        todo.discard(nxt)
+    return [items[i] for i in order]
+
+
+def _boxes_touch_2d(k1, k2) -> bool:
+    """Closed-touch adjacency of two parameter boxes — exact ℚ."""
+    return (k1[0] <= k2[1] and k2[0] <= k1[1]
+            and k1[2] <= k2[3] and k2[2] <= k1[3])
+
+
+def _border_position(dom, p):
+    """Arc-length position of ``p`` along the domain rectangle's border,
+    counterclockwise from (u0, v0); ``None`` if p is not exactly on the
+    border. Exact ℚ."""
+    (u0, u1), (v0, v1) = dom
+    u, v = p
+    if v == v0 and u0 <= u <= u1:
+        return u - u0
+    W, H = u1 - u0, v1 - v0
+    if u == u1 and v0 <= v <= v1:
+        return W + (v - v0)
+    if v == v1 and u0 <= u <= u1:
+        return W + H + (u1 - u)
+    if u == u0 and v0 <= v <= v1:
+        return 2 * W + H + (v1 - v)
+    return None
+
+
+def _border_corners(dom, p_from, p_to):
+    """The domain corners passed when walking the border counterclockwise
+    from ``p_from`` to ``p_to`` (both exactly on the border), in walk
+    order, endpoints excluded. Exact ℚ."""
+    (u0, u1), (v0, v1) = dom
+    P = 2 * ((u1 - u0) + (v1 - v0))
+    a = _border_position(dom, p_from)
+    b = _border_position(dom, p_to)
+    span = (b - a) % P
+    out = []
+    for c in ((u0, v0), (u1, v0), (u1, v1), (u0, v1)):
+        cp = (_border_position(dom, c) - a) % P
+        if 0 < cp < span:
+            out.append((cp, c))
+    return [c for _, c in sorted(out)]
+
+
+def _cell_hits_border(cell, dom) -> bool:
+    """Does the parameter box touch the domain rectangle's border?"""
+    (lo0, hi0), (lo1, hi1) = dom
+    c0, c1, c2, c3 = cell
+    return c0 <= lo0 or c1 >= hi0 or c2 <= lo1 or c3 >= hi1
+
+
+def _extend_end(A, B, pt, acell, bcell):
+    """Certified border crossing near an open chain's endpoint: try
+    constrained Newton solves with parameters pinned EXACTLY to nearby
+    domain borders — larger constraint sets first, so an endpoint that
+    exits both domains at once (shared edge geometry) lands exactly on
+    BOTH borders. Returns the certified (u, v, s, t) or ``None``.
+
+    Candidate borders are those within 2 cells of the endpoint (the cell
+    widths are the detection resolution); the filter is float-flavored
+    but harmless — the accepted answer carries an exact residual
+    certificate and exact in-domain checks."""
+    from itertools import combinations
+
+    (au0, au1), (av0, av1) = A.domain()
+    (bu0, bu1), (bv0, bv1) = B.domain()
+    bounds = ((au0, au1), (av0, av1), (bu0, bu1), (bv0, bv1))
+    widths = (acell[1] - acell[0] or F(1), acell[3] - acell[2] or F(1),
+              bcell[1] - bcell[0] or F(1), bcell[3] - bcell[2] or F(1))
+    near = []
+    for i in range(4):
+        for bord in bounds[i]:
+            d = abs(pt[i] - bord) / widths[i]
+            if d <= 2:
+                near.append((d, i, bord))
+    near.sort()
+    cand_sets = []
+    for size in (3, 2, 1):
+        for combo in combinations(near, size):
+            if len({c[1] for c in combo}) == size:
+                cand_sets.append(combo)
+    for combo in cand_sets:
+        fixed = {i: bord for (_, i, bord) in combo}
+        newpt, ok, _ = _refine_constrained(A, B, pt, fixed)
+        if not ok:
+            continue
+        if not all(bounds[i][0] <= newpt[i] <= bounds[i][1] for i in range(4)):
+            continue                                # exact in-domain check
+        if all(abs(float(newpt[i] - pt[i])) <= 4 * float(widths[i])
+               for i in range(4)):                  # stay near THIS endpoint
+            return newpt
+    return None
+
+
+def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
+    """SSI branches as closed TRIM LOOPS on BOTH parameter domains — the
+    input :func:`forgekernel.trim.split_trim_region` partitions a face by.
+
+    Closed branches become loops directly. OPEN branches are stitched:
+    each chain end is extended to a residual-certified domain-border
+    crossing (:func:`_refine_constrained` with the border value pinned
+    exactly), then the loop is closed with border segments and the patch
+    corners passed on a counterclockwise border walk. A branch that
+    cannot be stitched — an endpoint strictly interior to either domain,
+    or an uncertifiable border crossing — refuses by name
+    (:class:`TrimLoopUnstitchable`), never a guessed loop.
+
+    Consistency between the domains is by construction: ``loop_a`` and
+    ``loop_b`` read the SAME certified chain (residual² < 1e-20, so both
+    describe the same 3D curve) in A's (u, v) and B's (s, t); only the
+    border-walk segments are domain-local. For an open branch, which
+    side the stitched loop encloses depends on the chain's orientation —
+    callers that need the full partition (both sides) should hand the
+    loops to ``split_trim_region``, whose face tracing is independent of
+    that choice.
+
+    Returns ``{"loops": [{"closed": bool, "points": [(u,v,s,t), …],
+    "loop_a": [(u,v), …], "loop_b": [(s,t), …]}, …], "empty_certified":
+    bool, "cells": n, "empty_cells": n, "tightened": n}``; every
+    surviving SSI cell is classified upstream (certified point / proven
+    empty / :class:`SsiCellUncertified`)."""
+    res = _ssi_resolved(A, B, depth, use_rust)
+    if res is None:
+        return {"loops": [], "empty_certified": True, "cells": 0,
+                "empty_cells": 0, "tightened": 0}
+    points, branches, stats, bcells = res
+    adom, bdom = A.domain(), B.domain()
+    out = []
+    for bi, group in enumerate(branches):
+        items = _order_chain([(abox, points[abox]) for abox in group])
+        chain = [pt for _, pt in items]
+        if len(chain) < 3:
+            raise TrimLoopUnstitchable(
+                bi, "resolution",
+                f"only {len(chain)} certified point(s) at depth {depth} — "
+                f"too few to form a loop; raise depth")
+        ends = (items[0], items[-1])
+        ends_touch_border = any(
+            _cell_hits_border(acell, adom)
+            or _cell_hits_border(bcells[acell], bdom)
+            for acell, _ in ends)
+        ends_adjacent = _boxes_touch_2d(items[0][0], items[-1][0])
+        stitched = None
+        if ends_touch_border:
+            p0 = _extend_end(A, B, chain[0], ends[0][0], bcells[ends[0][0]])
+            p1 = _extend_end(A, B, chain[-1], ends[1][0], bcells[ends[1][0]])
+            if p0 is not None and p1 is not None:
+                stitched = (p0, p1)
+            elif not ends_adjacent:
+                raise TrimLoopUnstitchable(
+                    bi, "border_uncertified",
+                    "open chain end near a domain border but no "
+                    "residual-certified border crossing was found")
+        if stitched is not None:
+            p0, p1 = stitched
+            full = [p0] + chain + [p1]
+            full = [p for i, p in enumerate(full)
+                    if i == 0 or p != full[i - 1]]   # drop exact repeats
+            loops_ab = []
+            for dom, lo, hi in ((adom, 0, 2), (bdom, 2, 4)):
+                pts2 = [p[lo:hi] for p in full]
+                for name, p in (("first", pts2[0]), ("last", pts2[-1])):
+                    if _border_position(dom, p) is None:
+                        which = "A" if lo == 0 else "B"
+                        raise TrimLoopUnstitchable(
+                            bi, "open_interior",
+                            f"{name} chain end {tuple(map(str, p))} is "
+                            f"strictly interior to {which}'s parameter "
+                            f"domain — the curve ends mid-face; closing "
+                            f"it needs the other surface's edge curves "
+                            f"(boolean assembly), refusing to guess")
+                loops_ab.append(pts2 + _border_corners(dom, pts2[-1], pts2[0]))
+            out.append({"closed": False, "points": full,
+                        "loop_a": loops_ab[0], "loop_b": loops_ab[1]})
+            continue
+        if ends_adjacent:
+            out.append({"closed": True, "points": chain,
+                        "loop_a": [p[0:2] for p in chain],
+                        "loop_b": [p[2:4] for p in chain]})
+            continue
+        gap = sum((float(chain[0][i] - chain[-1][i])) ** 2
+                  for i in (0, 1)) ** 0.5
+        raise TrimLoopUnstitchable(
+            bi, "open_interior",
+            f"chain ends are non-adjacent interior cells (parameter gap "
+            f"{gap:.3g} in A's domain) and touch no border — open branch "
+            f"with no certified closure; raise depth or treat as tangency")
+    return {"loops": out, "empty_certified": not out, **stats}
 
 
 def polyline(points_xyz):
