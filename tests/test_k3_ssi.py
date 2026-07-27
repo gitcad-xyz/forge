@@ -336,10 +336,20 @@ def test_step_planar_solid_import_is_exact() -> None:
     for verts, nrm in faces:
         oes = []
         for a, b in zip(verts, verts[1:] + verts[:1]):
-            lines.append(f"#{eid} = EDGE_CURVE('',#{a + 10},#{b + 10},#{a},.T.);")
+            # a well-formed LINE basis per edge: the importer now guards
+            # the basis-curve type (a curved basis would be silently
+            # chorded), so the fixture must be honest STEP rather than a
+            # point reference in the curve slot.
+            (xa, ya, za), (xb, yb, zb) = pts[a], pts[b]
+            lines.append(f"#{eid + 2} = DIRECTION('',"
+                         f"({xb - xa}.,{yb - ya}.,{zb - za}.));")
+            lines.append(f"#{eid + 3} = VECTOR('',#{eid + 2},1.);")
+            lines.append(f"#{eid + 4} = LINE('',#{a},#{eid + 3});")
+            lines.append(f"#{eid} = EDGE_CURVE('',#{a + 10},#{b + 10},"
+                         f"#{eid + 4},.T.);")
             lines.append(f"#{eid + 1} = ORIENTED_EDGE('',*,*,#{eid},.T.);")
             oes.append(f"#{eid + 1}")
-            eid += 2
+            eid += 5
         lines.append(f"#{eid} = EDGE_LOOP('',({','.join(oes)}));")
         loop = eid
         eid += 1

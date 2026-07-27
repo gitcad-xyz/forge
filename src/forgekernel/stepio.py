@@ -90,8 +90,14 @@ class StepFile:
         m = re.search(r"DATA;(.*?)ENDSEC;", text, re.S)
         if m:
             data = m.group(1)
-        # one entity per statement: #id = <body> ;
-        for em in re.finditer(r"#(\d+)\s*=\s*(.*?);", data, re.S):
+        # One entity per statement: #id = <body> ;  — the terminating ';'
+        # must be found OUTSIDE quoted strings: a lazy .*?; used to split
+        # at a ';' inside a name (PRODUCT('a;b')), resync mid-string and
+        # silently DROP the entity. A body is a run of quoted strings
+        # ('...' — STEP escapes a quote by doubling it, so 'a''b' is two
+        # adjacent string tokens and stays matched) and non-quote,
+        # non-semicolon characters.
+        for em in re.finditer(r"#(\d+)\s*=\s*((?:'[^']*'|[^;'])*);", data):
             eid = int(em.group(1))
             body = em.group(2).strip().replace("\n", " ")
             if body.startswith("("):
@@ -294,6 +300,19 @@ class _Topo(StepFile):
             forward = oa[4].strip() == ".T."
             _, eargs = self.entities[edge_eid]
             ea = _split_args(eargs)
+            # basis-curve guard: the planar walk reads only vertex points,
+            # so a curved EDGE_CURVE (arc, B-spline) would be silently
+            # replaced by its chord — a wrong volume wearing an exact
+            # costume. Refuse the curve family by name instead.
+            basis_eid = _refs(ea[3])[0]
+            ctypes, _ = self.entities[basis_eid]
+            if "LINE" not in ctypes:
+                raise ValueError(
+                    "import_step: curved edge on the planar path — "
+                    f"EDGE_CURVE #{edge_eid} basis #{basis_eid} is "
+                    f"{'/'.join(ctypes)}, not LINE; chording it would "
+                    "silently change the volume (curved-edge topology "
+                    "arrives at K3.7)")
             v1, v2 = _refs(ea[1])[0], _refs(ea[2])[0]
             start = v1 if forward else v2
             _, vargs = self.entities[start]
