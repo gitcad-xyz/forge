@@ -20,14 +20,20 @@ ending with the full verification ritual.
 | decision record | gitcad `docs/adr/0018-native-kernel.md`; coverage matrix `docs/research/kernel-coverage-plan.md` |
 | python | ALWAYS `C:/Users/danie/cad-dev/.venv/Scripts/python.exe` (plain `python` lacks gitcad; forgekernel is pip-installed -e into that venv) |
 
-Current state (2026-07-26): forge is the SOLE kernel — OCCT was removed
+Current state (2026-07-27): forge is the SOLE kernel — OCCT was removed
 from gitcad entirely (ADR-0020), so the OCCT columns above are history.
 Source of truth is now the seam capability matrix
-(`python -m gitcad.bench.capability --md`): **339/345 (98%)** on main
-(2 gaps, 4 permanently-inexact cells, 0 crashes); the released 0.9.6
-wheels score 327/345 (95%). Released: `forgekernel` + `forgekernel_rs`
-0.9.6 on PyPI; main is ahead of the tag (surdrev, wider exact fields,
-torus/napkin-ring work — unreleased).
+(`python -m gitcad.bench.capability --md`): **340/345 (99%)** — 0 gaps,
+5 permanently-inexact cells (each with a transcendence proof; see gitcad
+`docs/releases/0.9.7.md`), 0 crashes — identical on main and on the
+released 0.9.8 wheels (clean-venv verified). Released: `forgekernel` +
+`forgekernel_rs` 0.9.8 on PyPI; main and the tag currently coincide.
+0.9.8 shipped K7: booleans over freeform NURBS solids (loft × loft end
+to end) whose volume is a CERTIFIED interval — a bracket proven to
+contain the truth, provenance `"certified"`, never a bare float — with
+tangent contact, operand-corner, and mixed loft × planar cases refusing
+by name (verified from the wheels: barrel(2582/35) ∩ slab(12) brackets
+89/16 at ±0.72, dome cap brackets 1.0794724554159 at ±0.019).
 
 ## 1. Rules of engagement (non-negotiable)
 
