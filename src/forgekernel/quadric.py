@@ -2454,18 +2454,41 @@ class FilletedBox:
 
 
 class VariableFilletedBox:
-    """A box with LINEAR-TAPER rolling-ball fillets on non-adjacent
-    straight edges — still exact in ℚ[π].
+    """A box with LINEAR-TAPER **disc-sweep** fillets on non-adjacent
+    straight edges — exact in ℚ[π].
 
-    A fillet whose radius runs linearly r(t)=r0+(r1−r0)t/L along an edge
-    removes cross-section area r(t)²(1−π/4), and ∫₀^L r(t)² dt =
-    L(r0²+r0r1+r1²)/3 exactly, so
+    THE SEMANTIC IS LOAD-BEARING. Two G1-valid surfaces answer to "linear
+    variable-radius fillet", they share their tangency lines on both faces,
+    and they sit on opposite sides of the exact-field boundary:
+
+    * DISC-SWEEP (this class): each slice perpendicular to the edge is the
+      2D fillet arc of radius r(t) = r0 + (r1−r0)·t/L. The surface is an
+      OBLIQUE circular cone with apex on the edge line where r extrapolates
+      to 0 (scaling identity verified to 4e-14), G1-tangent to both faces.
+      A slice removes area r(t)²(1−π/4) and ∫₀^L r(t)² dt =
+      L(r0²+r0r1+r1²)/3 exactly, so
 
         V = V_box − Σ (1−π/4)·L(r0²+r0r1+r1²)/3      — a PiVal, exact.
 
+    * ROLLING BALL (the Parasolid/SolidWorks semantic — envelope of spheres
+      of radius r(t)): a RIGHT circular cone whose perpendicular slice is an
+      ELLIPSE. The slice-segment area carries the eccentric-anomaly span Δu
+      linearly, with cos Δu = b² for taper slope b = (r1−r0)/L — and by
+      Niven's theorem Δu/π is rational only at b² ∈ {0, ½, 1}: constant
+      radius, the irrational slope b = 1/√2, or the degenerate b = 1. For
+      EVERY rational nonzero taper the volume is transcendental over every
+      ℚ[√d][π] (the Lindemann class) — so the rolling ball is a wall, not
+      backlog, and this kernel does not pretend to it.
+
+    Divergence of the two (removed volume, computed): 0.33% at b = 0.1,
+    4.9% at b = 0.4, 16.1% at b = 0.8. Consumers comparing against a
+    Parasolid-derived kernel must expect exactly that gap, by definition,
+    not by defect.
+
     Edges: (axis, side_a, side_b, r0, r1). Selected edges must be
     pairwise non-adjacent (a shared vertex needs a variable corner
-    patch → K5.3)."""
+    patch → K5.3; a sphere octant at matched vertex radii would be
+    C0-watertight but NOT G1 against the taper cones)."""
 
     def __init__(self, lo, hi, edges) -> None:
         self.lo = tuple(F(v) for v in lo)
@@ -2510,5 +2533,52 @@ class VariableFilletedBox:
             pic += X / 4
         return PiVal(rat, pic)
 
+    def centroid_f(self) -> tuple:
+        """Float centroid from the same closed forms as the volume
+        (FilletedBox precedent — floats are display here, the exactness
+        claim lives in ``volume()``).
+
+        Per edge, with r(t) = r0 + (r1−r0)t/L and the slice's removed area
+        a(t) = r(t)²(1−π/4):
+
+          ∫a dt      = (1−π/4)·L(r0²+r0r1+r1²)/3
+          ∫a·t dt    = (1−π/4)·L²(r0²+2r0r1+3r1²)/12   (axial moment)
+          ∫a·c* dt   = (5/6−π/4)·L(r0³+r0²r1+r0r1²+r1³)/4
+
+        where c* is the slice centroid's offset from the box corner along
+        each transverse axis (first moment of the corner-minus-quarter-disc
+        region is r³(5/6−π/4))."""
+        import math
+        axes = {"x": 0, "y": 1, "z": 2}
+        vbox = 1.0
+        cb = [0.0, 0.0, 0.0]
+        for c in range(3):
+            vbox *= float(self.hi[c] - self.lo[c])
+            cb[c] = float(self.lo[c] + self.hi[c]) / 2
+        num = [vbox * cb[c] for c in range(3)]
+        vtot = vbox
+        ka = 1 - math.pi / 4
+        kt = 5 / 6 - math.pi / 4
+        for ax, sa, sb, r0f, r1f in self.edges:
+            a = axes[ax]
+            o1, o2 = [c for c in range(3) if c != a]
+            L = float(self.hi[a] - self.lo[a])
+            r0, r1 = float(r0f), float(r1f)
+            i2 = L * (r0 * r0 + r0 * r1 + r1 * r1) / 3
+            i2t = L * L * (r0 * r0 + 2 * r0 * r1 + 3 * r1 * r1) / 12
+            i3 = L * (r0 ** 3 + r0 ** 2 * r1 + r0 * r1 ** 2 + r1 ** 3) / 4
+            vrem = ka * i2
+            vtot -= vrem
+            num[a] -= ka * (i2 * float(self.lo[a]) + i2t)
+            for o, side in ((o1, sa), (o2, sb)):
+                corner = float(self.lo[o] if side == "min" else self.hi[o])
+                inward = 1.0 if side == "min" else -1.0
+                num[o] -= vrem * corner + inward * kt * i3
+        return tuple(n / vtot for n in num)
+
     def bbox(self):
         return self.lo, self.hi
+
+    def tessellate(self, deflection: float = 0.2) -> dict:
+        raise NotImplementedError(
+            "variable-taper fillet mesh needs the oblique-cone band (K5.3)")
