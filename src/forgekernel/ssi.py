@@ -446,32 +446,6 @@ def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
 
 # -- K3.5: SSI over B-spline surfaces + ordered polylines ---------------------
 
-def _cluster(keys):
-    """Union-find over parameter boxes (closed-touch adjacency)."""
-    parent = list(range(len(keys)))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def touch(k1, k2):
-        return (k1[0] <= k2[1] and k2[0] <= k1[1]
-                and k1[2] <= k2[3] and k2[2] <= k1[3])
-
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            if touch(keys[i], keys[j]):
-                ri, rj = find(i), find(j)
-                if ri != rj:
-                    parent[ri] = rj
-    groups = {}
-    for i, k in enumerate(keys):
-        groups.setdefault(find(i), []).append(k)
-    return list(groups.values())
-
-
 def _cluster_resolved(cells, bmap):
     """Union-find over point-bearing A-cells in the RESOLVED cell graph:
     two cells are neighbours iff their A-boxes touch (closed touch, exact
@@ -499,17 +473,13 @@ def _cluster_resolved(cells, bmap):
             i = parent[i]
         return i
 
-    def touch(k1, k2):
-        return (k1[0] <= k2[1] and k2[0] <= k1[1]
-                and k1[2] <= k2[3] and k2[2] <= k1[3])
-
     for i in range(len(keys)):
         bi = bmap[keys[i]]
         for j in range(i + 1, len(keys)):
-            if not touch(keys[i], keys[j]):
+            if not _boxes_touch_2d(keys[i], keys[j]):
                 continue
             bj = bmap[keys[j]]
-            if any(touch(b1, b2) for b1 in bi for b2 in bj):
+            if any(_boxes_touch_2d(b1, b2) for b1 in bi for b2 in bj):
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[ri] = rj
