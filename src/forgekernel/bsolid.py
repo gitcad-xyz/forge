@@ -465,24 +465,45 @@ def _is_rational(surface) -> bool:
 
 def _patch_forms(surface):
     """Per exact Bézier sub-patch of ``surface``: (global parameter box,
-    P, Q) with F = P/Q in the sub-patch's local [0,1]² coordinates."""
+    P, Q, R) with F = P/Q in the sub-patch's local [0,1]² coordinates
+    and R = P·Q (built ONCE per span — the Neumann leaf rule needs the
+    exact mean of P·Q per cell, and subdividing the product form is far
+    cheaper than re-multiplying per leaf)."""
     from forgekernel.nurbs import bezier_patches
     out = []
     for (u0, u1, v0, v1, net) in bezier_patches(surface):
         P, Q = _flux_forms(net)
-        out.append(((F(u0), F(u1), F(v0), F(v1)), P, Q))
+        R = None if Q is None else _bf_mul(P, Q)
+        out.append(((F(u0), F(u1), F(v0), F(v1)), P, Q, R))
     return out
 
 
-def _leaf_mean_ci(P, Q):
+def _leaf_mean_ci(P, Q, R=None):
     """(lo, hi) bracketing the MEAN of F = P/Q over a leaf cell.
-    Q is None → polynomial → exact (zero-width). Otherwise the per-cell
-    reciprocal rule: P one-signed → (exact mean P)·[1/Qmax, 1/Qmin]."""
+    Q is None → polynomial → exact (zero-width).
+
+    Rational cells use the NEUMANN rule (second order): with the exact
+    algebraic identity, for any constant qm,
+
+        1/Q = 2/qm − Q/qm² + (Q − qm)²/(qm²·Q),
+
+    so  P/Q = 2P/qm − PQ/qm² + P·(Q − qm)²/(qm²·Q).  The first two terms
+    have EXACT means (P and R = P·Q are polynomial forms), and the
+    remainder is hull-bounded by max|P|·e²/(qm²·Qmin) with
+    e = (Qmax − Qmin)/2 — width O(h²) per cell where the plain
+    reciprocal rule was O(h).  ``R`` is the subdivided P·Q form; when
+    absent the old first-order reciprocal rule applies (sound, wider)."""
     if Q is None:
         m = _bf_mean(P)
         return m, m
     pmn, pmx = _bf_hull(P)
     qmn, qmx = _bf_hull(Q)
+    if R is not None and qmn > 0:
+        qm = (qmn + qmx) / 2
+        mid = 2 * _bf_mean(P) / qm - _bf_mean(R) / (qm * qm)
+        e = (qmx - qmn) / 2
+        mag = max(abs(pmn), abs(pmx)) * e * e / (qm * qm * qmn)
+        return mid - mag, mid + mag
     if pmn >= 0:
         I = _bf_mean(P)
         return I / qmx, I / qmn
@@ -502,7 +523,7 @@ def _leaf_range(P, Q):
     return min(cands), max(cands)
 
 
-def _accumulate(P, Q, box, depth, classify):
+def _accumulate(P, Q, box, depth, classify, R=None):
     """(lo, hi) bracketing the MEAN over ``box`` of the integrand
     restricted to the trimmed region. ``classify(box)`` returns:
 
@@ -513,7 +534,8 @@ def _accumulate(P, Q, box, depth, classify):
     A "split" verdict at depth 0 becomes the hull boundary bound
     [min(0, Fmin), max(0, Fmax)] — the unknown covered fraction of the
     cell is bracketed by 0..1, which is what makes the result a rigorous
-    enclosure rather than an estimate."""
+    enclosure rather than an estimate. ``R`` is the P·Q product form
+    subdivided alongside (rational patches; the Neumann leaf rule)."""
     verdict = classify(box)
     if verdict == "out":
         return F(0), F(0)
@@ -522,7 +544,7 @@ def _accumulate(P, Q, box, depth, classify):
             m = _bf_mean(P)                      # polynomial: exact, prune
             return m, m
         if depth == 0:
-            return _leaf_mean_ci(P, Q)
+            return _leaf_mean_ci(P, Q, R)
     else:                                        # boundary
         if depth == 0:
             fmn, fmx = _leaf_range(P, Q)
@@ -530,18 +552,23 @@ def _accumulate(P, Q, box, depth, classify):
     u0, u1, v0, v1 = box
     um, vm = (u0 + u1) / 2, (v0 + v1) / 2
     PL, PR = _bf_split_u(P)
-    QL = QR = None
+    QL = QR = RL = RR = None
     if Q is not None:
         QL, QR = _bf_split_u(Q)
+        if R is not None:
+            RL, RR = _bf_split_u(R)
     lo = hi = F(0)
-    for (Ph, Qh, ub) in ((PL, QL, (u0, um)), (PR, QR, (um, u1))):
+    for (Ph, Qh, Rh, ub) in ((PL, QL, RL, (u0, um)), (PR, QR, RR, (um, u1))):
         PB, PT = _bf_split_v(Ph)
-        QB = QT = None
+        QB = QT = RB = RT = None
         if Qh is not None:
             QB, QT = _bf_split_v(Qh)
-        for (Pq, Qq, vb) in ((PB, QB, (v0, vm)), (PT, QT, (vm, v1))):
+            if Rh is not None:
+                RB, RT = _bf_split_v(Rh)
+        for (Pq, Qq, Rq, vb) in ((PB, QB, RB, (v0, vm)),
+                                 (PT, QT, RT, (vm, v1))):
             l, h = _accumulate(Pq, Qq, (ub[0], ub[1], vb[0], vb[1]),
-                               depth - 1, classify)
+                               depth - 1, classify, Rq)
             lo += l
             hi += h
     return lo / 4, hi / 4
@@ -550,8 +577,8 @@ def _accumulate(P, Q, box, depth, classify):
 def _sum_ci(surface, depth, classify):
     from forgekernel.interval import CInterval
     lo = hi = F(0)
-    for (box, P, Q) in _patch_forms(surface):
-        l, h = _accumulate(P, Q, box, depth, classify)
+    for (box, P, Q, R) in _patch_forms(surface):
+        l, h = _accumulate(P, Q, box, depth, classify, R)
         lo += l
         hi += h
     return CInterval(lo / 3, hi / 3)
@@ -739,12 +766,14 @@ def certified_vector_area(surface: BSplineSurface, strip, inside,
     spans = []
     for (u0, u1, v0, v1, net) in bezier_patches(surface):
         P, Q = _normal_forms(net)
-        spans.append(((F(u0), F(u1), F(v0), F(v1)), P, Q))
+        R = None if Q is None else tuple(_bf_mul(Pc, Q) for Pc in P)
+        spans.append(((F(u0), F(u1), F(v0), F(v1)), P, Q, R))
     out = []
     for c in range(3):
         lo = hi = F(0)
-        for (box, P, Q) in spans:
-            l, h = _accumulate(P[c], Q, box, depth, classify)
+        for (box, P, Q, R) in spans:
+            l, h = _accumulate(P[c], Q, box, depth, classify,
+                               None if R is None else R[c])
             lo += l
             hi += h
         out.append(CInterval(lo, hi))
@@ -784,6 +813,25 @@ def certified_vector_area(surface: BSplineSurface, strip, inside,
 # (flux, vector area) never read roles, and the pairing audit fails on a
 # single flipped role while a consistent double flip reverses both
 # traversals and stays opposite — refusal or no-op, never a lie.
+
+def _snap_points(pts, depth):
+    """Snap a closed chain's certified (u, v, s, t) points to the dyadic
+    2^-(2·depth+10) grid — denominators bounded (exact polygon flux and
+    all downstream ℚ bookkeeping stay cheap; the raw points carry ~1e12
+    denominators), snap distance < 2^-(2·d+10) per 2D pair, folded into
+    the tube pads so enclosures stay enclosures (the "snap outward"
+    rule: the enclosure grows by the snap, never shrinks). Returns
+    (snapped, eps) or ``None`` when snapping would merge consecutive
+    vertices (the caller keeps the unsnapped chain)."""
+    scale = 1 << (2 * depth + 10)
+    out = [tuple(F(round(F(c) * scale), scale) for c in p) for p in pts]
+    n = len(out)
+    for k in range(n):
+        a, b = out[k], out[(k + 1) % n]
+        if (a[0], a[1]) == (b[0], b[1]) or (a[2], a[3]) == (b[2], b[3]):
+            return None
+    return out, F(1, scale)
+
 
 class BooleanUnsupported(ValueError):
     """Structured refusal: a boolean configuration stage 2 cannot turn
@@ -987,12 +1035,16 @@ class _FaceGrid:
 
 
 def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
-                   depth, raycast_depth):
+                   depth, raycast_depth, tight_ctx=None):
     """One operand face → its kept fragment as a
     :class:`~forgekernel.trimshell.ShellFace`, or ``None`` if the whole
-    face is discarded. ``chains`` is ``[(verts, uvs), …]`` — the face's
-    certified trim loops as shared TrimVertex objects plus this face's
-    own exact (u, v) coordinates."""
+    face is discarded. ``chains`` is ``[(verts, uvs, rec), …]`` — the
+    face's certified trim loops as shared TrimVertex objects plus this
+    face's own exact (u, v) coordinates and the assembly record (cells,
+    certified points, snap bound) the second-order tube bound reads.
+    ``tight_ctx`` (own_first/own_net/oth_nets) enables that bound; on
+    any :class:`~forgekernel.tube.TubeUncertified` the face simply
+    carries no tight bracket and the strip bracket stands alone."""
     from forgekernel.raycast import (PointClassifyUncertified,
                                      classify_point_in_shell)
     from forgekernel.trim import split_trim_region
@@ -1033,7 +1085,7 @@ def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
     # structural cross-check: the loops must form a legal arrangement —
     # exact partition of the domain, refusing crossings and degeneracies
     try:
-        split_trim_region(surface, [uvs for _, uvs in chains])
+        split_trim_region(surface, [uvs for _, uvs, _ in chains])
     except ValueError as exc:
         raise BooleanUnsupported("trim_loops_cross", str(exc)) from exc
 
@@ -1048,7 +1100,7 @@ def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
 
     # loop roles: the kept side of each loop, certified per component
     roles = []
-    for _, uvs in chains:
+    for _, uvs, _rec in chains:
         inside_vals = set()
         for c in range(grid.ncomp):
             um, vm = grid.cell_mid(grid.rep[c])
@@ -1085,9 +1137,178 @@ def _assemble_face(surface, sense, strip, chains, keep_inside, other_shell,
         return point_memo[key]
 
     face = ShellFace(surface, sense, strip, inside)
-    for (verts, uvs), role in zip(chains, roles):
+    for (verts, uvs, _rec), role in zip(chains, roles):
         face.add_loop(list(zip(verts, uvs)), outer=role)
+    if tight_ctx is not None:
+        face.tight = _try_tight(surface, strip, chains, grid, comp_kept,
+                                tight_ctx, depth)
     return face
+
+
+def _refined_chain(rec, tight_ctx, depth):
+    """The rec's closed chain with residual-certified midpoints inserted
+    (``tube_refine`` rounds of chord halving) and dyadically snapped.
+    Extra on-curve vertices are free tightness: the tube band scales
+    with chord²·cone, so each round roughly halves the certified error.
+    Midpoints carry the SAME certificate as chain points (exact rational
+    residual < 1e-20 from :func:`forgekernel.ssi._refine_global`); one
+    that fails to certify, or that snaps onto its neighbour, is simply
+    skipped — fewer points, wider band, never a wrong one. Cached on the
+    rec: both operand faces read one refinement."""
+    cached = rec.get("refined")
+    if cached is not None:
+        return cached
+    from forgekernel.ssi import _refine_global
+    sa = tight_ctx["surfs_a"][rec["pair"][0]]
+    sb = tight_ctx["surfs_b"][rec["pair"][1]]
+    cert = [tuple(F(c) for c in p) for p in rec["cert_pts"]]
+    for _ in range(tight_ctx.get("tube_refine", 2)):
+        new = []
+        n = len(cert)
+        for k in range(n):
+            p0, p1 = cert[k], cert[(k + 1) % n]
+            new.append(p0)
+            mids = tuple((a + b) / 2 for a, b in zip(p0, p1))
+            u, v, s, t, ok, _res = _refine_global(sa, sb, *mids)
+            if ok:
+                new.append((u, v, s, t))
+        cert = new
+    scale = 1 << (2 * depth + 10)
+    snap = [tuple(F(round(c * scale), scale) for c in p) for p in cert]
+    out_s: list = []
+    out_c: list = []
+    for pS, pC in zip(snap, cert):
+        if out_s and ((out_s[-1][0], out_s[-1][1]) == (pS[0], pS[1])
+                      or (out_s[-1][2], out_s[-1][3]) == (pS[2], pS[3])):
+            continue
+        out_s.append(pS)
+        out_c.append(pC)
+    while len(out_s) > 1 and (
+            (out_s[0][0], out_s[0][1]) == (out_s[-1][0], out_s[-1][1])
+            or (out_s[0][2], out_s[0][3]) == (out_s[-1][2], out_s[-1][3])):
+        out_s.pop()
+        out_c.pop()
+    rec["refined"] = (out_s, out_c)
+    return rec["refined"]
+
+
+def _try_tight(surface, strip, chains, grid, comp_kept, tight_ctx, depth):
+    """The second-order flux bracket for one boolean face: EXACT polygon
+    flux over the (snapped) trim loops ± the certified tube error
+    (:mod:`forgekernel.tube`), or ``None`` when any ingredient refuses —
+    the caller keeps the first-order strip bracket, never a wrong bound.
+
+    This retires the "polyline is never integrated" caveat: the polygon
+    IS integrated here, exactly, and the polygon-vs-curve deviation is
+    no longer a silent discretization error but a certified tube term
+    that shrinks O(h²) with the SSI depth. Residual premise (documented
+    in :mod:`forgekernel.tube`): one branch pass per covered cell set —
+    the same class the chain ordering already leans on; the reported
+    interval is additionally intersected with the independent strip
+    bracket by :meth:`forgekernel.trimshell.TrimmedShell.volume`."""
+    from forgekernel import tube
+    from forgekernel.interval import CInterval
+
+    try:
+        (du, dv) = surface.domain()
+        if (F(du[0]), F(du[1]), F(dv[0]), F(dv[1])) != (0, 1, 0, 1):
+            raise tube.TubeUncertified(
+                "domain_not_unit", "tube bound is proven on [0,1]² faces")
+        own_net = tight_ctx["own_net"]
+        P, Q = _flux_forms(own_net)
+        if Q is not None:
+            raise tube.TubeUncertified(
+                "rational_face", "tube bound covers polynomial faces")
+        n = grid.n
+        bg_vals = set()
+        for cc in ((0, 0), (n - 1, 0), (0, n - 1), (n - 1, n - 1)):
+            g = grid.comp.get(cc)
+            if g is None:
+                raise tube.TubeUncertified(
+                    "corner_on_strip", "a domain corner cell is on the "
+                    "trim strip — background side undecidable")
+            bg_vals.add(comp_kept(g))
+        if len(bg_vals) != 1:
+            raise tube.TubeUncertified(
+                "corner_mixed", "domain corners carry mixed memberships")
+        bg = bg_vals.pop()
+
+        fcache = tube.FormHullCache(P)
+        Hu, Hv = tube.face_direction_forms(own_net)
+        caches = {"hu": [tube.FormHullCache(c) for c in Hu],
+                  "hv": [tube.FormHullCache(c) for c in Hv]}
+        hull_memo: dict = {}
+        delta_memo = tight_ctx.setdefault("delta_memo", {})
+        own_first = tight_ctx["own_first"]
+        eps = F(1, 1 << (2 * depth + 10))
+        err = F(0)
+        all_quads = []
+        chain_polys = []
+        for (_verts, _uvs, rec) in chains:
+            if rec is None or rec.get("maps") is None:
+                raise tube.TubeUncertified(
+                    "no_assembly_record", "loop carries no cell record")
+            maps = rec["maps"]
+            if own_first:
+                own_strip_pair = maps["a_set"]
+                own2oth = maps["a2b"]
+                oth_net = tight_ctx["oth_nets"][rec["pair"][1]]
+            else:
+                own_strip_pair = maps["b_set"]
+                own2oth = maps["b2a"]
+                oth_net = tight_ctx["oth_nets"][rec["pair"][0]]
+            snap4, cert4 = _refined_chain(rec, tight_ctx, depth)
+            if own_first:
+                snap_own = [(p[0], p[1]) for p in snap4]
+            else:
+                snap_own = [(p[2], p[3]) for p in snap4]
+            e, quads = tube.loop_tube_error(
+                snap_own, cert4, own_first, own_net, oth_net,
+                own_strip_pair, own2oth, eps, fcache, depth,
+                hull_memo, delta_memo, caches)
+            err += e
+            all_quads.extend(quads)
+            # oriented polygon for the even-odd family: holes CW under a
+            # kept background, outers CCW otherwise — GEOMETRIC
+            # orientation, so the signed Green flux equals the even-odd
+            # region flux exactly for a non-nested arrangement
+            pts = list(snap_own)
+            area = F(0)
+            m = len(pts)
+            for k in range(m):
+                (ax, ay), (bx, by) = pts[k], pts[(k + 1) % m]
+                area += ax * by - bx * ay
+            if area == 0:
+                raise tube.TubeUncertified(
+                    "degenerate_loop", "zero-area trim loop")
+            if (area > 0) == bg:                 # want CW iff bg kept
+                pts = list(reversed(pts))
+            chain_polys.append(pts)
+        # non-nesting: crossing loops already refused upstream
+        # (split_trim_region), so one vertex decides containment
+        for a in range(len(chain_polys)):
+            for b in range(len(chain_polys)):
+                if a != b and _parity_in([chain_polys[a]],
+                                         *chain_polys[b][0]):
+                    raise tube.TubeUncertified(
+                        "nested_loops", "nested trim loops — the flat "
+                        "even-odd family does not apply")
+        family = []
+        if bg:
+            family.append([(F(0), F(0)), (F(1), F(0)),
+                           (F(1), F(1)), (F(0), F(1))])
+        family.extend(chain_polys)
+
+        extra = tube.band_audit(
+            depth, strip, all_quads, fcache,
+            parity_fn=lambda pt: _parity_in(family, pt[0], pt[1]),
+            kept_of_comp=comp_kept,
+            comp_of_cell=lambda ij: grid.comp.get(ij))
+        core = tube.polygon_flux(P, family)
+        e_total = err + extra
+        return CInterval(core - e_total, core + e_total)
+    except tube.TubeUncertified:
+        return None
 
 
 # -- open branches: seam topology, crossing canonicalization, chain gluing ----
@@ -1341,7 +1562,7 @@ def _face_paths(side_idx: int, face_index: int, recs):
     open_items = []
     for r in mine:
         if r["closed"]:
-            cycles.append((list(r["verts"]), coords(r)))
+            cycles.append((list(r["verts"]), coords(r), r))
         else:
             open_items.append(r)
     if not open_items:
@@ -1408,7 +1629,7 @@ def _face_paths(side_idx: int, face_index: int, recs):
         term = next((e for e in (0, 1) if r["ends"][e][0] == X), None)
         if term is not None:
             verts, uvs, _ = walk(id(r), term)
-            paths.append((verts, uvs))
+            paths.append((verts, uvs, None))
     for r in open_items:
         if id(r) not in used:
             start_vid = id(r["verts"][0])
@@ -1418,7 +1639,7 @@ def _face_paths(side_idx: int, face_index: int, recs):
                     "seam_crossing_unmatched",
                     "leftover glued chains neither reach a border nor "
                     "close a cycle")
-            cycles.append((verts, uvs))
+            cycles.append((verts, uvs, None))
     return paths, cycles
 
 
@@ -1477,14 +1698,14 @@ def _assemble_face_open(surface, sense, strip, paths, cycles, keep_inside,
                 f"point ({key[0]}, {key[1]}) of one face")
         vmap[key] = vx
 
-    for verts, uvs in list(paths) + list(cycles):
+    for verts, uvs, _rec in list(paths) + list(cycles):
         for vx, uv in zip(verts, uvs):
             register(vx, uv)
     for vx, uv in corner_items:
         register(vx, uv)
 
-    regions = split_domain_by_paths(surface, [uvs for _, uvs in paths],
-                                    [uvs for _, uvs in cycles])
+    regions = split_domain_by_paths(surface, [uvs for _, uvs, _ in paths],
+                                    [uvs for _, uvs, _ in cycles])
     grid = _FaceGrid(surface, strip, depth)
     verdicts: dict = {}
 
@@ -1573,7 +1794,8 @@ def _assemble_face_open(surface, sense, strip, paths, cycles, keep_inside,
 
 
 def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
-                    raycast_depth: int = 5, use_rust=None):
+                    raycast_depth: int = 5, use_rust=None,
+                    tube_refine: int = 2):
     """Boolean of two closed patch solids as an audited, certified
     :class:`~forgekernel.trimshell.TrimmedShell` — K7 gap 5.
 
@@ -1606,7 +1828,8 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
     a seamless operand (``open_branch``), invalid/unmatched seam
     topology, rational/multi-span/inward operands, unresolvable regions,
     and the empty result (:class:`BooleanUnsupported`)."""
-    from forgekernel.ssi import ssi_chains, ssi_strips
+    from forgekernel.nurbs import bezier_patches
+    from forgekernel.ssi import ssi_chains
     from forgekernel.trimshell import TrimmedShell, TrimVertex
 
     if op not in _BOOL_KEEP_INSIDE:
@@ -1620,13 +1843,22 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
     recs: list = []
     for i, sa in enumerate(fa):
         for j, sb in enumerate(fb):
-            a_cells, b_cells = ssi_strips(sa, sb, depth, use_rust=use_rust)
-            if not a_cells:
-                continue                      # certified non-intersection
             res = ssi_chains(sa, sb, depth, use_rust=use_rust)
+            if not res["chains"]:
+                continue                      # certified non-intersection
+            a_cells, b_cells = res["strips"]  # certified-pruned enclosures
             for ch in res["chains"]:
-                recs.append({"pair": (i, j), "pts": list(ch["points"]),
-                             "verts": [TrimVertex() for _ in ch["points"]],
+                pts = list(ch["points"])
+                eps = F(0)
+                if ch["closed"]:
+                    snapped = _snap_points(pts, depth)
+                    if snapped is not None:
+                        pts, eps = snapped
+                recs.append({"pair": (i, j), "pts": pts,
+                             "cert_pts": list(ch["points"]),
+                             "cells": list(ch["cells"]), "eps": eps,
+                             "maps": res["maps"],
+                             "verts": [TrimVertex() for _ in pts],
                              "closed": ch["closed"], "ends": ch["ends"]})
             strips[("A", i)] |= a_cells
             strips[("B", j)] |= b_cells
@@ -1661,6 +1893,9 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
     keep_a, keep_b = _BOOL_KEEP_INSIDE[op]
     shell_a = untrimmed_shell(fa)
     shell_b = untrimmed_shell(fb)
+    nets_a = [bezier_patches(f)[0][4] for f in fa]
+    nets_b = [bezier_patches(f)[0][4] for f in fb]
+    delta_memo: dict = {}          # σ anchors are per-pair: share across faces
     faces = []
     for side_idx, side, flist, keep_inside, sense, other, topo in (
             (0, "A", fa, keep_a, 1, shell_b, topo_a),
@@ -1668,10 +1903,17 @@ def boolean_trimmed(op: str, A, B, depth: int = 5, audit_depth=None,
         for i, f in enumerate(flist):
             paths, cycles = _face_paths(side_idx, i, recs)
             if topo is None:
-                # closed-loop mode: identical to the landed stage-2 path
+                # closed-loop mode: the landed stage-2 path + the
+                # second-order tube bracket where it certifies
+                ctx = {"own_first": side_idx == 0,
+                       "own_net": (nets_a if side_idx == 0 else nets_b)[i],
+                       "oth_nets": nets_b if side_idx == 0 else nets_a,
+                       "surfs_a": fa, "surfs_b": fb,
+                       "tube_refine": tube_refine,
+                       "delta_memo": delta_memo}
                 sf = _assemble_face(f, sense, strips[(side, i)], cycles,
                                     keep_inside, other, depth,
-                                    raycast_depth)
+                                    raycast_depth, tight_ctx=ctx)
             else:
                 sf = _assemble_face_open(f, sense, strips[(side, i)],
                                          paths, cycles, keep_inside,

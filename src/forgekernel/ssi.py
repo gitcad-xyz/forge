@@ -638,8 +638,11 @@ def ssi_strips(A, B, depth: int = 4, use_rust: bool | None = None):
     The true intersection curve provably lies inside the union of the
     a-cells in A's domain AND inside the union of the b-cells in B's
     domain — bbox pruning never discards a real intersection. This is
-    the rigorous object a boolean's certified volume bracket is built
-    from (:func:`forgekernel.bsolid.certified_trim_flux`); the chained
+    the raw detection-level enclosure; the boolean assembly reads the
+    certified-PRUNED strips from :func:`ssi_chains` instead (every
+    dropped cell proven empty — the B side here is ~3× inflated by
+    3D-box smear), and brackets flux through them
+    (:func:`forgekernel.bsolid.certified_trim_flux`). The chained
     polyline of :func:`ssi_curves` is only a float rendering aid.
     ``(set(), set())`` means certified non-intersection."""
     boxes = _ssi_boxes(A, B, depth, use_rust)
@@ -1089,6 +1092,95 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
     return {"loops": out, "empty_certified": not out, **stats}
 
 
+def _pair_group_prunable(grp, levels: int = 4, cap: int = 256) -> bool:
+    """Certified EXCLUSION for a group of surviving (BezierPatch,
+    BezierPatch) leaf pairs by deeper subdivision + control-net bbox
+    pruning alone (no Newton): ``True`` iff every descendant pair is
+    proven disjoint — the cell carries no intersection. ``False`` means
+    "could not prove empty" (never "nonempty"); callers must keep the
+    cell. Sound because no pair is ever discarded — growth past ``cap``
+    gives up rather than truncating."""
+    cur = list(grp)
+    for _ in range(levels):
+        nxt = []
+        for a, b in cur:
+            for sa in a.split4():
+                ba = sa.bbox()
+                for sb in b.split4():
+                    if _boxes_overlap(ba, sb.bbox()):
+                        nxt.append((sa, sb))
+        if not nxt:
+            return True                          # certified exclusion
+        if len(nxt) > cap:
+            return False
+        cur = nxt
+    return False
+
+
+def _bside_certified_strip(A, B, points, bcells, use_rust=None):
+    """The certified B-side strip: from the surviving pairs of the
+    point-bearing A-cells, drop every B-cell PROVEN empty and keep the
+    rest — the swapped-role analogue of the A-side classification.
+
+    Soundness of the enclosure: any true intersection point survives in
+    the leaf pair containing it, whose A-cell is therefore point-bearing
+    — so the union of the kept B-cells still encloses the curve in B's
+    domain. A cell is dropped only on a subdivision-pruning proof of
+    emptiness (deeper subdivision + control-net bbox disjointness — the
+    Rust ``ssi_pairs`` hot loop when built, else
+    :func:`_pair_group_prunable`, the executable spec); "could not
+    prove" keeps the cell. This kills the measured ~3× spurious B-side
+    inflation (an A-cell's 3D box overlaps a smear of B-cells whose
+    parameter boxes never meet the curve)."""
+    from forgekernel.nurbs import bezier_patches
+
+    owners: dict = {}
+    for ac, bbs in bcells.items():
+        for bb in bbs:
+            owners.setdefault(bb, set()).add(ac)
+    keep = set()
+    todo = []
+    for bb in sorted(owners):
+        acs = owners[bb]
+        if any(bb[0] <= points[ac][2] <= bb[1]
+               and bb[2] <= points[ac][3] <= bb[3] for ac in acs):
+            keep.add(bb)                 # certified point inside: curve-bearing
+        else:
+            todo.append((bb, acs))
+    if not todo:
+        return keep
+    rs = None
+    if use_rust is not False:
+        try:
+            import forgekernel_rs as rs
+        except ImportError:
+            if use_rust is True:
+                raise
+            rs = None
+    spans = (list(bezier_patches(A)), list(bezier_patches(B)))
+    patch_memo: dict = {}
+
+    def cellpatch(side, box):
+        key = (side, box)
+        if key not in patch_memo:
+            patch_memo[key] = _cell_patch(spans[side], box)
+        return patch_memo[key]
+
+    for bb, acs in todo:
+        grp = [(cellpatch(0, ac), cellpatch(1, bb)) for ac in sorted(acs)]
+        if rs is not None:
+            empty = all(not rs.ssi_pairs(
+                _net_str(a.net), _net_str(b.net), 4,
+                [_rstr(a.u0), _rstr(a.u1), _rstr(a.v0), _rstr(a.v1)],
+                [_rstr(b.u0), _rstr(b.u1), _rstr(b.v0), _rstr(b.v1)])
+                for a, b in grp)
+        else:
+            empty = _pair_group_prunable([(b, a) for a, b in grp])
+        if not empty:
+            keep.add(bb)
+    return keep
+
+
 def _border_sides(dom, p):
     """The side names ("u0"|"u1"|"v0"|"v1") of the domain rectangle that
     point ``p`` lies EXACTLY on — [] for an interior point, two names for
@@ -1125,21 +1217,54 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
       (``border_uncertified``).
 
     Returns ``{"chains": [{"closed": bool, "points": [(u,v,s,t), …],
-    "ends": (end0, end1)}, …], "empty_certified": bool, "cells": n,
-    "empty_cells": n, "tightened": n}`` where each end is ``None`` (for
-    a closed chain) or ``("A"|"B", side)``. Every surviving SSI cell is
-    classified upstream (certified / proven empty /
-    :class:`SsiCellUncertified`)."""
+    "cells": [(a_cell, b_cell|None), …], "ends": (end0, end1)}, …],
+    "empty_certified": bool, "cells": n, "empty_cells": n,
+    "tightened": n, "strips": (a_cells, b_cells), "maps": {"a2b", "b2a",
+    "a_set", "b_set"}}`` where each end is ``None`` (for a closed chain)
+    or ``("A"|"B", side)``. Every surviving SSI cell is classified
+    upstream (certified / proven empty / :class:`SsiCellUncertified`).
+
+    ``strips`` are the CERTIFIED trim-curve enclosures on both parameter
+    domains — like :func:`ssi_strips` but with every cell that the
+    resolver PROVED empty pruned away (A side: the point-bearing cells;
+    B side: :func:`_bside_certified_strip`). Still rigorous enclosures —
+    only proven-empty cells are dropped — and substantially smaller on
+    the B side (measured ~3× on the dome × plane case). Per chain point,
+    ``cells`` carries the point's own A-cell and the surviving B-cell
+    its (s, t) lies in (``None`` when no listed B-cell contains it, or
+    for border-extension points)."""
     res = _ssi_resolved(A, B, depth, use_rust)
     if res is None:
         return {"chains": [], "empty_certified": True, "cells": 0,
-                "empty_cells": 0, "tightened": 0}
+                "empty_cells": 0, "tightened": 0,
+                "strips": (set(), set()),
+                "maps": {"a2b": {}, "b2a": {}, "a_set": set(),
+                         "b_set": set()}}
     points, branches, stats, bcells = res
+    b_strip = _bside_certified_strip(A, B, points, bcells, use_rust)
+    b2a: dict = {}
+    for ac, bbs in bcells.items():
+        for bb in bbs:
+            b2a.setdefault(bb, set()).add(ac)
+    maps = {"a2b": {ac: list(bbs) for ac, bbs in bcells.items()},
+            "b2a": {bb: sorted(acs) for bb, acs in b2a.items()},
+            "a_set": set(points), "b_set": set(b_strip)}
+
+    def cell_pair(acell, pt):
+        if acell is None:
+            return (None, None)
+        s, t = pt[2], pt[3]
+        for bb in bcells[acell]:
+            if bb[0] <= s <= bb[1] and bb[2] <= t <= bb[3]:
+                return (acell, bb)
+        return (acell, None)
+
     adom, bdom = A.domain(), B.domain()
     out = []
     for bi, group in enumerate(branches):
         items = _order_chain([(abox, points[abox]) for abox in group])
         chain = [pt for _, pt in items]
+        cellsq = [ab for ab, _ in items]
         if len(chain) < 3:
             raise TrimLoopUnstitchable(
                 bi, "resolution",
@@ -1159,8 +1284,10 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
                     if p2 is not None:
                         if e == 0:
                             chain = [p2] + chain
+                            cellsq = [None] + cellsq
                         else:
                             chain = chain + [p2]
+                            cellsq = cellsq + [None]
                         a_on = _border_sides(adom, p2[0:2])
                         b_on = _border_sides(bdom, p2[2:4])
                     elif not ends_adjacent:
@@ -1185,7 +1312,11 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
             else:
                 ends.append(None)
         # drop exact consecutive repeats introduced by border extension
-        chain = [p for i, p in enumerate(chain) if i == 0 or p != chain[i - 1]]
+        keep_idx = [i for i, p in enumerate(chain)
+                    if i == 0 or p != chain[i - 1]]
+        chain = [chain[i] for i in keep_idx]
+        cellsq = [cellsq[i] for i in keep_idx]
+        cpairs = [cell_pair(ab, p) for ab, p in zip(cellsq, chain)]
         if ends[0] is None and ends[1] is None:
             if not ends_adjacent:
                 gap = sum((float(chain[0][i] - chain[-1][i])) ** 2
@@ -1195,7 +1326,7 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
                     f"chain ends are non-adjacent interior cells "
                     f"(parameter gap {gap:.3g} in A's domain) and touch "
                     f"no border — no certified closure")
-            out.append({"closed": True, "points": chain,
+            out.append({"closed": True, "points": chain, "cells": cpairs,
                         "ends": (None, None)})
             continue
         if ends[0] is None or ends[1] is None:
@@ -1204,9 +1335,10 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
                 "one chain end crosses a border but the other ends "
                 "strictly interior to both domains — the curve ends "
                 "mid-face; refusing to guess a closure")
-        out.append({"closed": False, "points": chain,
+        out.append({"closed": False, "points": chain, "cells": cpairs,
                     "ends": (ends[0], ends[1])})
-    return {"chains": out, "empty_certified": not out, **stats}
+    return {"chains": out, "empty_certified": not out, **stats,
+            "strips": (set(points), b_strip), "maps": maps}
 
 
 def polyline(points_xyz):

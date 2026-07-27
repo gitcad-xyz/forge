@@ -117,10 +117,15 @@ class ShellFace:
     Loops (added via :meth:`add_loop`) are the shared-vertex topology:
     ``loops[0]`` the outer boundary, the rest holes, in the
     :class:`~forgekernel.trim.TrimmedPatch` convention. They carry the
-    pairing audit; the *measure* is carried by strip + inside — the
-    polyline is never integrated (the honest K7 caveat)."""
+    pairing audit. The *measure* is carried by strip + inside; when the
+    boolean assembly additionally certifies the second-order tube bound
+    (:mod:`forgekernel.tube`), ``tight`` holds that face-flux bracket —
+    exact polygon flux over the certified snapped loops ± the tube
+    error — and :meth:`TrimmedShell.volume` intersects it with the
+    strip bracket (both are enclosures of the same true flux)."""
 
-    __slots__ = ("surface", "sense", "strip", "inside", "loops", "roles")
+    __slots__ = ("surface", "sense", "strip", "inside", "loops", "roles",
+                 "tight")
 
     def __init__(self, surface, sense: int, strip, inside) -> None:
         if sense not in (1, -1):
@@ -131,6 +136,7 @@ class ShellFace:
         self.inside = inside
         self.loops: list[list[TrimVertex]] = []
         self.roles: list[bool] = []
+        self.tight = None
 
     def add_loop(self, verts_with_uv, outer: bool | None = None) -> None:
         """Append a trim loop as ``[(vertex, (u, v)), …]``; binds each
@@ -244,14 +250,33 @@ class TrimmedShell:
         return len(seen)
 
     def volume(self, depth: int = 4):
-        """Certified volume bracket: Σ sense·certified_trim_flux over
-        the faces (each face's flux bracketed through its SSI strip).
-        A ``CInterval`` — "certified ± e", per ADR-0019."""
+        """Certified volume bracket: Σ sense·(face flux bracket) over the
+        faces. A ``CInterval`` — "certified ± e", per ADR-0019.
+
+        Each face's flux is the first-order strip bracket
+        (:func:`~forgekernel.bsolid.certified_trim_flux`), INTERSECTED
+        with the second-order tube bracket (``face.tight``) when the
+        boolean assembly certified one — both provably enclose the same
+        true flux, so their intersection does too, and it is never wider
+        than either. Disjoint brackets would be a proven contradiction
+        between two certified enclosures and raise
+        :class:`ShellAuditError` rather than report either."""
         from forgekernel.interval import CInterval
         total = CInterval.exact(0)
         for face in self.faces:
             iv = certified_trim_flux(face.surface, face.strip, face.inside,
                                      depth=depth)
+            tight = getattr(face, "tight", None)
+            if tight is not None:
+                lo, hi = max(iv.lo, tight.lo), min(iv.hi, tight.hi)
+                if lo > hi:
+                    raise ShellAuditError(
+                        f"strip bracket [{float(iv.lo):.6g}, "
+                        f"{float(iv.hi):.6g}] and tube bracket "
+                        f"[{float(tight.lo):.6g}, {float(tight.hi):.6g}] "
+                        f"are disjoint — two certified enclosures of one "
+                        f"flux cannot be; a premise is violated")
+                iv = CInterval(lo, hi)
             total = total + iv * CInterval.exact(face.sense)
         return total
 
