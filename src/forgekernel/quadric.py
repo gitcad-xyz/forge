@@ -997,7 +997,14 @@ def _annulus_band(outer_xy, cx, cy, r, n):
 
     The ring points are computed with EXACTLY the sub-expressions
     tess.lathe uses, so the hole rim re-uses the cylinder wall's vertex
-    floats verbatim and the stitch is seamless by construction."""
+    floats verbatim and the stitch is seamless by construction.
+
+    Floats are right here (ADR-0019): a mesh is a bounded-error VIEW, and
+    every quantity in this function is already display-precision float.
+    The 1e-6 coverage check never decides the exact model's topology — it
+    only chooses between two valid renderings of the same solid (the
+    stitched band or the merged-shells fallback), and it fails CLOSED to
+    the fallback."""
     ring = []
     for k in range(n):
         a = 2 * math.pi * k / n
