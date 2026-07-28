@@ -608,15 +608,37 @@ def logical_edges(solid: Solid) -> list[dict]:
 
 
 def _unit_normal(plane: Plane) -> Vec | None:
-    """Exact unit normal when it exists in the rationals (axis-aligned
-    faces, and any face whose |n| is a perfect rational square)."""
-    c = plane.canonical()[:3]
-    nn = c[0] * c[0] + c[1] * c[1] + c[2] * c[2]
+    """Exact unit normal when it exists in the rationals — i.e. when |n|² is
+    a perfect square IN ℚ — else None.
+
+    The perfect-square test must be done on the RATIONAL |n|². It used to be
+    ``root = isqrt(int(nn))``, and ``int()`` TRUNCATES a Fraction: a canonical
+    normal of (1, 0, 1/6) — a lofted solid's slanted face — has |n|² = 37/36,
+    ``int(37/36)`` is 1, ``isqrt(1)`` is 1, and 1·1 == 1, so the guard PASSED
+    and handed back (1, 0, 1/6), whose length is √37/6 ≈ 1.0138. The same
+    truncation let every non-axis-aligned normal through: canonical (3,4,0) is
+    (3/4, 1, 0) with |n|² = 25/16, which also truncates to 1.
+
+    An exactness guard made vacuous by an integer cast. Everything downstream
+    trusted the result to be unit — ``chamfer_planar`` offsets ``distance``
+    along ``cross(edge_dir, normal)`` — so a non-unit normal scaled every
+    chamfer wedge. On a frustum, chamfer(d=1) returned 100.55 of an original
+    784 with the answer audit reporting valid=True, and d=2 returned a
+    NEGATIVE volume.
+
+    p/q is a perfect rational square iff p and q are each perfect squares, and
+    then √(p/q) = √p/√q exactly — the same test the polygon inset already uses
+    for Pythagorean edges. No float, no tolerance (ADR-0019).
+    """
     import math as _m
 
-    root = _m.isqrt(int(nn))
-    if root * root != int(nn):
+    c = plane.canonical()[:3]
+    nn = F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2])
+    p, q = nn.numerator, nn.denominator
+    rp, rq = _m.isqrt(p), _m.isqrt(q)
+    if rp * rp != p or rq * rq != q:
         return None
+    root = F(rp) / F(rq)                      # F() is a 1-arg coercion here
     return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
 
 
