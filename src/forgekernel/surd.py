@@ -15,6 +15,31 @@ from fractions import Fraction
 from forgekernel.exact import F
 
 
+class MixedRadicals(ValueError):
+    """Two SurdVals live in different quadratic fields — ℚ[√2] and ℚ[√3]
+    have no common home short of the biquadratic tower (K3.1).
+
+    This is a PERMANENT boundary of the current number field, not a bug and
+    not an unwritten algorithm, so a caller needs to tell it apart from
+    both. It was a bare ``ValueError`` and a bbox comparison inside
+    ``boolean`` let it out of the Kernel seam raw — by the capability
+    bench's own taxonomy a raw exception escaping the seam is a CRASH, i.e.
+    a defect, so the one wall that is genuinely about exactness was also the
+    one the seam failed to report honestly. Named so callers can catch it
+    (every sibling refusal in forge already is: ``BooleanUnsupported``,
+    ``TrimLoopUnstitchable``, ``ShellAuditUncertified``, …).
+
+    Still a ``ValueError``, so existing ``except ValueError`` handlers
+    around surd arithmetic keep working unchanged.
+    """
+
+    def __init__(self, d_self: int, d_other: int):
+        self.radicals = (d_self, d_other)
+        super().__init__(
+            f"mixed radicals √{d_self} and √{d_other} — a bigger "
+            "field arrives at K3.1")
+
+
 def _squarefree(n: int) -> tuple[int, int]:
     """Factor n = m^2 * k with k square-free; return (m, k). n >= 0."""
     if n == 0:
@@ -89,9 +114,7 @@ class SurdVal:
         if o.b == 0:
             return self.d
         if self.d != o.d:
-            raise ValueError(
-                f"mixed radicals √{self.d} and √{o.d} — a bigger field "
-                "arrives at K3.1")
+            raise MixedRadicals(self.d, o.d)
         return self.d
 
     def __add__(self, o) -> "SurdVal":
@@ -120,7 +143,7 @@ class SurdVal:
             d = self._radical(o)
             return SurdVal(self.a * o.a, self.a * o.b + self.b * o.a, d)
         if self.d != o.d:
-            raise ValueError("mixed radicals in product — K3.1")
+            raise MixedRadicals(self.d, o.d)
         # (a+b√d)(c+e√d) = (ac + be d) + (ae + bc)√d
         return SurdVal(self.a * o.a + self.b * o.b * self.d,
                        self.a * o.b + self.b * o.a, self.d)
