@@ -179,6 +179,21 @@ def _axis_rotation(axis, deg):
     return None
 
 
+def _scale_factor(f):
+    """A uniform scale ratio as an exact positive value, or raise.
+
+    Every family in this module is closed under a SIMILARITY: scale a cylinder
+    and it is a cylinder, radius and all. Non-uniform scale is not closed —
+    squash a cylinder in x and it is an elliptic cylinder, which nothing here
+    holds — so callers that support it hand this a single ratio and get None
+    from their own `scaled` for the anisotropic case.
+    """
+    v = F(f)
+    if v <= 0:
+        raise ValueError(f"scale factor must be positive, got {f!r}")
+    return v
+
+
 @dataclass(frozen=True)
 class Cyl:
     """A solid right circular cylinder, axis +z through (cx, cy)."""
@@ -215,6 +230,11 @@ class Cyl:
         cx, cy = fn(self.cx, self.cy)
         z0, z1 = (-self.z1, -self.z0) if flipped else (self.z0, self.z1)
         return Cyl(cx, cy, self.r, z0, z1)
+
+    def scaled(self, f) -> "Cyl":
+        s = _scale_factor(f)
+        return Cyl(self.cx * s, self.cy * s, self.r * s,
+                   self.z0 * s, self.z1 * s)
 
     def volume(self) -> PiVal:
         return PiVal(0, self.r * self.r * (self.z1 - self.z0))
@@ -414,6 +434,12 @@ class DrilledSolid:
         except ValueError:
             return None                       # angle outside the exact table
         return DrilledSolid(base, bores)
+
+    def scaled(self, f) -> "DrilledSolid":
+        s = _scale_factor(f)
+        # Solid.scaled takes THREE factors — a uniform scale is the diagonal
+        return DrilledSolid(self.base.scaled(s, s, s),
+                            [b.scaled(s) for b in self.bores])
 
     def translated(self, x, y, z) -> "DrilledSolid":
         """Rigid translation — base and every bore move together (exact).
@@ -640,6 +666,10 @@ class Sphere:
         p = tuple(sum(m[i][j] * c[j] for j in range(3)) for i in range(3))
         return Sphere(p[0], p[1], p[2], self.r)
 
+    def scaled(self, f) -> "Sphere":
+        s = _scale_factor(f)
+        return Sphere(self.cx * s, self.cy * s, self.cz * s, self.r * s)
+
     def tessellate(self, deflection: float = 0.2) -> dict:
         """A UV-sphere display mesh with collapsed poles (floats legal)."""
         import math
@@ -715,6 +745,11 @@ class Cone:
         if flipped:                           # the radii travel with their ends
             return Cone(cx, cy, self.r2, self.r1, -self.z1, -self.z0)
         return Cone(cx, cy, self.r1, self.r2, self.z0, self.z1)
+
+    def scaled(self, f) -> "Cone":
+        s = _scale_factor(f)
+        return Cone(self.cx * s, self.cy * s, self.r1 * s, self.r2 * s,
+                    self.z0 * s, self.z1 * s)
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh (frustum wall + caps) via the lathe (floats legal)."""
@@ -837,6 +872,11 @@ class AxisStack:
         cx, cy = fn(self.cx, self.cy)
         return AxisStack(cx, cy, prims)
 
+    def scaled(self, f) -> "AxisStack":
+        s = _scale_factor(f)
+        return AxisStack(self.cx * s, self.cy * s,
+                         [p.scaled(s) for p in self.prims])
+
     def fuse(self, prim) -> "AxisStack":
         if getattr(prim, "cx", None) != self.cx or \
            getattr(prim, "cy", None) != self.cy:
@@ -949,6 +989,11 @@ class RevolveSolid:
         cx, cy = fn(self.cx, self.cy)
         loop = [(rr, -z) for rr, z in self.loop] if flipped else list(self.loop)
         return RevolveSolid(loop, cx, cy)
+
+    def scaled(self, f) -> "RevolveSolid":
+        s = _scale_factor(f)
+        return RevolveSolid([(r * s, z * s) for r, z in self.loop],
+                            self.cx * s, self.cy * s)
 
     def _edges(self):
         n = len(self.loop)
@@ -1357,6 +1402,16 @@ class DisjointUnion:
                 return None                   # one member cannot absorb it
             out.append(r)
         return DisjointUnion._unchecked(out)
+
+    def scaled(self, f) -> "DisjointUnion":
+        # a similarity is a bijection, so disjointness survives it
+        from forgekernel.brep import Solid
+
+        s = _scale_factor(f)
+        # Solid.scaled takes three factors; the quadrics take one ratio
+        return DisjointUnion._unchecked(
+            [m.scaled(s, s, s) if isinstance(m, Solid) else m.scaled(s)
+             for m in self.members])
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh = the members' meshes merged — and where a Cyl cap
@@ -1859,6 +1914,13 @@ class RoundedBox:
         new_size = tuple(size[perm[i]] for i in range(3))
         return RoundedBox(new_size[0], new_size[1], new_size[2], self.r,
                           new_lo)
+
+    def scaled(self, f) -> "RoundedBox":
+        # FOUR lengths, not three: forgetting the fillet radius yields a box
+        # of the right size with the wrong corners
+        s = _scale_factor(f)
+        return RoundedBox(self.a * s, self.b * s, self.c * s, self.r * s,
+                          tuple(v * s for v in self.origin))
 
     def volume(self) -> PiVal:
         r = self.r
