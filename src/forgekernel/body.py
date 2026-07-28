@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 from forgekernel.exact import F, cross, dot, sub
+from forgekernel.exact import as_fraction as _exact_as_fraction
 
 Vec = tuple
 
@@ -600,38 +601,11 @@ def _mixed_loop_area_centroid_f(loop: Loop, nf):
     return area, tuple(acc[k] / area for k in range(3))
 
 
-def _as_fraction(x):
-    """x as a Fraction if it is rational, else None.
-
-    Includes a ``SurdVal`` whose surd part is zero, which is what an exact
-    rotation leaves behind (a 45° turn types every coordinate as ℚ[√2] even
-    where the value is rational).
-
-    A value from a WIDER field has to PROVE it is rational rather than merely
-    look like a SurdVal. ``BiSurd`` (a + b√p + c√q + e√pq) also carries ``.a``
-    and ``.b``, so reading those two alone silently discarded c√q + e√pq:
-    960 − 20√3 is stored with b = 0 and came back as the plain rational 960,
-    and ``volume`` reported the rational part of an answer as the answer. Ask
-    ``demote()`` — the field's own statement of the smallest type that holds
-    the value — and refuse to guess when there are coefficients we do not
-    understand.
-    """
-    if isinstance(x, Fraction):
-        return x
-    if isinstance(x, int):
-        return Fraction(x)
-    dem = getattr(x, "demote", None)
-    if dem is not None:                          # BiSurd, and any wider field
-        x = dem()                                # -> Fraction | SurdVal | self
-        if isinstance(x, Fraction):
-            return x
-        if isinstance(x, int):
-            return Fraction(x)
-    b = getattr(x, "b", None)
-    if b is not None and b == 0 and not getattr(x, "c", 0) \
-            and not getattr(x, "e", 0):
-        return x.a
-    return None
+#: "is this exact value rational, and if so which Fraction" — ONE answer for
+#: the whole kernel, next to ``F`` in exact.py. It lived here first, and having
+#: it here meant ``brep`` grew its own version by assuming ``.numerator``,
+#: which crashed on every rotated plane. Same question, same answer, one place.
+_as_fraction = _exact_as_fraction
 
 
 def _exact(x, what: str) -> Fraction:

@@ -632,8 +632,19 @@ def _unit_normal(plane: Plane) -> Vec | None:
     """
     import math as _m
 
+    from forgekernel.exact import as_fraction
+
     c = plane.canonical()[:3]
-    nn = F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2])
+    nn = as_fraction(F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2]))
+    if nn is None:
+        # |n|² is not even rational, so there is certainly no RATIONAL unit
+        # normal. as_fraction, not `.numerator`: a ROTATED body's plane normal
+        # has SurdVal components, so |n|² arrives wearing a ℚ[√d] tag even when
+        # its value is an integer — a 45°-turned box canonicalises to
+        # n = (1,−1,0) and nn = 2. Reading .numerator off that raised
+        # AttributeError straight through the seam, and chamfer's whole refusal
+        # message became "'SurdVal' object has no attribute 'numerator'".
+        return None
     p, q = nn.numerator, nn.denominator
     rp, rq = _m.isqrt(p), _m.isqrt(q)
     if rp * rp != p or rq * rq != q:
@@ -646,12 +657,21 @@ def _unit_vec(v):
     """``v`` scaled to unit length, exactly — rational when it can be, else in
     ℚ[√d]. Used wherever a direction is assumed unit; assuming it without
     dividing is the defect this exists to prevent."""
+    import math as _m
+
+    from forgekernel.exact import as_fraction
     from forgekernel.surd import sqrt_rational
 
-    nn = F(v[0]) * F(v[0]) + F(v[1]) * F(v[1]) + F(v[2]) * F(v[2])
-    if nn == 0:
+    raw = F(v[0]) * F(v[0]) + F(v[1]) * F(v[1]) + F(v[2]) * F(v[2])
+    if raw == 0:
         raise ValueError("cannot normalise a zero vector")
-    import math as _m
+    nn = as_fraction(raw)
+    if nn is None:
+        # |v|² itself left ℚ — a direction whose own length squared is a surd
+        # needs a nested radical, which is a field above this one
+        raise ValueError(
+            f"cannot normalise exactly: |v|² = {raw!r} is not rational, so "
+            "|v| needs a nested radical (arrives with K3.2)")
     p, q = nn.numerator, nn.denominator
     rp, rq = _m.isqrt(p), _m.isqrt(q)
     root = (F(rp) / F(rq) if rp * rp == p and rq * rq == q
@@ -672,13 +692,18 @@ def _unit_normal_exact(plane: Plane):
     surd arithmetic raises ``MixedRadicals`` (K3.1) on its own when a caller
     tries, so no check is needed here.
     """
+    from forgekernel.exact import as_fraction
     from forgekernel.surd import sqrt_rational
 
     c = plane.canonical()[:3]
     exact = _unit_normal(plane)
     if exact is not None:
         return exact
-    nn = F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2])
+    nn = as_fraction(F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2]))
+    if nn is None:
+        raise ValueError(
+            "cannot take an exact unit normal: |n|² is not rational, so |n| "
+            "needs a nested radical (arrives with K3.2)")
     root = sqrt_rational(nn)
     return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
 

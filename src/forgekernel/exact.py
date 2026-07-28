@@ -41,6 +41,44 @@ def F(x):
     return Fraction(x)
 
 
+def as_fraction(x):
+    """``x`` as a ``Fraction`` if its VALUE is rational, else None.
+
+    The companion to ``F``. ``F`` widens — it lets ℚ[√d] and ℚ(√p,√q) through
+    untouched — and everything downstream that wants to do integer arithmetic
+    (a perfect-square test, a numerator) then has to ask whether what it got
+    is actually rational. Asking is the whole job, and it has to be asked in
+    ONE place, because getting it wrong has gone both ways here:
+
+    * assuming rational — ``nn.numerator`` on a rotated plane's |n|², which is
+      a ``SurdVal`` even when its value is 2, crashed chamfer and shell with
+      ``AttributeError`` on the most ordinary modelling step there is;
+    * assuming irrational — reading ``.b == 0`` as "rational" on a ``BiSurd``,
+      which carries ``.a`` and ``.b`` too, silently dropped ``c√q + e√pq`` and
+      reported 960 for 960 − 20√3.
+
+    A value from a wider field must PROVE it is rational: ask ``demote()`` for
+    the smallest type that holds it, and refuse to guess at coefficients we do
+    not understand.
+    """
+    if isinstance(x, Fraction):
+        return x
+    if isinstance(x, int):
+        return Fraction(x)
+    dem = getattr(x, "demote", None)
+    if dem is not None:                          # BiSurd, and any wider field
+        x = dem()                                # -> Fraction | SurdVal | self
+        if isinstance(x, Fraction):
+            return x
+        if isinstance(x, int):
+            return Fraction(x)
+    b = getattr(x, "b", None)                    # SurdVal: a + b√d
+    if b is not None and b == 0 and not getattr(x, "c", 0) \
+            and not getattr(x, "e", 0):
+        return Fraction(x.a)
+    return None
+
+
 def vec(x, y, z) -> Vec:
     return (F(x), F(y), F(z))
 
