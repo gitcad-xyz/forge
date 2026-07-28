@@ -14,8 +14,22 @@ Structure (all geometry exact rational; Bézier patches, weights 1):
    branch is guaranteed to be hit by at least one surviving leaf pair —
    completeness at resolution 2^-d, stated, not hoped.
 
-2. **Branch counting.** Surviving leaves are cells in A's parameter
-   square; connected components (8-neighbour union-find) = branches.
+2. **Branch counting.** At detection level, surviving leaves are cells
+   in A's parameter square and connected components (8-neighbour
+   union-find) = branches. The RESOLVED entry points (``ssi``,
+   ``ssi_surfaces``, ``ssi_curves``, ``ssi_trim_loops``, ``ssi_chains``)
+   cluster in the resolved cell graph instead: two point-bearing cells
+   are neighbours only if their A-boxes touch AND some surviving B-cell
+   of one touches some surviving B-cell of the other. A connected curve
+   is covered by surviving leaf PAIRS whose 4-dim (u,v,s,t) boxes
+   overlap consecutively, so the resolved graph never splits a genuine
+   branch; it separates disjoint curves the moment EITHER parameter
+   domain resolves the gap (A-only clustering welded curves that pass
+   close in A's domain but far apart in B's — the double-bump defect).
+   The ``closed`` flag is likewise exact: a branch is closed iff the
+   union of its cells encloses a hole in A's parameter domain
+   (:func:`_branch_is_closed`), a certificate at the stated resolution,
+   replacing the float median-gap heuristic.
 
 3. **Certified refinement.** Per cell, a float Newton solve lands a
    point on the intersection; the *certificate* is exact: the rational
@@ -422,7 +436,9 @@ def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
             unresolved.append((cell, (b0.u0, b0.u1, b0.v0, b0.v1)))
     if unresolved:
         raise SsiCellUncertified(unresolved, depth, _RESOLVE_LEVELS)
-    return {"branches": len(_cluster(alive)), "points": pts,
+    bmap = {cell: [(b.u0, b.u1, b.v0, b.v1) for _, b in groups[cell]]
+            for cell in alive}
+    return {"branches": len(_cluster_resolved(alive, bmap)), "points": pts,
             "uncertified": 0, "empty_certified": not pts,
             "cells": len(groups), "empty_cells": empty,
             "tightened": tightened}
@@ -430,8 +446,25 @@ def ssi(A: BezierPatch, B: BezierPatch, depth: int = 5):
 
 # -- K3.5: SSI over B-spline surfaces + ordered polylines ---------------------
 
-def _cluster(keys):
-    """Union-find over parameter boxes (closed-touch adjacency)."""
+def _cluster_resolved(cells, bmap):
+    """Union-find over point-bearing A-cells in the RESOLVED cell graph:
+    two cells are neighbours iff their A-boxes touch (closed touch, exact
+    ℚ) AND some surviving B-cell of one touches some surviving B-cell of
+    the other. ``bmap`` maps each A-cell to its list of surviving B-side
+    parameter boxes.
+
+    Soundness (never splits a genuine branch): a connected intersection
+    curve is covered by surviving leaf pairs, and any two points of the
+    curve close along it lie in pairs whose 4-dim (u,v,s,t) boxes
+    overlap — which is exactly "A-boxes touch and B-boxes touch". Every
+    A-cell containing curve is point-bearing (it cannot be proven empty,
+    and an unresolved cell raises), so the covering survives into this
+    graph. Completeness of separation is resolution-bounded the other
+    way: two disjoint curves closer than one cell in BOTH domains still
+    merge (merge-not-miss, as at detection level) — but curves welded
+    only by A-domain proximity now separate, because their B-cells are
+    far apart."""
+    keys = list(cells)
     parent = list(range(len(keys)))
 
     def find(i):
@@ -440,13 +473,13 @@ def _cluster(keys):
             i = parent[i]
         return i
 
-    def touch(k1, k2):
-        return (k1[0] <= k2[1] and k2[0] <= k1[1]
-                and k1[2] <= k2[3] and k2[2] <= k1[3])
-
     for i in range(len(keys)):
+        bi = bmap[keys[i]]
         for j in range(i + 1, len(keys)):
-            if touch(keys[i], keys[j]):
+            if not _boxes_touch_2d(keys[i], keys[j]):
+                continue
+            bj = bmap[keys[j]]
+            if any(_boxes_touch_2d(b1, b2) for b1 in bi for b2 in bj):
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[ri] = rj
@@ -454,6 +487,78 @@ def _cluster(keys):
     for i, k in enumerate(keys):
         groups.setdefault(find(i), []).append(k)
     return list(groups.values())
+
+
+def _branch_is_closed(cells, dom) -> bool:
+    """Exact closure certificate for one branch: ``True`` iff the union
+    of the branch's A-cells encloses a HOLE in A's parameter domain — a
+    complement component with no path to the domain border.
+
+    A closed intersection curve encloses area in the parameter domain,
+    and at adequate resolution its cell strip is an annulus whose
+    uncovered core is that hole; an open curve's strip deformation-
+    retracts to an arc and encloses nothing. The test is combinatorial
+    over exact ℚ coordinates (coordinate-compressed grid, never a
+    raster): strip squares are those covered by some cell; the
+    complement flood-fills inward from the domain border with
+    4-adjacency, the topological dual of the strip's 8-adjacency
+    clustering. Any unreached uncovered square is a hole.
+
+    This replaces the float median-gap heuristic of the old
+    ``_order_branch`` (wrong in both directions under execution) and the
+    end-cell-adjacency rule (which called two merged open curves a loop).
+    Resolution caveat, stated rather than hidden: a hole finer than one
+    cell is invisible at this depth, so a genuinely closed loop whose
+    interior is sub-cell reports ``False`` — raise the depth (tighten-
+    or-refuse), the flag never guesses. The converse — an OPEN curve
+    whose two interior endpoints seal a hole — needs curve endpoints
+    strictly inside both domains, i.e. a tangential retreat, which
+    refuses upstream as :class:`SsiCellUncertified` before reaching
+    here."""
+    import bisect
+
+    (du0, du1), (dv0, dv1) = dom
+    us = {F(du0), F(du1)}
+    vs = {F(dv0), F(dv1)}
+    for c in cells:
+        us.add(F(c[0]))
+        us.add(F(c[1]))
+        vs.add(F(c[2]))
+        vs.add(F(c[3]))
+    us, vs = sorted(us), sorted(vs)
+    nu, nv = len(us) - 1, len(vs) - 1
+    if nu < 3 or nv < 3:
+        return False                      # no room for an interior hole
+    covered = [[False] * nv for _ in range(nu)]
+    for c in cells:
+        i0 = bisect.bisect_left(us, F(c[0]))
+        i1 = bisect.bisect_left(us, F(c[1]))
+        j0 = bisect.bisect_left(vs, F(c[2]))
+        j1 = bisect.bisect_left(vs, F(c[3]))
+        for i in range(i0, i1):
+            for j in range(j0, j1):
+                covered[i][j] = True
+    seen = [[False] * nv for _ in range(nu)]
+    stack = []
+    for i in range(nu):
+        for j in (0, nv - 1):
+            if not covered[i][j] and not seen[i][j]:
+                seen[i][j] = True
+                stack.append((i, j))
+    for j in range(nv):
+        for i in (0, nu - 1):
+            if not covered[i][j] and not seen[i][j]:
+                seen[i][j] = True
+                stack.append((i, j))
+    while stack:
+        i, j = stack.pop()
+        for i2, j2 in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+            if 0 <= i2 < nu and 0 <= j2 < nv and not covered[i2][j2] \
+                    and not seen[i2][j2]:
+                seen[i2][j2] = True
+                stack.append((i2, j2))
+    return any(not covered[i][j] and not seen[i][j]
+               for i in range(nu) for j in range(nv))
 
 
 def _rstr(x) -> str:
@@ -624,7 +729,7 @@ def _ssi_resolved(A, B, depth: int, use_rust: bool | None):
             unresolved.append((abox, b0))
     if unresolved:
         raise SsiCellUncertified(unresolved, depth, _RESOLVE_LEVELS)
-    branches = _cluster(list(points))
+    branches = _cluster_resolved(list(points), bcells)
     return points, branches, {"cells": len(groups), "empty_cells": empty,
                               "tightened": tightened}, bcells
 
@@ -665,53 +770,14 @@ def ssi_surfaces(A, B, depth: int = 4, use_rust: bool | None = None):
             "uncertified": 0, "empty_certified": not points, **stats}
 
 
-def _order_branch(points):
-    """Chain a branch's certified points into an ordered polyline in A's
-    (u, v) parameter space by greedy nearest-neighbour, started from an
-    endpoint via the double-sweep diameter heuristic (furthest point from
-    an arbitrary sample is an endpoint of an open arc). Reports whether the
-    branch closes on itself. Float ordering over exact points — a
-    render/report artifact; the points themselves are the certified data."""
-    n = len(points)
-    if n <= 2:
-        return list(points), False
-    uv = [(float(p[0]), float(p[1])) for p in points]
-
-    def d2(i, j):
-        return (uv[i][0] - uv[j][0]) ** 2 + (uv[i][1] - uv[j][1]) ** 2
-
-    start = max(range(n), key=lambda i: d2(i, 0))   # an extreme end
-    todo = set(range(n))
-    todo.discard(start)
-    order = [start]
-    gaps = []
-    while todo:
-        last = order[-1]
-        nxt = min(todo, key=lambda i: d2(i, last))
-        gaps.append(d2(nxt, last) ** 0.5)
-        order.append(nxt)
-        todo.discard(nxt)
-    ordered = [points[i] for i in order]
-    # Closure needs enough samples to be decidable: with only 3 points the
-    # median-of-two collapses to the LARGER gap, and the triangle inequality
-    # then forces wrap ≤ g1+g2 ≤ 2·median for ANY three points — so the test
-    # would call every 3-point arc closed. A genuine median needs ≥3 gaps
-    # (n ≥ 4); below that, report open (closure is undecidable from the
-    # samples) rather than let a float heuristic mis-decide the topology.
-    if n < 4:
-        return ordered, False
-    wrap = d2(order[0], order[-1]) ** 0.5
-    med = sorted(gaps)[len(gaps) // 2]
-    closed = med > 0 and wrap <= 2.0 * med
-    return ordered, closed
-
-
 def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):
     """Ordered SSI output: the certified intersection points chained into
     one parameter-space polyline **per branch** (a branch = a connected
-    component of surviving cells in A's parameter domain). Within a branch
-    the points are ordered along the curve; a branch that returns to its
-    start is flagged ``closed``.
+    component of the RESOLVED cell graph — A-boxes touching AND surviving
+    B-cells touching, see :func:`_cluster_resolved`). Within a branch the
+    points are ordered along the curve; ``closed`` is the exact strip
+    certificate of :func:`_branch_is_closed` (the branch's cells enclose
+    a hole in A's parameter domain), never a float heuristic.
 
     Returns ``{"curves": [{"points": [(u,v,s,t)…] (exact ℚ),
     "xyz": [(x,y,z)…] (float, for render), "closed": bool}, …],
@@ -726,13 +792,12 @@ def ssi_curves(A, B, depth: int = 4, use_rust: bool | None = None):
         return {"curves": [], "uncertified": 0, "empty_certified": True,
                 "cells": 0, "empty_cells": 0, "tightened": 0}
     points, branches, stats, _ = res
-    branch_of = {abox: bi for bi, group in enumerate(branches) for abox in group}
-    per_branch: dict[int, list] = {bi: [] for bi in range(len(branches))}
-    for abox, pt in points.items():
-        per_branch[branch_of[abox]].append(pt)
+    adom = A.domain()
     curves = []
-    for bi in range(len(branches)):
-        ordered, closed = _order_branch(per_branch[bi])
+    for group in branches:
+        items = _order_chain([(abox, points[abox]) for abox in group])
+        ordered = [pt for _, pt in items]
+        closed = _branch_is_closed(group, adom)
         xyz = [tuple(float(c) for c in A.eval(p[0], p[1])) for p in ordered]
         curves.append({"points": ordered, "xyz": xyz, "closed": closed})
     return {"curves": curves, "uncertified": 0,
@@ -893,9 +958,11 @@ def _refine_constrained(A, B, pt, fixed, iters: int = 16):
 def _order_chain(items):
     """Greedy nearest-neighbour ordering of ``[(a_cell, point), …]`` in
     A's (u, v), started from an endpoint via the double-sweep diameter
-    heuristic — :func:`_order_branch`'s rule, carrying the cells along.
-    Float ordering over exact points (a report artifact; the points stay
-    the certified data)."""
+    heuristic (furthest point from an arbitrary sample is an endpoint of
+    an open arc), carrying the cells along. Float ordering over exact
+    points (a report artifact; the points stay the certified data —
+    topology is decided by :func:`_cluster_resolved` and
+    :func:`_branch_is_closed`, never by this ordering)."""
     n = len(items)
     if n <= 1:
         return list(items)
@@ -1011,7 +1078,9 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
     """SSI branches as closed TRIM LOOPS on BOTH parameter domains — the
     input :func:`forgekernel.trim.split_trim_region` partitions a face by.
 
-    Closed branches become loops directly. OPEN branches are stitched:
+    Closed branches (the exact strip certificate of
+    :func:`_branch_is_closed` — the branch's cells enclose a hole in A's
+    parameter domain) become loops directly. OPEN branches are stitched:
     each chain end is extended to a residual-certified domain-border
     crossing (:func:`_refine_constrained` with the border value pinned
     exactly), then the loop is closed with border segments and the patch
@@ -1049,12 +1118,17 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
                 bi, "resolution",
                 f"only {len(chain)} certified point(s) at depth {depth} — "
                 f"too few to form a loop; raise depth")
+        if _branch_is_closed(group, adom):
+            # exact strip certificate: the branch's cells enclose a hole
+            out.append({"closed": True, "points": chain,
+                        "loop_a": [p[0:2] for p in chain],
+                        "loop_b": [p[2:4] for p in chain]})
+            continue
         ends = (items[0], items[-1])
         ends_touch_border = any(
             _cell_hits_border(acell, adom)
             or _cell_hits_border(bcells[acell][0], bdom)
             for acell, _ in ends)
-        ends_adjacent = _boxes_touch_2d(items[0][0], items[-1][0])
         stitched = None
         if ends_touch_border:
             p0 = _extend_end(A, B, chain[0], ends[0][0],
@@ -1063,7 +1137,7 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
                              bcells[ends[1][0]][0])
             if p0 is not None and p1 is not None:
                 stitched = (p0, p1)
-            elif not ends_adjacent:
+            else:
                 raise TrimLoopUnstitchable(
                     bi, "border_uncertified",
                     "open chain end near a domain border but no "
@@ -1090,18 +1164,12 @@ def ssi_trim_loops(A, B, depth: int = 4, use_rust: bool | None = None):
             out.append({"closed": False, "points": full,
                         "loop_a": loops_ab[0], "loop_b": loops_ab[1]})
             continue
-        if ends_adjacent:
-            out.append({"closed": True, "points": chain,
-                        "loop_a": [p[0:2] for p in chain],
-                        "loop_b": [p[2:4] for p in chain]})
-            continue
-        gap = sum((float(chain[0][i] - chain[-1][i])) ** 2
-                  for i in (0, 1)) ** 0.5
         raise TrimLoopUnstitchable(
             bi, "open_interior",
-            f"chain ends are non-adjacent interior cells (parameter gap "
-            f"{gap:.3g} in A's domain) and touch no border — open branch "
-            f"with no certified closure; raise depth or treat as tangency")
+            "branch is not certifiably closed (its cell strip encloses "
+            "no hole in A's parameter domain) and its chain ends touch "
+            "no domain border — open branch with no certified closure; "
+            "raise depth or treat as tangency")
     return {"loops": out, "empty_certified": not out, **stats}
 
 
@@ -1283,12 +1351,14 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
                 bi, "resolution",
                 f"only {len(chain)} certified point(s) at depth {depth} — "
                 f"too few to form a chain; raise depth")
-        ends_adjacent = _boxes_touch_2d(items[0][0], items[-1][0])
+        # exact strip certificate: closed iff the branch's cells enclose
+        # a hole in A's parameter domain (never chain-end adjacency)
+        is_closed = _branch_is_closed(group, adom)
         ends = []
         for e, (acell, pt) in enumerate((items[0], items[-1])):
             a_on = _border_sides(adom, pt[0:2])
             b_on = _border_sides(bdom, pt[2:4])
-            if not a_on and not b_on:
+            if not a_on and not b_on and not is_closed:
                 touches = (_cell_hits_border(acell, adom)
                            or any(_cell_hits_border(b, bdom)
                                   for b in bcells[acell]))
@@ -1303,7 +1373,7 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
                             cellsq = cellsq + [None]
                         a_on = _border_sides(adom, p2[0:2])
                         b_on = _border_sides(bdom, p2[2:4])
-                    elif not ends_adjacent:
+                    else:
                         raise TrimLoopUnstitchable(
                             bi, "border_uncertified",
                             "open chain end near a domain border but no "
@@ -1331,14 +1401,13 @@ def ssi_chains(A, B, depth: int = 4, use_rust: bool | None = None):
         cellsq = [cellsq[i] for i in keep_idx]
         cpairs = [cell_pair(ab, p) for ab, p in zip(cellsq, chain)]
         if ends[0] is None and ends[1] is None:
-            if not ends_adjacent:
-                gap = sum((float(chain[0][i] - chain[-1][i])) ** 2
-                          for i in (0, 1)) ** 0.5
+            if not is_closed:
                 raise TrimLoopUnstitchable(
                     bi, "open_interior",
-                    f"chain ends are non-adjacent interior cells "
-                    f"(parameter gap {gap:.3g} in A's domain) and touch "
-                    f"no border — no certified closure")
+                    "branch is not certifiably closed (its cell strip "
+                    "encloses no hole in A's parameter domain) and its "
+                    "chain ends touch no domain border — no certified "
+                    "closure; raise depth or treat as tangency")
             out.append({"closed": True, "points": chain, "cells": cpairs,
                         "ends": (None, None)})
             continue
