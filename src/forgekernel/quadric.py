@@ -114,6 +114,27 @@ class PiVal:
         return f"({self.a} + {self.b}·π)"
 
 
+def _mirror_axis(axis: str) -> int:
+    """The coordinate index an axis-plane reflection negates.
+
+    Every family in this module is CLOSED under such a reflection — a mirrored
+    cylinder is a cylinder, a mirrored frustum is a frustum with its radii
+    swapped — so ``mirrored`` is exact and structural: negate a coordinate,
+    swap an interval's ends. Nothing costs arithmetic.
+
+    It matters because the feature paths (chamfer, fillet, shell) dispatch on
+    representation. A reflection that dropped to the generic canonical ``Body``
+    made every one of them refuse a shape they handle perfectly well upright,
+    which is 30 of gitcad's 34 mirror-asymmetry pairs. For an isometry σ the
+    contract is op(σS) ≡ σ op(S); a kernel that answers one and refuses the
+    other is not wrong about geometry, it is wrong about itself.
+    """
+    i = {"x": 0, "y": 1, "z": 2}.get(axis)
+    if i is None:
+        raise ValueError(f"mirror axis must be x|y|z, got {axis!r}")
+    return i
+
+
 @dataclass(frozen=True)
 class Cyl:
     """A solid right circular cylinder, axis +z through (cx, cy)."""
@@ -133,6 +154,14 @@ class Cyl:
     def translated(self, x, y, z) -> "Cyl":
         return Cyl(self.cx + F(x), self.cy + F(y), self.r,
                    self.z0 + F(z), self.z1 + F(z))
+
+    def mirrored(self, axis: str) -> "Cyl":
+        i = _mirror_axis(axis)
+        if i == 0:
+            return Cyl(-self.cx, self.cy, self.r, self.z0, self.z1)
+        if i == 1:
+            return Cyl(self.cx, -self.cy, self.r, self.z0, self.z1)
+        return Cyl(self.cx, self.cy, self.r, -self.z1, -self.z0)
 
     def volume(self) -> PiVal:
         return PiVal(0, self.r * self.r * (self.z1 - self.z0))
@@ -316,6 +345,10 @@ class DrilledSolid:
 
     def bbox(self):
         return self.base.bbox()
+
+    def mirrored(self, axis: str) -> "DrilledSolid":
+        return DrilledSolid(self.base.mirrored(axis),
+                            [b.mirrored(axis) for b in self.bores])
 
     def translated(self, x, y, z) -> "DrilledSolid":
         """Rigid translation — base and every bore move together (exact).
@@ -523,6 +556,12 @@ class Sphere:
     def translated(self, x, y, z) -> "Sphere":
         return Sphere(self.cx + F(x), self.cy + F(y), self.cz + F(z), self.r)
 
+    def mirrored(self, axis: str) -> "Sphere":
+        c = [self.cx, self.cy, self.cz]
+        i = _mirror_axis(axis)
+        c[i] = -c[i]
+        return Sphere(c[0], c[1], c[2], self.r)
+
     def tessellate(self, deflection: float = 0.2) -> dict:
         """A UV-sphere display mesh with collapsed poles (floats legal)."""
         import math
@@ -578,6 +617,16 @@ class Cone:
     def translated(self, x, y, z) -> "Cone":
         return Cone(self.cx + F(x), self.cy + F(y), self.r1, self.r2,
                     self.z0 + F(z), self.z1 + F(z))
+
+    def mirrored(self, axis: str) -> "Cone":
+        i = _mirror_axis(axis)
+        if i == 0:
+            return Cone(-self.cx, self.cy, self.r1, self.r2, self.z0, self.z1)
+        if i == 1:
+            return Cone(self.cx, -self.cy, self.r1, self.r2, self.z0, self.z1)
+        # r1 lives at z0, so reflecting z has to carry it to the other end —
+        # the one case where negating a coordinate is not the whole story
+        return Cone(self.cx, self.cy, self.r2, self.r1, -self.z1, -self.z0)
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh (frustum wall + caps) via the lathe (floats legal)."""
@@ -673,6 +722,14 @@ class AxisStack:
         self.cx, self.cy = F(cx), F(cy)
         self.prims = list(prims)
 
+    def mirrored(self, axis: str) -> "AxisStack":
+        # the members are coaxial by construction and a reflection keeps them
+        # so; _pieces sorts its cuts, so the z-order need not be restored
+        i = _mirror_axis(axis)
+        return AxisStack(-self.cx if i == 0 else self.cx,
+                         -self.cy if i == 1 else self.cy,
+                         [p.mirrored(axis) for p in self.prims])
+
     def fuse(self, prim) -> "AxisStack":
         if getattr(prim, "cx", None) != self.cx or \
            getattr(prim, "cy", None) != self.cy:
@@ -761,6 +818,19 @@ class RevolveSolid:
         return RevolveSolid([(r, zz + F(z)) for r, zz in self.loop],
                             self.cx + F(x), self.cy + F(y))
 
+    def mirrored(self, axis: str) -> "RevolveSolid":
+        # the profile is a (r, z) loop swept about a VERTICAL axis, so an x or
+        # y reflection only moves the axis — the solid is already symmetric
+        # about every plane through it. Reflecting z negates the profile's z,
+        # which reverses the loop's winding; __init__ re-orients it.
+        i = _mirror_axis(axis)
+        if i == 2:
+            return RevolveSolid([(r, -z) for r, z in self.loop],
+                                self.cx, self.cy)
+        return RevolveSolid(list(self.loop),
+                            -self.cx if i == 0 else self.cx,
+                            -self.cy if i == 1 else self.cy)
+
     def _edges(self):
         n = len(self.loop)
         for i in range(n):
@@ -834,6 +904,15 @@ def bore_cyl(cyl: "Cyl", bore: "Cyl") -> object:
 def _member_volume(m):
     if isinstance(m, (Sphere, Cone)):
         return AxisStack(m.cx, m.cy, [m]).volume()
+    if not hasattr(m, "volume"):
+        # a member that already fell through to the canonical B-rep — an
+        # operation on a union member returns a Body, and a union whose
+        # members are a mix of representations is exactly what ADR-0021's
+        # canonical form is for. Ask body.volume rather than AttributeError
+        # out through the seam.
+        from forgekernel import body as B
+
+        return B.volume(m)
     return m.volume()
 
 
@@ -842,6 +921,10 @@ def _member_centroid(m):
         return AxisStack(m.cx, m.cy, [m]).centroid_f()
     if hasattr(m, "centroid_f"):
         return m.centroid_f()
+    if not hasattr(m, "centroid"):
+        from forgekernel import body as B
+
+        return tuple(float(x) for x in B.centroid(m))
     return tuple(float(x) for x in m.centroid())
 
 
@@ -1123,6 +1206,14 @@ class DisjointUnion:
         for m in self.members:
             _classify_pair(m, other)
         return DisjointUnion(self.members + [other])
+
+    def mirrored(self, axis: str) -> "DisjointUnion":
+        # _unchecked, not the validating constructor: a reflection is a
+        # bijection, so members that were disjoint still are. Re-running the
+        # pairwise classifier would only spend exact arithmetic re-deriving a
+        # fact the isometry already guarantees.
+        return DisjointUnion._unchecked(
+            [m.mirrored(axis) for m in self.members])
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh = the members' meshes merged — and where a Cyl cap
@@ -1583,6 +1674,15 @@ class RoundedBox:
     def _pqs(self):
         r = self.r
         return self.a - 2 * r, self.b - 2 * r, self.c - 2 * r
+
+    def mirrored(self, axis: str) -> "RoundedBox":
+        # the box spans origin .. origin + (a, b, c), so reflecting an axis
+        # sends that interval to −(origin + size) .. −origin: the FAR corner
+        # becomes the new origin. Extents and radius are unchanged.
+        i = _mirror_axis(axis)
+        o = list(self.origin)
+        o[i] = -(o[i] + (self.a, self.b, self.c)[i])
+        return RoundedBox(self.a, self.b, self.c, self.r, tuple(o))
 
     def volume(self) -> PiVal:
         r = self.r
