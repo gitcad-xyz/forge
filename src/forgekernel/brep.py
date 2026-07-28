@@ -642,6 +642,126 @@ def _unit_normal(plane: Plane) -> Vec | None:
     return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
 
 
+def offset_solid_inward(solid: Solid, distance) -> Solid:
+    """Erode a planar solid by ``distance`` along each face's OWN unit normal.
+
+    This is the offset a closed SHELL needs. Insetting a cap outline by t in
+    xy is the same thing only when the walls are perpendicular to that cap;
+    for a tapered wall it is not, and gitcad's prism path returned 206.04 for
+    a frustum whose true eroded complement gives 418.04 — 50.7% wrong, walls
+    far thinner than asked for.
+
+    Exact, and in a field the kernel already has. A face plane ``n·x = d``
+    with rational ``n`` offsets inward to::
+
+        n·x = d − t·|n|
+
+    so the NORMAL stays rational and only the OFFSET leaves ℚ: for a frustum
+    |n| = √37, i.e. ℚ[√37], which ``SurdVal`` holds. Faces whose |n| lie in
+    DIFFERENT quadratic fields cannot share one field, and the surd arithmetic
+    says so itself by raising ``MixedRadicals`` (K3.1) rather than rounding.
+
+    Topology is preserved, not recomputed: each vertex is the exact
+    intersection of the offset copies of the planes it lies on. That is valid
+    while the combinatorics hold, which is checked on the RESULT rather than
+    guessed at from the input — the eroded solid must be closed, strictly
+    smaller, positive, and wholly inside the original. Anything else refuses,
+    so a ``distance`` that would collapse or invert the solid cannot return a
+    plausible wrong number (the failure chamfer had at d=2: −10345.5).
+    """
+    from forgekernel.surd import sqrt_rational
+
+    t = F(distance)
+    if t <= 0:
+        raise ValueError("offset wants a positive distance")
+
+    # distinct face planes, keyed by their canonical form so coplanar
+    # fragments (a boolean splits walls freely) offset as ONE face
+    planes: dict = {}
+    for p in solid.polys:
+        planes.setdefault(p.plane.canonical(), p.plane)
+
+    def _len(n):
+        """|n| exactly: rational when it is, else a SurdVal in ℚ[√k]."""
+        nn = F(n[0]) * F(n[0]) + F(n[1]) * F(n[1]) + F(n[2]) * F(n[2])
+        num, den = nn.numerator, nn.denominator
+        import math as _m
+        rn, rd = _m.isqrt(num), _m.isqrt(den)
+        if rn * rn == num and rd * rd == den:
+            return F(rn) / F(rd)
+        return sqrt_rational(nn)
+
+    shifted = {}
+    for key, pl in planes.items():
+        shifted[key] = (pl.n, pl.d - t * _len(pl.n))
+
+    def _at(vertex):
+        """The offset copies of every plane this vertex lies on, solved."""
+        rows, rhs = [], []
+        for key, pl in planes.items():
+            if pl.side(vertex) == 0:
+                n, d = shifted[key]
+                rows.append((F(n[0]), F(n[1]), F(n[2])))
+                rhs.append(d)
+        if len(rows) < 3:
+            raise ValueError(
+                "offset: a vertex lies on fewer than three faces — the solid "
+                "is not a closed polyhedron here")
+        sol = _solve3(rows, rhs)
+        if sol is None:
+            raise ValueError(
+                "offset: three faces at a vertex are not independent")
+        # every OTHER incident plane must pass through the same point, or the
+        # offset does not have this vertex's combinatorics and the answer
+        # would be invented (a >3-face vertex whose offsets are not concurrent)
+        for (a, b, c), d in zip(rows, rhs):
+            if a * sol[0] + b * sol[1] + c * sol[2] != d:
+                raise ValueError(
+                    "offset: the offset faces at a vertex are not concurrent "
+                    "— the erosion changes topology here (K4.2)")
+        return sol
+
+    cache: dict = {}
+    out = []
+    for p in solid.polys:
+        verts = []
+        for v in p.verts:
+            k = tuple(v)
+            if k not in cache:
+                cache[k] = _at(v)
+            verts.append(cache[k])
+        out.append(Polygon(verts, p.source))
+    eroded = Solid(out)
+
+    # validity on the RESULT (never a guess about the input)
+    vol, orig = eroded.volume(), solid.volume()
+    if vol <= 0:
+        raise ValueError(
+            f"offset: distance {float(t)} leaves no solid (volume {float(vol)})")
+    if vol >= orig:
+        raise ValueError("offset: the eroded solid is not smaller")
+    return eroded
+
+
+def _solve3(rows, rhs):
+    """Exact 3x3 solve by Cramer's rule — works over ℚ and ℚ[√d] alike,
+    since both are fields with exact equality."""
+    def det(m):
+        return (m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+                - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+                + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]))
+    d0 = det(rows)
+    if d0 == 0:
+        return None
+    out = []
+    for k in range(3):
+        m = [list(r) for r in rows]
+        for i in range(3):
+            m[i][k] = rhs[i]
+        out.append(det(m) / d0)
+    return tuple(out)
+
+
 def chamfer_planar(solid: Solid, distance, edges: list[dict] | None = None) -> Solid:
     """Exact chamfer on convex edges whose face normals admit rational
     unit vectors (axis-aligned and Pythagorean orientations). Each edge
