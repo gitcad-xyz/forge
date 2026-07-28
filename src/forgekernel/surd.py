@@ -246,6 +246,15 @@ class SurdVal:
             return NotImplemented
         if o.b == 0:                             # divide by a rational
             return SurdVal(self.a / o.a, self.b / o.a, self.d)
+        # DIVISION PROMOTES TOO. It was the one arithmetic route #127 left
+        # behind: the conjugate trick below builds `self * conj`, which
+        # promotes to a BiSurd the moment the two live in different quadratic
+        # fields, and then reading `num.d` off it raised AttributeError. Found
+        # by rotating a sphere about an oblique axis, where the centre lands in
+        # ℚ(√2,√3) — BiSurd divides perfectly well, it was simply never asked.
+        pr = self._promote(o)
+        if pr is not None:
+            return pr[0] / pr[1]
         # divide by (c+e√d) via the conjugate: ·(c−e√d)/(c²−e²d)
         denom = o.a * o.a - o.b * o.b * o.d      # rational, nonzero
         num = self * SurdVal(o.a, -o.b, o.d)

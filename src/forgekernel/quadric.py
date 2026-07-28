@@ -135,6 +135,50 @@ def _mirror_axis(axis: str) -> int:
     return i
 
 
+def _axis_rotation(axis, deg):
+    """How a +z-axis family absorbs a rotation, or None if it does not.
+
+    Returns ``(fn, flipped)`` where ``fn(cx, cy) -> (cx', cy')`` moves the axis
+    POSITION and ``flipped`` says the +z axis became −z (so z-intervals and any
+    end-labelled data travel with their ends). None means the rotation is a
+    genuine TILT — the family cannot express the result and the caller should
+    fall through to the canonical B-rep, which is an answer rather than a
+    refusal.
+
+    Absorbed:
+
+    * any exact rotation about **z** — the axis direction is unchanged and only
+      (cx, cy) turn. This is the common case in real modelling and it was going
+      through the generic path, which cost the representation and with it every
+      feature and boolean that dispatches on one;
+    * a half turn about **x** or **y** — +z becomes −z, which Cyl and Cone can
+      express by swapping and negating their ends, exactly as ``mirrored``
+      does. (x, y) also reflect, one of them.
+
+    A quarter turn about x or y lays the axis into the xy-plane and is NOT
+    absorbed; nor is any angle outside the exact ℚ[√d] table.
+    """
+    from forgekernel.kernel import _cos_sin_deg
+
+    if deg != int(deg):
+        return None
+    d = int(deg) % 360
+    ax, ay, az = (F(axis[0]), F(axis[1]), F(axis[2]))
+    if ax == 0 and ay == 0 and az != 0:
+        cs = _cos_sin_deg(d if az > 0 else -d)
+        if cs is None:
+            return None                       # angle outside the exact table
+        c, s = cs
+        return (lambda x, y: (c * x - s * y, s * x + c * y)), False
+    if d != 180:
+        return None                           # only a half turn flips the axis
+    if ay == 0 and az == 0 and ax != 0:       # 180° about x: y→−y, z→−z
+        return (lambda x, y: (x, -y)), True
+    if ax == 0 and az == 0 and ay != 0:       # 180° about y: x→−x, z→−z
+        return (lambda x, y: (-x, y)), True
+    return None
+
+
 @dataclass(frozen=True)
 class Cyl:
     """A solid right circular cylinder, axis +z through (cx, cy)."""
@@ -162,6 +206,15 @@ class Cyl:
         if i == 1:
             return Cyl(self.cx, -self.cy, self.r, self.z0, self.z1)
         return Cyl(self.cx, self.cy, self.r, -self.z1, -self.z0)
+
+    def rotated(self, axis, deg):
+        r = _axis_rotation(axis, deg)
+        if r is None:
+            return None
+        fn, flipped = r
+        cx, cy = fn(self.cx, self.cy)
+        z0, z1 = (-self.z1, -self.z0) if flipped else (self.z0, self.z1)
+        return Cyl(cx, cy, self.r, z0, z1)
 
     def volume(self) -> PiVal:
         return PiVal(0, self.r * self.r * (self.z1 - self.z0))
@@ -349,6 +402,18 @@ class DrilledSolid:
     def mirrored(self, axis: str) -> "DrilledSolid":
         return DrilledSolid(self.base.mirrored(axis),
                             [b.mirrored(axis) for b in self.bores])
+
+    def rotated(self, axis, deg):
+        from forgekernel.kernel import rotate as _rotate_solid
+
+        bores = [b.rotated(axis, deg) for b in self.bores]
+        if any(b is None for b in bores):
+            return None                       # a bore would leave the family
+        try:
+            base = _rotate_solid(self.base, axis, deg)
+        except ValueError:
+            return None                       # angle outside the exact table
+        return DrilledSolid(base, bores)
 
     def translated(self, x, y, z) -> "DrilledSolid":
         """Rigid translation — base and every bore move together (exact).
@@ -562,6 +627,19 @@ class Sphere:
         c[i] = -c[i]
         return Sphere(c[0], c[1], c[2], self.r)
 
+    def rotated(self, axis, deg):
+        """A sphere absorbs EVERY rotation, being round: only the centre
+        moves, and it moves by the same exact matrix everything else uses."""
+        from forgekernel.kernel import _rotation_matrix
+
+        try:
+            m = _rotation_matrix(axis, deg)
+        except ValueError:
+            return None                       # angle outside the exact table
+        c = (self.cx, self.cy, self.cz)
+        p = tuple(sum(m[i][j] * c[j] for j in range(3)) for i in range(3))
+        return Sphere(p[0], p[1], p[2], self.r)
+
     def tessellate(self, deflection: float = 0.2) -> dict:
         """A UV-sphere display mesh with collapsed poles (floats legal)."""
         import math
@@ -628,6 +706,16 @@ class Cone:
         # the one case where negating a coordinate is not the whole story
         return Cone(self.cx, self.cy, self.r2, self.r1, -self.z1, -self.z0)
 
+    def rotated(self, axis, deg):
+        r = _axis_rotation(axis, deg)
+        if r is None:
+            return None
+        fn, flipped = r
+        cx, cy = fn(self.cx, self.cy)
+        if flipped:                           # the radii travel with their ends
+            return Cone(cx, cy, self.r2, self.r1, -self.z1, -self.z0)
+        return Cone(cx, cy, self.r1, self.r2, self.z0, self.z1)
+
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh (frustum wall + caps) via the lathe (floats legal)."""
         from forgekernel.tess import lathe
@@ -651,15 +739,23 @@ class _Quad:
     def at(self, z: Fraction) -> Fraction:
         return self.a * z * z + self.b * z + self.c
 
-    def integral(self, lo: Fraction, hi: Fraction) -> Fraction:
-        return (self.a * (hi ** 3 - lo ** 3) / 3
-                + self.b * (hi ** 2 - lo ** 2) / 2 + self.c * (hi - lo))
+    # x*x, never x**2. The bounds are only Fractions when nothing upstream has
+    # been rotated: a body turned about an oblique axis puts its z-extent in
+    # ℚ[√d] or ℚ(√p,√q), and neither SurdVal nor BiSurd implements __pow__ —
+    # so `hi ** 3` raised TypeError out of a VOLUME. Repeated multiplication is
+    # the house convention here for exactly this reason and costs nothing.
+    def integral(self, lo, hi):
+        h2, l2 = hi * hi, lo * lo
+        return (self.a * (h2 * hi - l2 * lo) / 3
+                + self.b * (h2 - l2) / 2 + self.c * (hi - lo))
 
-    def z_integral(self, lo: Fraction, hi: Fraction) -> Fraction:
+    def z_integral(self, lo, hi):
         """Integral of z*q(z)."""
-        return (self.a * (hi ** 4 - lo ** 4) / 4
-                + self.b * (hi ** 3 - lo ** 3) / 3
-                + self.c * (hi ** 2 - lo ** 2) / 2)
+        h2, l2 = hi * hi, lo * lo
+        h3, l3 = h2 * hi, l2 * lo
+        return (self.a * (h3 * hi - l3 * lo) / 4
+                + self.b * (h3 - l3) / 3
+                + self.c * (h2 - l2) / 2)
 
     def rational_roots_between(self, lo: Fraction, hi: Fraction,
                                other: "_Quad") -> list[Fraction] | None:
@@ -729,6 +825,17 @@ class AxisStack:
         return AxisStack(-self.cx if i == 0 else self.cx,
                          -self.cy if i == 1 else self.cy,
                          [p.mirrored(axis) for p in self.prims])
+
+    def rotated(self, axis, deg):
+        r = _axis_rotation(axis, deg)
+        if r is None:
+            return None
+        prims = [p.rotated(axis, deg) for p in self.prims]
+        if any(p is None for p in prims):
+            return None
+        fn, _flipped = r
+        cx, cy = fn(self.cx, self.cy)
+        return AxisStack(cx, cy, prims)
 
     def fuse(self, prim) -> "AxisStack":
         if getattr(prim, "cx", None) != self.cx or \
@@ -830,6 +937,18 @@ class RevolveSolid:
         return RevolveSolid(list(self.loop),
                             -self.cx if i == 0 else self.cx,
                             -self.cy if i == 1 else self.cy)
+
+    def rotated(self, axis, deg):
+        # the solid is already symmetric about its own axis, so a z-rotation
+        # only carries the axis position; a half turn about x or y stands the
+        # profile on its head (__init__ re-orients the loop's winding)
+        r = _axis_rotation(axis, deg)
+        if r is None:
+            return None
+        fn, flipped = r
+        cx, cy = fn(self.cx, self.cy)
+        loop = [(rr, -z) for rr, z in self.loop] if flipped else list(self.loop)
+        return RevolveSolid(loop, cx, cy)
 
     def _edges(self):
         n = len(self.loop)
@@ -1214,6 +1333,30 @@ class DisjointUnion:
         # fact the isometry already guarantees.
         return DisjointUnion._unchecked(
             [m.mirrored(axis) for m in self.members])
+
+    def rotated(self, axis, deg):
+        # _unchecked for the same reason as mirrored: a rotation is a
+        # bijection, so members that were disjoint still are
+        from forgekernel.brep import Solid
+        from forgekernel.kernel import rotate as _rotate_solid
+
+        out = []
+        for m in self.members:
+            if isinstance(m, Solid):
+                # a plate under a boss is an ordinary Solid and rotates
+                # exactly; requiring `rotated` on every member sent the whole
+                # union to the canonical Body for want of one plain plate
+                try:
+                    out.append(_rotate_solid(m, axis, deg))
+                except ValueError:
+                    return None               # angle outside the exact table
+                continue
+            fn = getattr(m, "rotated", None)
+            r = fn(axis, deg) if fn is not None else None
+            if r is None:
+                return None                   # one member cannot absorb it
+            out.append(r)
+        return DisjointUnion._unchecked(out)
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh = the members' meshes merged — and where a Cyl cap
@@ -1683,6 +1826,39 @@ class RoundedBox:
         o = list(self.origin)
         o[i] = -(o[i] + (self.a, self.b, self.c)[i])
         return RoundedBox(self.a, self.b, self.c, self.r, tuple(o))
+
+    def rotated(self, axis, deg):
+        """QUARTER TURNS ONLY. The extents are axis-aligned by construction, so
+        90° permutes them exactly and anything else genuinely leaves the
+        family — a rounded box turned 45° is not a rounded box."""
+        if deg != int(deg) or int(deg) % 90 != 0:
+            return None
+        r = _axis_rotation(axis, deg)
+        if r is None and int(deg) % 180 != 0:
+            return None
+        from forgekernel.kernel import _rotation_matrix
+
+        try:
+            m = _rotation_matrix(axis, deg)
+        except ValueError:
+            return None
+        size = (self.a, self.b, self.c)
+        # a quarter turn sends each axis to ±another axis: read the permutation
+        # off the matrix exactly, and refuse if it is not one (an oblique axis)
+        perm, sign = [], []
+        for i in range(3):
+            nz = [j for j in range(3) if m[i][j] != 0]
+            if len(nz) != 1 or abs(m[i][nz[0]]) != 1:
+                return None
+            perm.append(nz[0])
+            sign.append(1 if m[i][nz[0]] > 0 else -1)
+        lo = self.origin
+        hi = tuple(lo[j] + size[j] for j in range(3))
+        new_lo = tuple(min(sign[i] * lo[perm[i]], sign[i] * hi[perm[i]])
+                       for i in range(3))
+        new_size = tuple(size[perm[i]] for i in range(3))
+        return RoundedBox(new_size[0], new_size[1], new_size[2], self.r,
+                          new_lo)
 
     def volume(self) -> PiVal:
         r = self.r

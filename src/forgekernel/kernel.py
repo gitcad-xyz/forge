@@ -103,13 +103,32 @@ def rotate(s: Solid, axis, deg) -> Solid:
     the result is a Solid with exact ℚ[√d] coordinates. Raises ValueError for
     angles a larger field would be needed for (the seam turns that into an
     honest refusal)."""
+    from forgekernel.exact import as_fraction
+
     r = _rotation_matrix(axis, deg)
+
+    def _narrow(c):
+        """A coordinate whose VALUE is rational comes back as a Fraction.
+
+        Rodrigues builds ``s/|axis|`` as a SurdVal even for a quarter turn,
+        where sin is 0 and cos is ±1, so every coordinate of a 90°-rotated
+        solid used to arrive ℚ[√1]-typed. Downstream that is not cosmetic:
+        paths that ask "is this rational" by TYPE then refused a solid whose
+        coordinates are plain integers — a quarter-turned drilled plate lost
+        fillet — and docket S1 recorded the byte-canonical version of the same
+        thing, a 360° turn rewriting a whole committed file for a no-op.
+
+        Demoting is exact: as_fraction returns a value only when it IS the
+        value. A genuinely irrational coordinate passes through untouched.
+        """
+        f = as_fraction(c)
+        return c if f is None else f
 
     def fn(v):
         x, y, z = v
-        return (r[0][0] * x + r[0][1] * y + r[0][2] * z,
-                r[1][0] * x + r[1][1] * y + r[1][2] * z,
-                r[2][0] * x + r[2][1] * y + r[2][2] * z)
+        return (_narrow(r[0][0] * x + r[0][1] * y + r[0][2] * z),
+                _narrow(r[1][0] * x + r[1][1] * y + r[1][2] * z),
+                _narrow(r[2][0] * x + r[2][1] * y + r[2][2] * z))
 
     return s.mapped(fn)
 
