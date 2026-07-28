@@ -538,13 +538,21 @@ def test_surd_field_arithmetic() -> None:
     assert sqrt_rational(Fraction(9, 4)) == SurdVal(Fraction(3, 2), 0, 1)
 
 
-def test_mixed_radicals_refuse() -> None:
+def test_mixed_radicals_promote_or_refuse_by_name() -> None:
+    """K1 pinned ``√2 + √3`` as a refusal. K3.1 built ℚ(√p,√q), #127 wired it
+    in, and that pair is a NUMBER now. What still refuses is a pair with no
+    coprime square-free generators — and it refuses by name."""
+    import math
+
     import pytest as _pytest
 
-    from forgekernel.surd import sqrt_rational
+    from forgekernel.surd import MixedRadicals, sqrt_rational
 
-    with _pytest.raises(ValueError, match="bigger field"):
-        sqrt_rational(2) + sqrt_rational(3)
+    assert float(sqrt_rational(2) + sqrt_rational(3)) == _pytest.approx(
+        math.sqrt(2) + math.sqrt(3), abs=1e-12)
+
+    with _pytest.raises(MixedRadicals):
+        sqrt_rational(6) + sqrt_rational(10)
 
 
 def test_mitered_sweep_exact_in_root2() -> None:

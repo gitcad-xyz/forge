@@ -642,6 +642,47 @@ def _unit_normal(plane: Plane) -> Vec | None:
     return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
 
 
+def _unit_vec(v):
+    """``v`` scaled to unit length, exactly — rational when it can be, else in
+    ℚ[√d]. Used wherever a direction is assumed unit; assuming it without
+    dividing is the defect this exists to prevent."""
+    from forgekernel.surd import sqrt_rational
+
+    nn = F(v[0]) * F(v[0]) + F(v[1]) * F(v[1]) + F(v[2]) * F(v[2])
+    if nn == 0:
+        raise ValueError("cannot normalise a zero vector")
+    import math as _m
+    p, q = nn.numerator, nn.denominator
+    rp, rq = _m.isqrt(p), _m.isqrt(q)
+    root = (F(rp) / F(rq) if rp * rp == p and rq * rq == q
+            else sqrt_rational(nn))
+    return (F(v[0]) / root, F(v[1]) / root, F(v[2]) / root)
+
+
+def _unit_normal_exact(plane: Plane):
+    """The unit normal over ℚ[√d] — exact even when |n| is irrational.
+
+    ``_unit_normal`` deliberately returns None there, because its callers
+    wanted a RATIONAL vector and silently handing back a near-unit one is what
+    made chamfer 87% wrong on a taper. But "not rational" is not "not exact":
+    |n| = √37 lives in ℚ[√37], which ``SurdVal`` holds, and dividing a rational
+    normal by it gives components in that field with exact equality intact.
+
+    Faces whose |n| lie in DIFFERENT quadratic fields cannot be combined; the
+    surd arithmetic raises ``MixedRadicals`` (K3.1) on its own when a caller
+    tries, so no check is needed here.
+    """
+    from forgekernel.surd import sqrt_rational
+
+    c = plane.canonical()[:3]
+    exact = _unit_normal(plane)
+    if exact is not None:
+        return exact
+    nn = F(c[0]) * F(c[0]) + F(c[1]) * F(c[1]) + F(c[2]) * F(c[2])
+    root = sqrt_rational(nn)
+    return (F(c[0]) / root, F(c[1]) / root, F(c[2]) / root)
+
+
 def offset_solid_inward(solid: Solid, distance) -> Solid:
     """Erode a planar solid by ``distance`` along each face's OWN unit normal.
 
@@ -780,11 +821,22 @@ def chamfer_planar(solid: Solid, distance, edges: list[dict] | None = None) -> S
     out = solid
     for e in todo:
         pa, pb = e["plane_a"], e["plane_b"]
-        na, nb = _unit_normal(pa), _unit_normal(pb)
+        # ℚ[√d] is enough: a tapered face's |n| = √37 is irrational but EXACT,
+        # and dividing a rational normal by it keeps exact equality. Refusing
+        # here was right only while the alternative was a non-unit vector —
+        # see _unit_normal's note. Faces in different quadratic fields raise
+        # MixedRadicals from the arithmetic below (K3.1) on their own.
+        na, nb = _unit_normal_exact(pa), _unit_normal_exact(pb)
         if na is None or nb is None:
             raise ValueError(
                 "chamfer: face normal is not rational-unit (arrives at K2)")
-        u = e["dir"]
+        # The EDGE DIRECTION must be unit too, and `_canon_dir` does not make
+        # it one: a frustum's slanted edges come back with |dir|² = 38. The
+        # walk below is `distance × cross(u, n)`, so a non-unit u scales every
+        # chamfer wedge by |u| exactly as a non-unit normal did — the same bug
+        # one field over, and the reason fixing `_unit_normal` alone still left
+        # a frustum's chamfer at 107.8 against a validated truth of 733.7.
+        u = _unit_vec(e["dir"])
         p0 = e["point"]
         # direction from the edge into each face: perpendicular to both the
         # edge and the face normal, signed to point into the OTHER face's

@@ -601,15 +601,35 @@ def _mixed_loop_area_centroid_f(loop: Loop, nf):
 
 
 def _as_fraction(x):
-    """x as a Fraction if it is rational — including a ``SurdVal`` whose surd
-    part is zero, which is what an exact rotation leaves behind (a 45° turn
-    types every coordinate as ℚ[√2] even where the value is rational)."""
+    """x as a Fraction if it is rational, else None.
+
+    Includes a ``SurdVal`` whose surd part is zero, which is what an exact
+    rotation leaves behind (a 45° turn types every coordinate as ℚ[√2] even
+    where the value is rational).
+
+    A value from a WIDER field has to PROVE it is rational rather than merely
+    look like a SurdVal. ``BiSurd`` (a + b√p + c√q + e√pq) also carries ``.a``
+    and ``.b``, so reading those two alone silently discarded c√q + e√pq:
+    960 − 20√3 is stored with b = 0 and came back as the plain rational 960,
+    and ``volume`` reported the rational part of an answer as the answer. Ask
+    ``demote()`` — the field's own statement of the smallest type that holds
+    the value — and refuse to guess when there are coefficients we do not
+    understand.
+    """
     if isinstance(x, Fraction):
         return x
     if isinstance(x, int):
         return Fraction(x)
+    dem = getattr(x, "demote", None)
+    if dem is not None:                          # BiSurd, and any wider field
+        x = dem()                                # -> Fraction | SurdVal | self
+        if isinstance(x, Fraction):
+            return x
+        if isinstance(x, int):
+            return Fraction(x)
     b = getattr(x, "b", None)
-    if b is not None and b == 0:
+    if b is not None and b == 0 and not getattr(x, "c", 0) \
+            and not getattr(x, "e", 0):
         return x.a
     return None
 
@@ -643,11 +663,17 @@ def _pi_value(rat, pi, what: str):
     fr, fp = _as_fraction(rat), _as_fraction(pi)
     if fr is not None and fp is not None:
         return PiVal(fr, fp)
+    # The gate is "can PiPoly hold this coefficient", and PiPoly's answer is
+    # `demote()` (BiSurd and anything wider) or `.d` (SurdVal). Testing `.d`
+    # alone turned away a biquadratic term the ring holds perfectly well — the
+    # same duck-typing mistake as _as_fraction's, in the opposite direction:
+    # one dropped a radical, this one refused a computable answer.
     for part, name in ((rat, "offset"), (pi, "sweep")):
-        if _as_fraction(part) is None and not hasattr(part, "d"):
+        if (_as_fraction(part) is None and not hasattr(part, "d")
+                and not hasattr(part, "demote")):
             raise ValueError(
                 f"{what} {name} volume term left ℚ[√d][π] ({part!r}) — a "
-                "bigger number field arrives with K3.1")
+                "bigger number field arrives with K3.2")
     return PiPoly([rat, pi])
 
 

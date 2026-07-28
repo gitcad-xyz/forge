@@ -280,11 +280,23 @@ def test_a_surd_that_is_really_rational_collapses() -> None:
     assert len({PiPoly([_s(3, 0, 1)]), PiPoly([F(3)]), 3}) == 1
 
 
-def test_mixed_radicals_still_refuse() -> None:
-    """ℚ[√2, √3] is a bigger field than either, and inventing it silently is
-    exactly what the charter forbids (K3.1)."""
+def test_mixed_radicals_promote_into_the_coefficient_ring() -> None:
+    """ℚ[√2, √3] is a bigger field than either, and K3.1 built it, so the
+    product is a NUMBER now — √2·√3 = √6 — not a refusal. PiPoly accepts it
+    because it asks a coefficient for ``bounds()``, not for its type."""
+    prod = PiPoly([_s(0, 1, 2)]) * PiPoly([_s(0, 1, 3)])
+    assert float(prod) == pytest.approx(math.sqrt(6), abs=1e-12)
+    assert prod.sign() == 1
+    # squaring returns to ℚ exactly: (√6)² = 6
+    assert (prod * prod) == PiPoly([F(6)])
+
+
+def test_a_pair_with_no_biquadratic_home_still_refuses() -> None:
+    """gcd(6,10) > 1, so ``BiSurd`` declines the pair (its coercion matches on
+    the radicand tag, and √60 carries the tag 15). Inventing a field to get an
+    answer anyway is exactly what the charter forbids."""
     with pytest.raises(ValueError, match="mixed radicals"):
-        PiPoly([_s(0, 1, 2)]) * PiPoly([_s(0, 1, 3)])
+        PiPoly([_s(0, 1, 6)]) * PiPoly([_s(0, 1, 10)])
 
 
 def test_a_float_still_cannot_enter() -> None:

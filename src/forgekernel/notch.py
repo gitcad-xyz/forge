@@ -32,9 +32,14 @@ new quadric measure that 500+ existing faces also depend on.
 
 from __future__ import annotations
 
-from fractions import Fraction as F
-
 from forgekernel import body as B
+# exact.F, NOT fractions.Fraction: this module coerces tool-box coordinates
+# that come off a ROTATED body, and those live in ℚ[√d] or ℚ(√p,√q). Fraction
+# raises TypeError on them — a raw exception straight through the Kernel seam,
+# which is a crash-class defect, thrown by a call site that only meant to
+# normalise an int. exact.F passes an exact scalar through and still converts a
+# float to its exact binary Fraction, so nothing here becomes inexact.
+from forgekernel.exact import F
 
 UP = (F(0), F(0), F(1))
 DN = (F(0), F(0), F(-1))

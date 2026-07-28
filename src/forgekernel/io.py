@@ -49,11 +49,28 @@ def _num(v) -> str:
 
     A ``Solid``'s coordinates are rational, but a ROTATED one carries ℚ[√d]
     — so a format that only knows ``num/den`` can describe a box and not the
-    same box turned 45°. Both encodings are exact and both round-trip to the
-    identical value, which is what makes the bytes a geometry identity.
+    same box turned 45°. A body built from TWO differently-rotated ones carries
+    ℚ(√p,√q) (K3.1), which is what ``B:`` spells. Every encoding is exact and
+    every one round-trips to the identical value, which is what makes the bytes
+    a geometry identity.
+
+    ADR-0004 in one rule: a shape the kernel can BUILD, the text must be able
+    to SAY. A biquadratic coordinate used to fall through to
+    ``Fraction(v)`` and raise TypeError, so the first boolean across two
+    rotations produced a body that could not be saved.
     """
+    from forgekernel.bisurd import BiSurd
     from forgekernel.surd import SurdVal
 
+    if isinstance(v, BiSurd):
+        # demote FIRST: a value that is really rational, or really in one
+        # ℚ[√d], must be spelled in the narrow form or a round trip through the
+        # wider field rewrites a file for a geometric no-op — the same
+        # byte-canonical defect docket S1 recorded for SurdVal, one level up.
+        v = v.demote()
+        if isinstance(v, BiSurd):
+            return (f"B:{_fr(v.a)}:{_fr(v.b)}:{_fr(v.c)}:{_fr(v.e)}"
+                    f":{_fr(v.p)}:{_fr(v.q)}")
     if isinstance(v, SurdVal):
         if v.b == 0:
             # SurdVal(a, 0, d) IS the rational a. A rigid map leaves every
@@ -73,6 +90,12 @@ def _unnum(s: str):
 
         _, a, b, d = s.split(":")
         return SurdVal(_unfr(a), _unfr(b), _unfr(d))
+    if s.startswith("B:"):
+        from forgekernel.bisurd import BiSurd
+
+        _, a, b, c, e, p, q = s.split(":")
+        return BiSurd(_unfr(a), _unfr(b), _unfr(c), _unfr(e),
+                      _unfr(p), _unfr(q))
     return _unfr(s)
 
 

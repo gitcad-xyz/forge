@@ -16,28 +16,39 @@ from forgekernel.exact import F
 
 
 class MixedRadicals(ValueError):
-    """Two SurdVals live in different quadratic fields — ℚ[√2] and ℚ[√3]
-    have no common home short of the biquadratic tower (K3.1).
+    """Radicands with no common home in the current number field.
 
-    This is a PERMANENT boundary of the current number field, not a bug and
-    not an unwritten algorithm, so a caller needs to tell it apart from
-    both. It was a bare ``ValueError`` and a bbox comparison inside
-    ``boolean`` let it out of the Kernel seam raw — by the capability
-    bench's own taxonomy a raw exception escaping the seam is a CRASH, i.e.
-    a defect, so the one wall that is genuinely about exactness was also the
-    one the seam failed to report honestly. Named so callers can catch it
-    (every sibling refusal in forge already is: ``BooleanUnsupported``,
-    ``TrimLoopUnstitchable``, ``ShellAuditUncertified``, …).
+    ℚ[√2] and ℚ[√3] used to be such a pair; K3.1 built ℚ(√p,√q) and
+    ``SurdVal._promote`` now lifts any pair that a coprime square-free pair of
+    generators can name, so this fires only where the tower really stops:
+    √6 with √10 (6 = 2·3, 10 = 2·5, 15 = 3·5 — no two of the field's radicals
+    are coprime), or a value from outside a ``BiSurd``'s field.
 
-    Still a ``ValueError``, so existing ``except ValueError`` handlers
-    around surd arithmetic keep working unchanged.
+    This is a boundary of the number field, not a bug and not an unwritten
+    algorithm, so a caller needs to tell it apart from both. It was a bare
+    ``ValueError`` and a bbox comparison inside ``boolean`` let it out of the
+    Kernel seam raw — by the capability bench's own taxonomy a raw exception
+    escaping the seam is a CRASH, i.e. a defect, so the one wall that is
+    genuinely about exactness was also the one the seam failed to report
+    honestly. Named so callers can catch it (every sibling refusal in forge
+    already is: ``BooleanUnsupported``, ``TrimLoopUnstitchable``,
+    ``ShellAuditUncertified``, …).
+
+    ``.radicals`` is every radicand involved, in the order they were met — two
+    for a ``SurdVal`` pair, three when a value meets a ``BiSurd`` field it is
+    outside of, four for two different biquadratic fields.
+
+    Still a ``ValueError``, so existing ``except ValueError`` handlers around
+    surd arithmetic keep working unchanged.
     """
 
-    def __init__(self, d_self: int, d_other: int):
-        self.radicals = (d_self, d_other)
-        super().__init__(
-            f"mixed radicals √{d_self} and √{d_other} — a bigger "
-            "field arrives at K3.1")
+    def __init__(self, *radicands: int, message: str | None = None):
+        self.radicals = tuple(int(d) for d in radicands)
+        super().__init__(message or (
+            "mixed radicals "
+            + " and ".join(f"√{d}" for d in self.radicals)
+            + " — no coprime square-free pair of generators names one field "
+              "holding them all"))
 
 
 def _squarefree(n: int) -> tuple[int, int]:
@@ -117,10 +128,66 @@ class SurdVal:
             raise MixedRadicals(self.d, o.d)
         return self.d
 
+    def _promote(self, o):
+        """Both operands lifted into ℚ(√p,√q), or None when that field does
+        not exist for this pair (#127).
+
+        ``BiSurd`` was already general in (p, q) and complete — arithmetic,
+        comparison, sign, inverse — but nothing ever CONNECTED the two, so
+        every mixed-radical expression refused although its exact home was
+        already in the kernel. A frustum's chamfer is the case that exposed it:
+        the face normal lives in ℚ[√37] and the edge direction in ℚ[√38].
+
+        ``BiSurd`` names its field by a COPRIME square-free pair, because its
+        coercion matches on the radicand tag and √(pq) must carry the tag pq.
+        Two radicands that share a factor can still be inside one biquadratic
+        field, just under different generators: √2 and √6 both live in
+        ℚ(√2,√3), where √6 is the third basis radical √(pq). So when one
+        radicand divides the other, change generators to (p, q/p) rather than
+        refuse — otherwise a body with √2 face normals and √6 edge directions
+        is turned away from a field it is already inside.
+
+        Returns None (leaving the caller to refuse) when no coprime pair of
+        generators exists. √6 with √10 is the honest case: the field is
+        ℚ(√6,√10) = ℚ(√6,√15), degree 4 and perfectly ordinary, but its
+        radicals are 6 = 2·3, 10 = 2·5 and 15 = 3·5, which pairwise share a
+        prime — no two of them are coprime, so this normal form cannot name it.
+        """
+        from math import gcd
+
+        if not isinstance(o, SurdVal) or self.b == 0 or o.b == 0:
+            return None
+        if self.d == o.d:
+            return None                       # already one field
+        p, q = (self.d, o.d) if self.d < o.d else (o.d, self.d)
+        if p < 2:
+            return None
+        if _squarefree(p)[0] != 1 or _squarefree(q)[0] != 1:
+            return None
+        if gcd(p, q) != 1:
+            if q % p:
+                return None                   # e.g. √6 with √10
+            p, q = sorted((p, q // p))         # √p, √(pq) -> generators p, q/p
+            if p < 2 or gcd(p, q) != 1 or _squarefree(q)[0] != 1:
+                return None
+        from forgekernel.bisurd import BiSurd
+
+        def lift(v):
+            if v.d == p:
+                return BiSurd(v.a, v.b, 0, 0, p, q)
+            if v.d == q:
+                return BiSurd(v.a, 0, v.b, 0, p, q)
+            return BiSurd(v.a, 0, 0, v.b, p, q)      # v.d == p·q
+
+        return lift(self), lift(o)
+
     def __add__(self, o) -> "SurdVal":
         o = self._co(o)
         if o is NotImplemented:
             return NotImplemented
+        pr = self._promote(o)
+        if pr is not None:
+            return pr[0] + pr[1]
         return SurdVal(self.a + o.a, self.b + o.b, self._radical(o))
 
     __radd__ = __add__
@@ -129,6 +196,9 @@ class SurdVal:
         o = self._co(o)
         if o is NotImplemented:
             return NotImplemented
+        pr = self._promote(o)
+        if pr is not None:
+            return pr[0] - pr[1]
         return SurdVal(self.a - o.a, self.b - o.b, self._radical(o))
 
     def __rsub__(self, o) -> "SurdVal":     # o − self, for rational/int on the left
@@ -142,6 +212,9 @@ class SurdVal:
         if self.b == 0 or o.b == 0:
             d = self._radical(o)
             return SurdVal(self.a * o.a, self.a * o.b + self.b * o.a, d)
+        pr = self._promote(o)
+        if pr is not None:
+            return pr[0] * pr[1]
         if self.d != o.d:
             raise MixedRadicals(self.d, o.d)
         # (a+b√d)(c+e√d) = (ac + be d) + (ae + bc)√d
@@ -231,21 +304,31 @@ class SurdVal:
             return 0
         return sa if da > db else sb
 
+    def _diff_sign(self, o) -> int:
+        """Sign of (self − o), whichever field the difference lands in.
+
+        ``__sub__`` now PROMOTES a mixed-radical pair to ``BiSurd`` (#127),
+        and BiSurd spells its sign ``sign()`` rather than ``_sign()`` — so the
+        comparisons have to ask the object, not assume the type.
+        """
+        diff = self - o
+        return diff._sign() if isinstance(diff, SurdVal) else diff.sign()
+
     def __lt__(self, o) -> bool:
         o = self._co(o)
-        return NotImplemented if o is NotImplemented else (self - o)._sign() < 0
+        return NotImplemented if o is NotImplemented else self._diff_sign(o) < 0
 
     def __le__(self, o) -> bool:
         o = self._co(o)
-        return NotImplemented if o is NotImplemented else (self - o)._sign() <= 0
+        return NotImplemented if o is NotImplemented else self._diff_sign(o) <= 0
 
     def __gt__(self, o) -> bool:
         o = self._co(o)
-        return NotImplemented if o is NotImplemented else (self - o)._sign() > 0
+        return NotImplemented if o is NotImplemented else self._diff_sign(o) > 0
 
     def __ge__(self, o) -> bool:
         o = self._co(o)
-        return NotImplemented if o is NotImplemented else (self - o)._sign() >= 0
+        return NotImplemented if o is NotImplemented else self._diff_sign(o) >= 0
 
     def __eq__(self, o: object) -> bool:
         o = self._co(o)

@@ -19,10 +19,14 @@ float consulted) until the interval sum excludes zero — the same discipline as
 ``PiPoly.sign``. Termination is guaranteed because a nonzero element is a
 fixed nonzero real. Zero itself is decided structurally, by the basis.
 
-Radicand pairs with ``gcd(p, q) > 1`` refuse: ``√2·√6 = 2√3`` leaves the
-{1,√2,√6,√12} span, so such a pair is not a basis in this normal form —
-callers hold ℚ(√2,√6) as ``BiSurd(·,·,·,·, 2, 3)``, which is the same field
-under its canonical generators.
+Radicand pairs with ``gcd(p, q) > 1`` refuse, and the reason is NORMAL FORM,
+not span: {1,√2,√6,√12} is a perfectly good basis of ℚ(√2,√3), but √12 = 2√3
+so the same value reaches ``_co`` tagged 3, not 12, and coercion matches on the
+tag. Requiring coprime radicands makes the tag canonical. ``SurdVal._promote``
+therefore changes generators before it gets here — √2 with √6 enters as
+``BiSurd(·,·,·,·, 2, 3)``, the same field under its canonical names. The pairs
+that stay out are the ones with no coprime generators at all: ℚ(√6,√10) has
+radicals 6 = 2·3, 10 = 2·5 and 15 = 3·5, which pairwise share a prime.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from __future__ import annotations
 import math
 from fractions import Fraction
 
-from forgekernel.surd import SurdVal, _squarefree
+from forgekernel.surd import MixedRadicals, SurdVal, _squarefree
 
 
 def _enc(d: int, digits: int) -> tuple[Fraction, Fraction]:
@@ -61,11 +65,13 @@ class BiSurd:
                 f"radicand not square-free in ℚ(√{p},√{q}) — factor the "
                 "square out first (sqrt_rational does)")
         if math.gcd(p, q) != 1:
-            raise ValueError(
-                f"radicands √{p} and √{q} share a factor: √{p}·√{q} is not "
-                f"√{p * q}'s square-free form, so {{1,√{p},√{q},√{p * q}}} is "
-                "not a basis — hand the field its canonical coprime "
-                "generators instead")
+            raise MixedRadicals(
+                p, q,
+                message=f"radicands √{p} and √{q} share a factor, so √{p * q} "
+                        f"is not in square-free form and the same value can "
+                        f"reach coercion under two different tags — hand the "
+                        f"field its canonical coprime generators instead "
+                        f"(SurdVal._promote does)")
         self.a, self.b = Fraction(a), Fraction(b)
         self.c, self.e = Fraction(c), Fraction(e)
         self.p, self.q = p, q
@@ -79,9 +85,11 @@ class BiSurd:
                 return o
             o = o.demote()                # a foreign tag may name a value we hold
             if isinstance(o, BiSurd):
-                raise ValueError(
-                    f"mixed biquadratic fields ℚ(√{self.p},√{self.q}) and "
-                    f"ℚ(√{o.p},√{o.q}) — a bigger tower arrives at K3.2")
+                raise MixedRadicals(
+                    self.p, self.q, o.p, o.q,
+                    message=f"mixed biquadratic fields ℚ(√{self.p},√{self.q}) "
+                            f"and ℚ(√{o.p},√{o.q}) — a degree-8 tower arrives "
+                            "at K3.2")
         if isinstance(o, SurdVal):
             if o.b == 0 or o.d == 1:
                 return BiSurd(o.a, 0, 0, 0, self.p, self.q)
@@ -91,9 +99,10 @@ class BiSurd:
                 return BiSurd(o.a, 0, o.b, 0, self.p, self.q)
             if o.d == self.p * self.q:
                 return BiSurd(o.a, 0, 0, o.b, self.p, self.q)
-            raise ValueError(
-                f"√{o.d} is not in ℚ(√{self.p},√{self.q}) — a bigger tower "
-                "arrives at K3.2")
+            raise MixedRadicals(
+                self.p, self.q, o.d,
+                message=f"√{o.d} is not in ℚ(√{self.p},√{self.q}) — a bigger "
+                        "tower arrives at K3.2")
         if isinstance(o, (int, float, Fraction)):
             return BiSurd(Fraction(o), 0, 0, 0, self.p, self.q)
         return NotImplemented

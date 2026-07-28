@@ -88,3 +88,45 @@ def test_a_rational_but_non_integer_length_resolves():
     u = _n(F(3, 2), F(2), F(0))               # |n|² = 9/4 + 4 = 25/4
     assert u is not None
     assert _len2(u) == 1
+
+
+# -- the same bug one field over: EDGE DIRECTIONS are not unit either --------
+
+def test_canon_dir_is_not_unit_and_must_be_normalised():
+    """``_canon_dir`` returns a canonical direction, NOT a unit one: a
+    frustum's slanted edges come back with |dir|² = 38.
+
+    ``chamfer_planar`` walks ``distance × cross(dir, normal)``, so a non-unit
+    direction scales every wedge exactly as a non-unit normal did. Fixing
+    ``_unit_normal`` alone still left a frustum's chamfer at 107.8 against a
+    validated truth of 733.7 — the second half of the same defect.
+    """
+    from fractions import Fraction as Q
+
+    from forgekernel.brep import Polygon, Solid, _unit_vec, logical_edges
+
+    b = [(Q(0), Q(0), Q(0)), (Q(10), Q(0), Q(0)),
+         (Q(10), Q(10), Q(0)), (Q(0), Q(10), Q(0))]
+    t = [(Q(2), Q(2), Q(12)), (Q(8), Q(2), Q(12)),
+         (Q(8), Q(8), Q(12)), (Q(2), Q(8), Q(12))]
+    polys = [Polygon(list(reversed(b)), "bottom"), Polygon(list(t), "top")]
+    for i in range(4):
+        j = (i + 1) % 4
+        polys.append(Polygon([b[i], b[j], t[j], t[i]], f"wall{i}"))
+
+    dirs = {tuple(e["dir"]) for e in logical_edges(Solid(polys))}
+    lens = {sum(Q(c) * Q(c) for c in d) for d in dirs}
+    assert 38 in lens, "expected the slanted edges to be non-unit"
+
+    for d in dirs:                       # every one normalises to EXACTLY 1
+        u = _unit_vec(d)
+        assert sum(x * x for x in u) == 1
+
+
+@pytest.mark.parametrize("v,expected_len2", [
+    ((3, 4, 0), 1), ((1, 0, 0), 1), ((2, 3, 6), 1), ((F(1, 2), F(1, 2), 0), 1),
+])
+def test_unit_vec_is_exactly_unit_for_rational_cases(v, expected_len2):
+    from forgekernel.brep import _unit_vec
+
+    assert sum(x * x for x in _unit_vec(v)) == expected_len2
