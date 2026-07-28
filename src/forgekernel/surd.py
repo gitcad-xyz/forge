@@ -159,6 +159,39 @@ class SurdVal:
         o = self._co(o)
         return NotImplemented if o is NotImplemented else o / self
 
+    def __pow__(self, n) -> "SurdVal":
+        """``x ** n`` for integer ``n`` — exact, by square-and-multiply.
+
+        ℚ[√d] is closed under multiplication, so an integer power never leaves
+        the field and there was never a reason for this to be missing. The
+        same lesson ``__abs__`` records: a field that can multiply but cannot
+        raise to a power is a half-built type, and the gap shows up only after
+        a solid has been ROTATED, when surds first appear in coordinates.
+
+        gitcad #49: a body placed through a non-``z`` sketch plane carries an
+        exact 120° axis permutation, and drilling it reached
+        ``_seg_dist2``'s ``(px - qx) ** 2`` — which raised a bare TypeError
+        straight through the seam's refusal wrapper. A distance predicate is
+        exactly where an exact field must not have holes.
+
+        A non-integer exponent leaves the field, so it DEFERS
+        (``NotImplemented``) rather than rounding through float.
+        """
+        if not isinstance(n, int):
+            return NotImplemented
+        if n < 0:
+            # __truediv__ raises ZeroDivisionError for a zero denominator,
+            # which is the honest answer for 0 ** -1.
+            return SurdVal(1) / (self ** -n)
+        out, base, e = SurdVal(1), self, n
+        while e:
+            if e & 1:
+                out = out * base
+            e >>= 1
+            if e:
+                base = base * base
+        return out
+
     def _sign(self) -> int:
         """Exact sign of a + b√d (d ≥ 1, √d > 0) — decides comparisons."""
         if self.b == 0:
