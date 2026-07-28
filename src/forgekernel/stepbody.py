@@ -25,11 +25,24 @@ from fractions import Fraction
 from forgekernel.body import (Body, Circle, Cone, Cylinder, Line, Plane,
                               SphereS, dot, sub)
 from forgekernel.brep import _canon_dir
-from forgekernel.stepio import _dec, _perp, _real, _unit3
+from forgekernel.stepio import _dec, _perp, _real, _unit3, export_rational
 
 
 def _f(x) -> Fraction:
-    return x if isinstance(x, Fraction) else Fraction(x)
+    """A coordinate as a rational, ready for ``_dec`` to render.
+
+    Reached at exactly one place — writing a CARTESIAN_POINT — so this is a
+    NUMERAL conversion, never a predicate. It delegates to
+    ``stepio.export_rational``, which converts values beyond ℚ (a rotated
+    part's ℚ[√2] coordinates, a lathe's ℚ[π] ones) by exact comparison only.
+
+    It used to be a bare ``Fraction(x)``, which raises on any exact scalar by
+    design (``is_exact_scalar`` exists to stop silent coercion). That
+    TypeError surfaced at the seam as "export_step on Solid yet — K3.7",
+    blaming the canonical B-rep for a capability it had; what was missing was
+    the numeral.
+    """
+    return x if isinstance(x, Fraction) else export_rational(x)
 
 
 def _key(v):

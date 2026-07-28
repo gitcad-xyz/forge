@@ -433,6 +433,62 @@ def read_step_planar_solid(text: str, *, heal_tolerance=None,
 
 # -- K7.0c: native STEP AP214 export (planar solids) --------------------------
 
+def export_rational(x, digits: int = 25) -> Fraction:
+    """An exact value as a rational, accurate to ``digits`` decimals — for
+    WRITING A NUMERAL, and nothing else.
+
+    ``Fraction(x)`` deliberately REFUSES an exact scalar: ``SurdVal`` and
+    ``PiPoly`` carry ``is_exact_scalar = True`` precisely so a value beyond ℚ
+    can never be coerced away by accident. That guard is right everywhere a
+    number might decide something. STEP is the one place it must not apply:
+    Part 21 is a DECIMAL interchange format, so an exact→decimal conversion
+    has to happen somewhere, and here is where it is sanctioned. Nothing
+    downstream of this reads the result except ``_dec``, which turns it into
+    text.
+
+    Before this existed, a 45°-rotated box could not be exported at all: its
+    coordinates live in ℚ[√2], ``Fraction()`` raised, and the seam reported
+    "export_step on Solid yet — K3.7" as if the canonical B-rep were missing
+    a capability. The capability was there; the numeral was not.
+
+    The conversion uses ONLY the type's own exact comparisons — bisection
+    against rationals — so it needs no per-type code and works for every
+    member of the tower (SurdVal, BiSurd, PiVal, PiPoly) alike. A float is
+    used to SEED the bracket and then verified exactly; if the seed is wrong
+    the bracket is widened until the exact comparisons agree, so the float
+    cannot make the answer wrong, only slower to find (ADR-0019).
+    """
+    if isinstance(x, Fraction):
+        return x
+    if isinstance(x, int):
+        return Fraction(x)
+    if not getattr(x, "is_exact_scalar", False):
+        return Fraction(x)
+
+    try:
+        seed = float(x)
+    except (TypeError, ValueError, OverflowError):
+        seed = 0.0
+    lo, hi = Fraction(seed) - 1, Fraction(seed) + 1
+    # widen until the bracket provably contains x, using exact comparisons
+    for _ in range(80):
+        if lo <= x <= hi:
+            break
+        span = hi - lo
+        lo, hi = lo - span, hi + span
+    else:                                    # pragma: no cover - unreachable
+        raise ValueError(f"export_rational: cannot bracket {x!r}")
+
+    tol = Fraction(1, 10 ** digits)
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        if x <= mid:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
 def _dec(x: Fraction, digits: int = 15) -> str:
     """Rational → STEP decimal real. Exact for terminating rationals;
     high-precision rounded otherwise (STEP is a decimal interchange
