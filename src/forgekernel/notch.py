@@ -211,7 +211,10 @@ def notch_cut(body: B.Body, rect, za, zb) -> B.Body:
         if not isinstance(s, B.Cylinder) or not _vertical(s.d):
             continue
         cx, cy = s.p[0], s.p[1]
-        d2 = [((p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+        # x*x, never x**2: a rotated body's bore center has SurdVal
+        # coordinates, and SurdVal implements multiplication, not __pow__
+        # (same defect class as the crossing sort above)
+        d2 = [((p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy))
               for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
         rr = s.r * s.r
         if min(d2) < rr < max(d2) or (min(d2) < rr and any(x == rr for x in d2)):
@@ -273,7 +276,8 @@ def notch_cut(body: B.Body, rect, za, zb) -> B.Body:
             lo, hi = _z_range(f)
             if hi <= za or lo >= ztop:
                 continue
-            d2 = [((p[0] - s.p[0]) ** 2 + (p[1] - s.p[1]) ** 2)
+            d2 = [((p[0] - s.p[0]) * (p[0] - s.p[0])
+                   + (p[1] - s.p[1]) * (p[1] - s.p[1]))
                   for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
             if not (max(d2) < s.r * s.r and f.sense):
                 raise NotchRefused(
@@ -325,7 +329,8 @@ def notch_cut(body: B.Body, rect, za, zb) -> B.Body:
                 "could break out of the part unseen")
         clear = xs[0] < x0 and x1 < xs[1] and ys[0] < y0 and y1 < ys[1]
     else:
-        clear = all(((p[0] - ocirc.c[0]) ** 2 + (p[1] - ocirc.c[1]) ** 2)
+        clear = all(((p[0] - ocirc.c[0]) * (p[0] - ocirc.c[0])
+                     + (p[1] - ocirc.c[1]) * (p[1] - ocirc.c[1]))
                     < ocirc.r * ocirc.r
                     for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
     if not clear:

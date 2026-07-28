@@ -831,6 +831,61 @@ def prismatoid(bottom: list[tuple], z0, top: list[tuple], z1,
     return Solid(polys)
 
 
+def ruled_stack(sections: list[tuple[list[tuple], object]],
+                source: str = "loft") -> "Solid":
+    """Exact ruled loft through ≥3 same-count xy loops at strictly
+    increasing heights, built DIRECTLY as one closed shell: every wall
+    band plus the two outer caps.
+
+    This is the same point set as the BSP-union fold of the pairwise
+    prismatoids — the interface caps cancel exactly, because piece i's top
+    cap and piece i+1's bottom cap are the same ear-clipped section polygon
+    with opposite orientation — at O(sections) cost instead of the fold's
+    O(n²) polygon splits (a 13×34 crankbait hull: ~26 s → milliseconds).
+
+    Raises ``ValueError`` when the preconditions for the cancellation
+    argument do not hold (fewer than 3 sections, unequal loop lengths,
+    non-monotonic z, a zero-area section, or mixed loop orientation);
+    callers fall back to the fold, whose behaviour is unchanged.
+    """
+    if len(sections) < 3:
+        raise ValueError("ruled_stack wants >=3 sections (2 is prismatoid)")
+    zs = [F(z) for _, z in sections]
+    loops = [[(F(x), F(y)) for x, y in lp] for lp, _ in sections]
+    n = len(loops[0])
+    if n < 3 or any(len(lp) != n for lp in loops):
+        raise ValueError("ruled_stack needs equal-length loops (>=3)")
+    if any(z1 <= z0 for z0, z1 in zip(zs, zs[1:])):
+        raise ValueError("ruled_stack needs strictly increasing z")
+    areas = [_loop_area2(lp) for lp in loops]
+    if any(a == 0 for a in areas):
+        raise ValueError("ruled_stack: zero-area section")
+    if any((a < 0) != (areas[0] < 0) for a in areas):
+        raise ValueError("ruled_stack: mixed section orientation")
+    if areas[0] < 0:                     # normalise CCW, as prismatoid does
+        loops = [list(reversed(lp)) for lp in loops]
+    polys: list[Polygon] = []
+    for a, bb, c in _ear_clip(loops[0]):
+        polys.append(Polygon([vec(*a, zs[0]), vec(*c, zs[0]), vec(*bb, zs[0])],
+                             f"{source}.bottom"))
+    for a, bb, c in _ear_clip(loops[-1]):
+        polys.append(Polygon([vec(*a, zs[-1]), vec(*bb, zs[-1]),
+                              vec(*c, zs[-1])], f"{source}.top"))
+    for k, (b, tp) in enumerate(zip(loops, loops[1:])):
+        z0, z1 = zs[k], zs[k + 1]
+        for i in range(n):
+            j = (i + 1) % n
+            b0, b1 = b[i], b[j]
+            t0, t1 = tp[i], tp[j]
+            # side quad b0-b1-t1-t0 -> two triangles (consistent winding,
+            # exactly as prismatoid emits them)
+            polys.append(Polygon([vec(*b0, z0), vec(*b1, z0), vec(*t1, z1)],
+                                 f"{source}.s{k}.side{i}"))
+            polys.append(Polygon([vec(*b0, z0), vec(*t1, z1), vec(*t0, z1)],
+                                 f"{source}.s{k}.side{i}"))
+    return Solid(polys)
+
+
 def _rational_sqrt(q: Fraction) -> Fraction | None:
     """√q as an exact Fraction when q is a square in ℚ, else None."""
     import math as _m
