@@ -1092,6 +1092,30 @@ def _member_volume(m):
     return m.volume()
 
 
+def _member_transformed(m, method: str, arg, aff):
+    """Transform one union member, PREFERRING its own representation-preserving
+    method and falling back to the canonical Affine only when it has none.
+
+    The order matters and is not a style choice. Every quadric family is closed
+    under an axis reflection — a mirrored Cyl is a Cyl — and dropping to the
+    canonical Body throws that away: the feature paths dispatch on
+    representation, so a mirrored bar made chamfer/fillet/shell refuse a shape
+    they handle perfectly well upright. `ref.mirror` records that as 30 of the
+    34 pairs in its mirror invariant. So the Affine is the fallback, never the
+    first choice.
+
+    The fallback exists because of the same rule `_member_volume` follows: a
+    member may already be a canonical Body, since an operation on a union
+    member returns one. A Body has `transformed(Affine)` and none of the
+    feature families' `mirrored`/`scaled`/`translated`, so a union holding one
+    raised AttributeError out through the seam — surfacing as "mirror on Body,
+    DisjointUnion yet", which reads as an unbuilt capability rather than a
+    missing dispatch.
+    """
+    fn = getattr(m, method, None)
+    return fn(arg) if fn is not None else m.transformed(aff)
+
+
 def _member_centroid(m):
     if isinstance(m, (Sphere, Cone)):
         return AxisStack(m.cx, m.cy, [m]).centroid_f()
@@ -1388,8 +1412,11 @@ class DisjointUnion:
         # bijection, so members that were disjoint still are. Re-running the
         # pairwise classifier would only spend exact arithmetic re-deriving a
         # fact the isometry already guarantees.
+        from forgekernel import body as B
+
         return DisjointUnion._unchecked(
-            [m.mirrored(axis) for m in self.members])
+            [_member_transformed(m, "mirrored", axis, B.Affine.mirror(axis))
+             for m in self.members])
 
     def rotated(self, axis, deg):
         # _unchecked for the same reason as mirrored: a rotation is a
@@ -1420,10 +1447,19 @@ class DisjointUnion:
         from forgekernel.brep import Solid
 
         s = _scale_factor(f)
-        # Solid.scaled takes three factors; the quadrics take one ratio
-        return DisjointUnion._unchecked(
-            [m.scaled(s, s, s) if isinstance(m, Solid) else m.scaled(s)
-             for m in self.members])
+        # Solid.scaled takes three factors; the quadrics take one ratio; a
+        # canonical Body takes neither and goes through an Affine
+        out = []
+        for m in self.members:
+            if isinstance(m, Solid):
+                out.append(m.scaled(s, s, s))
+            elif hasattr(m, "scaled"):
+                out.append(m.scaled(s))
+            else:
+                from forgekernel import body as B
+
+                out.append(m.transformed(B.Affine.scaling(s, s, s)))
+        return DisjointUnion._unchecked(out)
 
     def tessellate(self, deflection: float = 0.2) -> dict:
         """Display mesh = the members' meshes merged — and where a Cyl cap
