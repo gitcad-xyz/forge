@@ -1563,7 +1563,17 @@ class DisjointUnion:
         return (acc[0] / vtot, acc[1] / vtot, acc[2] / vtot)
 
     def bbox(self):
-        boxes = [m.bbox() for m in self.members]
+        # a member may be a canonical Body — every member already may be, for
+        # volume and centroid (see `_member_volume`), and this was the one
+        # accessor that still assumed a feature representation and
+        # AttributeError'd straight through the seam. `body.bbox` is the right
+        # answer here BECAUSE this method is documented as float: nothing
+        # topological is decided on it (`_body_outer_bbox` is what separation
+        # uses), so the float bound is a bound and not a rounded predicate.
+        from forgekernel import body as B
+
+        boxes = [m.bbox() if hasattr(m, "bbox") else B.bbox(m)
+                 for m in self.members]
         lo = tuple(min(float(b[0][i]) for b in boxes) for i in range(3))
         hi = tuple(max(float(b[1][i]) for b in boxes) for i in range(3))
         return (lo, hi)
@@ -1634,7 +1644,10 @@ def _classify_pair(a, b) -> None:
     # opposite ends of a bracket) and it was refusing purely for want of a
     # rule for that particular pair of types. Touching counts as separated:
     # a tangent contact has measure zero.
-    ba, bb = _exact_bbox(a), _exact_bbox(b)
+    #
+    # OUTER, not exact-tight: separation is the one question an over-estimate
+    # cannot get wrong. See `_outer_bbox`.
+    ba, bb = _outer_bbox(a), _outer_bbox(b)
     if ba is not None and bb is not None:
         if any(ba[1][k] <= bb[0][k] or bb[1][k] <= ba[0][k] for k in range(3)):
             return
@@ -1788,6 +1801,92 @@ def _exact_bbox(shape):
         return None
     return (tuple(min(p[0][k] for p in parts) for k in range(3)),
             tuple(max(p[1][k] for p in parts) for k in range(3)))
+
+
+def _body_outer_bbox(shape):
+    """A sound OUTER bound for a canonical ``Body`` — exact, or None.
+
+    Deliberately allowed to be loose, which `_exact_bbox` is not. The two
+    contracts must not be merged: `_flat_on_bar` asks `_exact_bbox` whether a
+    tool COVERS a bar, and a box that is too big would approve a cut that
+    actually misses. The only caller here proves the opposite direction —
+    DISJOINTNESS — where an over-estimate can only fail to prove separation
+    and can never claim it wrongly. Loose in the safe direction is the whole
+    reason this is a separate function.
+
+    A ``Body`` is the representation every transformed or already-cut solid
+    falls into (ADR-0021), so without this the general fallback above could
+    never fire for the commonest operand in the composed grid: two solids at
+    opposite ends of a bracket refused as an unbuilt curved-surface boolean,
+    naming an intersection that is empty.
+
+    Exact throughout — `body.bbox` exists but is explicitly a FLOAT bound, and
+    a rounded coordinate must not decide a topological question (ADR-0019).
+    Anything whose reach is not rational in the face's own field — an obliquely
+    axed cylinder, a cone, a torus — returns None so the caller refuses by name
+    instead of guessing.
+    """
+    from forgekernel import body as B
+
+    lo: list = [None] * 3
+    hi: list = [None] * 3
+
+    def bump(i, v):
+        if lo[i] is None or v < lo[i]:
+            lo[i] = v
+        if hi[i] is None or v > hi[i]:
+            hi[i] = v
+
+    try:
+        for f in shape.faces:
+            s = f.surface
+            if isinstance(s, B.Plane):
+                pass                          # bounded entirely by its loops
+            elif isinstance(s, B.SphereS):
+                # sound whether or not the face carries loops — a whole sphere
+                # carries none, and c +- r still contains it
+                for i in range(3):
+                    bump(i, s.c[i] - s.r)
+                    bump(i, s.c[i] + s.r)
+            elif isinstance(s, B.Cylinder):
+                ax = [i for i in range(3) if s.d[i] != 0]
+                if len(ax) != 1:
+                    return None               # oblique: the reach needs a sqrt
+                if not f.loops:
+                    return None               # nothing bounds it along the axis
+                for i in range(3):
+                    if i == ax[0]:
+                        continue              # the loops below bound this one
+                    bump(i, s.p[i] - s.r)
+                    bump(i, s.p[i] + s.r)
+            else:
+                return None                   # Cone, Torus, anything new
+            for lp in f.loops:
+                for e in lp.edges:
+                    for v in (e.v0, e.v1):
+                        for i in range(3):
+                            bump(i, v[i])
+    except (TypeError, ValueError, ArithmeticError):
+        # comparing across two different quadratic fields (a 45-degree cut
+        # meeting a 30-degree one lands in Q(sqrt2,sqrt3)) can refuse to order
+        # rather than lie. That is the exact arithmetic working; treat it as
+        # "cannot prove it" and let the caller say so by name.
+        return None
+    if any(v is None for v in lo) or any(v is None for v in hi):
+        return None
+    return (tuple(lo), tuple(hi))
+
+
+def _outer_bbox(shape):
+    """`_exact_bbox` where it applies, widened to cover the canonical Body.
+
+    Sound OUTER bound only — never use where tightness is load-bearing.
+    """
+    from forgekernel import body as B
+
+    if isinstance(shape, B.Body):
+        return _body_outer_bbox(shape)
+    return _exact_bbox(shape)
 
 
 def _require_convex(solid: "Solid", what: str) -> None:

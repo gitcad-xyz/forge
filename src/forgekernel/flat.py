@@ -2,9 +2,16 @@
 boolean (K2.x).
 
 The everyday mechanical version of "a plane cuts a cylinder": a D-shaft, a
-spanner flat, a keyed hub. It is also the smallest honest piece of the boolean
-family that ~77 of the composed grid's gaps need, and it is exact, so it is
-worth having on its own terms rather than waiting for the general engine.
+spanner flat, a keyed hub. It is exact, so it is worth having on its own terms
+rather than waiting for the general engine.
+
+This docstring used to claim it was "the smallest honest piece of the boolean
+family that ~77 of the composed grid's gaps need". That 77 came from reading
+refusal strings and is wrong; instrumenting the operands
+(`gitcad.bench.refusals`) puts the plane-cuts-a-cylinder family at ~50 of the
+composed gaps, of which the ones needing only LINES and CIRCLES — this family
+and the bores, not ellipses — are the large majority. Left here rather than
+quietly deleted, because the number was load-bearing for a roadmap decision.
 
 The plane is PARALLEL to the axis, so the intersection curve is a pair of
 straight lines up the wall — no ellipse, no transcendence. Keeping the side of
