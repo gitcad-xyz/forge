@@ -65,8 +65,25 @@ def _squarefree(n: int) -> tuple[int, int]:
 
 
 def sqrt_rational(x) -> "SurdVal":
-    """Exact √x for rational x >= 0, as m·√k with k square-free."""
-    x = F(x)
+    """Exact √x for rational x >= 0, as m·√k with k square-free.
+
+    ``F`` WIDENS — it lets ℚ[√d] and ℚ(√p,√q) through untouched — so `F(x)`
+    here does not guarantee a Fraction, and the `.numerator` two lines down
+    then raised AttributeError straight through the seam. That happened four
+    separate times in one day, from four different callers, because a value
+    whose TYPE is SurdVal and whose VALUE is rational is the normal residue of
+    any exact rotation. Ask `as_fraction`, and when the argument really is
+    irrational say so by name instead of by traceback: √(a+b√d) is a NESTED
+    radical, a field above this one.
+    """
+    from forgekernel.exact import as_fraction
+
+    q = as_fraction(x)
+    if q is None:
+        raise MixedRadicals(
+            message=f"sqrt of {x!r} needs a nested radical — √(a+b√d) is not "
+                    "in ℚ[√d], and the tower that holds it arrives at K3.2")
+    x = q
     if x < 0:
         raise ValueError("sqrt of a negative rational")
     mn, kn = _squarefree(x.numerator)

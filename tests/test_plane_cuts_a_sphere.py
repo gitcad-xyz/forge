@@ -110,3 +110,45 @@ def test_it_refuses_a_shape_that_is_not_a_sphere():
 
     with pytest.raises(SphereCutRefused, match="wants a Sphere"):
         cut_sphere_at_z(Cyl(F(0), F(0), F(5), F(0), F(10)), F(0))
+
+
+# -- the centroid, which is what held this rung back (#143) --------------------
+
+def test_a_hemisphere_centroid_is_the_textbook_value():
+    """3r/8 from the flat face. A whole number anyone can look up, and the
+    reason to check it FIRST: `body.volume` handled a pole-trimmed cap all
+    along and `body.centroid` did not, so this rung computed an exact volume
+    and then refused its centre of mass."""
+    c = B.centroid(cut_sphere_at_z(_ball(), F(0)))
+    assert float(c[2]) == pytest.approx(-3 * float(R) / 8, abs=1e-12)
+    assert float(c[0]) == pytest.approx(0.0, abs=1e-12)
+    assert float(c[1]) == pytest.approx(0.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("zc", HEIGHTS, ids=str)
+def test_the_centroid_lies_inside_the_solid(zc):
+    c = B.centroid(cut_sphere_at_z(_ball(), zc))
+    x, y, z = (float(v) for v in c)
+    assert x * x + y * y + z * z < float(R) ** 2, "inside the ball"
+    assert z < float(zc), "below the cut"
+
+
+def test_an_off_centre_cap_centroid_translates_with_the_sphere():
+    """The check a centred ball cannot make: every c_k term in the moment
+    integral is invisible at the origin, so a sign error there passes each
+    centred case and fails only once the sphere moves."""
+    cx, cy, cz = F(3), F(-2), F(7)
+    off = Sphere(cx, cy, cz, R)
+    a = B.centroid(cut_sphere_at_z(off, cz + F(5, 2)))
+    b = B.centroid(cut_sphere_at_z(_ball(), F(5, 2)))
+    for i, off_i in enumerate((cx, cy, cz)):
+        assert float(a[i]) == pytest.approx(float(b[i]) + float(off_i),
+                                            abs=1e-9)
+
+
+def test_a_whole_sphere_centroid_is_untouched():
+    """The branch this shares. A whole sphere's centre of mass is its centre,
+    off-origin included, and widening the sphere case must not move it."""
+    whole = B.to_body(Sphere(F(3), F(-2), F(7), R))
+    assert [float(v) for v in B.centroid(whole)] == pytest.approx(
+        [3.0, -2.0, 7.0], abs=1e-9)

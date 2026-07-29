@@ -1251,6 +1251,43 @@ def centroid(body: Body):
         elif isinstance(s, SphereS):
             rr = float(s.r)
             cc = tuple(float(x) for x in s.c)
+            if s.pole is not None or _sphere_zone(f, s) is not None:
+                # A ZONE or a pole-trimmed CAP. The volume term already had
+                # this case (`_sphere_pole_span` / `_sphere_zone`); the moment
+                # did not, so a plane-cut sphere measured its volume exactly
+                # and then refused its centre of mass — which is what held
+                # K2.x rung 2 back (#143).
+                #
+                # With u = x − c and the patch spanning u_z ∈ [a, b],
+                # Archimedes gives dA = 2πr du_z, so every integral below is
+                # elementary and the off-diagonal ones vanish by revolution
+                # symmetry:
+                #     A      = 2πr(b−a)
+                #     ∫u dA  = (0, 0, πr(b²−a²))
+                #     ∫u_z²dA = 2πr(b³−a³)/3
+                #     ∫u_x²dA = ∫u_y²dA = πr(r²(b−a) − (b³−a³)/3)
+                # and on the sphere x·n̂ = r + c·û, so expanding
+                # ∫x_k(x·n̂)dA gives the four terms below. m holds ¼ of it,
+                # the same normalisation the whole-sphere branch uses — which
+                # was CHECKED against that branch rather than assumed, since
+                # `v·c_k` is not what a naive expansion predicts.
+                zl, zh = (_sphere_pole_span(f, s) if s.pole is not None
+                          else _sphere_zone(f, s))
+                a_, b_ = float(zl) - cc[2], float(zh) - cc[2]
+                area = 2 * math.pi * rr * (b_ - a_)
+                i1z = math.pi * rr * (b_ * b_ - a_ * a_)
+                i2z = 2 * math.pi * rr * (b_ ** 3 - a_ ** 3) / 3
+                i2t = math.pi * rr * (rr * rr * (b_ - a_)
+                                      - (b_ ** 3 - a_ ** 3) / 3)
+                i2 = (i2t, i2t, i2z)
+                i1 = (0.0, 0.0, i1z)
+                cdot = cc[2] * i1z / rr          # ∫(c·û)dA
+                for k in range(3):
+                    m[k] += sgn * 0.25 * (cc[k] * rr * area
+                                          + cc[k] * cdot
+                                          + rr * i1[k]
+                                          + cc[k] * i2[k] / rr)
+                continue
             oct_ = _sphere_octant(f)
             if oct_ is None:
                 v = 4 / 3 * math.pi * rr ** 3

@@ -662,8 +662,20 @@ class Sphere:
             m = _rotation_matrix(axis, deg)
         except ValueError:
             return None                       # angle outside the exact table
+        from forgekernel.exact import as_fraction
+
         c = (self.cx, self.cy, self.cz)
-        p = tuple(sum(m[i][j] * c[j] for j in range(3)) for i in range(3))
+        p = []
+        for i in range(3):
+            v = sum(m[i][j] * c[j] for j in range(3))
+            # demote a coordinate whose VALUE is rational, exactly as
+            # kernel.rotate does. Rodrigues builds s/|axis| as a SurdVal even
+            # for a quarter turn, so a 90-degree-rotated sphere's centre came
+            # back Q[sqrt 1]-typed and the first thing downstream to want an
+            # integer — sqrt_rational, computing a rim radius — hit
+            # AttributeError. Fourth appearance of this pattern today.
+            f = as_fraction(v)
+            p.append(v if f is None else f)
         return Sphere(p[0], p[1], p[2], self.r)
 
     def scaled(self, f) -> "Sphere":
