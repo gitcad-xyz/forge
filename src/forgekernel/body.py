@@ -21,7 +21,7 @@ meshing is a display property.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 from forgekernel.exact import F, cross, dot, sub
@@ -177,10 +177,94 @@ class Face:
 
 @dataclass(frozen=True)
 class Body:
+    """The canonical B-rep (ADR-0021), and the only type the seam returns
+    (ADR-0022 A).
+
+    ``repr_hint`` is ADR-0022 B's ``_repr``: the special form this body was
+    built from — a ``Cyl``, a ``DrilledSolid`` — kept so an operation can still
+    reach that form's exact closed form instead of a divergence sum over faces.
+    Measured before it was added: conversion costs MORE than the operation it
+    replaces for all 15 corpus representations, by 3-10x and by 400x for a
+    filleted box (0.01ms of RoundedBox's closed form against 3.96ms canonical).
+    So the hint is load-bearing, exactly as ADR-0022 predicted, and not an
+    optimisation anyone may quietly drop.
+
+    **THE HINT MAY NEVER CHANGE THE ANSWER, only the cost.** It is therefore
+    excluded from equality and from the hash: two bodies with the same faces
+    are the same body whatever they were built from. That is not a detail —
+    `Document.dumps()` is byte-canonical (ADR-0004) and geometry is compared by
+    value across the differential oracle, so a hint that participated in
+    equality would make identical geometry compare unequal by construction
+    history, which is the exact coupling ADR-0022 exists to remove.
+
+    ``transformed`` DROPS the hint rather than carrying it: a map may leave the
+    special form (an anisotropic scale turns a cylinder into an elliptic one),
+    and a stale hint is worse than none, because the fast path would then
+    answer for a shape that no longer exists. A caller that knows the form
+    survives re-attaches it deliberately.
+    """
+
     faces: tuple
+    repr_hint: object = field(default=None, compare=False, repr=False)
 
     def transformed(self, m):
         return Body(tuple(f.transformed(m) for f in self.faces))
+
+    # -- the canonical measures, as methods ----------------------------------
+    #
+    # A public type needs these on it (ADR-0022 A makes Body public). The
+    # module-level `volume`/`centroid`/`bbox`/`tessellate` below are the
+    # implementations; the bare names inside these methods resolve through
+    # module globals, not the class, so they reach the functions and not
+    # themselves.
+
+    def volume(self):
+        """Exact volume — via the source form's closed form when there is one.
+
+        This is where `repr_hint` earns its keep. `Cyl.volume()` is a closed
+        form and the canonical path is a divergence sum over faces; measured
+        across the corpus the canonical route costs 3-10x more, and 400x for a
+        filleted box. The two agree EXACTLY on every corpus shape that has both
+        — checked by test, because ADR-0022 B allows the hint to change the cost
+        and never the answer.
+        """
+        own = getattr(self.repr_hint, "volume", None)
+        return own() if own is not None else volume(self)
+
+    def centroid(self):
+        own = getattr(self.repr_hint, "centroid", None)
+        return own() if own is not None else centroid(self)
+
+    def bbox(self):
+        """Float bounds. Deliberately always canonical: `_body_outer_bbox` in
+        quadric.py is what any TOPOLOGICAL decision must use, so there is
+        nothing to gain here by asking the hint and one more path to keep
+        honest if we did."""
+        return bbox(self)
+
+    def watertight_violations(self) -> list:
+        """Is this shell closed? Canonical, under the name the feature
+        representations already use, so a caller asking the question does not
+        have to know which kind of shape it holds. `manifold_violations` is the
+        implementation and stays the name for the free function — the two are
+        the same check, and `validate` once reported every pocketed or
+        curved-shelled solid as "unsupported representation" precisely because
+        it reached for the method spelling on a type that only had the
+        function."""
+        return manifold_violations(self)
+
+    def tessellate(self, deflection: float = 0.2):
+        """Always the canonical mesher — NEVER the source form's.
+
+        This one exception is the defect ADR-0022 was written from. Preferring
+        each representation's own mesher was measured strictly worse on every
+        curved shape, and several of those meshers do not even ACCEPT a
+        deflection, so a `except TypeError: return shape.tessellate()` fallback
+        silently discarded the caller's argument and returned a valid mesh that
+        was not the one asked for. A wrong answer to a reasonable question,
+        invisible because the mesh still checked out.
+        """
+        return tessellate(self, deflection)
 
 
 # -- exact affine maps -------------------------------------------------------
