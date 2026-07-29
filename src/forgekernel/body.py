@@ -2006,12 +2006,26 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             rims = [e.curve for lp in face.loops for e in lp.edges]
             cc = tuple(float(x) for x in s.c)
             rr = float(s.r)
+            # WHICH AXIS the band runs along: the pole's, for a blind bore;
+            # z for a through zone, whose rims `_sphere_zone` sorted by z.
+            pax = _pole_axis(s) if s.pole is not None else 2
             if s.pole is not None:
                 zlo_e, zhi_e = _sphere_pole_span(face, s)
                 c_ref = rims[0]
                 ring_rim, segs = circle_pts(c_ref)
-                south = float(s.pole[2]) < 0
-                pole_pt = (cc[0], cc[1], cc[2] + (-rr if south else rr))
+                # ALONG THE TRIM AXIS. This read s.pole[2] and put the pole
+                # point at cc[2] ± r, so a face trimmed on ±x meshed its pole
+                # at the wrong place and the band did not stitch — 34 unpaired
+                # directed edges, which `_audited` refused. The exact body was
+                # right the whole time; only this coarse display mesh was
+                # wrong, which is the fourth site of the same z assumption and
+                # the only one in a float path (meshing, where ADR-0019 allows
+                # floats — so nothing exact was ever at risk).
+                pax = _pole_axis(s)
+                south = float(s.pole[pax]) < 0
+                _pp = list(cc)
+                _pp[pax] = cc[pax] + (-rr if south else rr)
+                pole_pt = tuple(_pp)
                 pole_ring = [pole_pt] * segs
                 ring_lo, ring_hi = ((pole_ring, ring_rim) if south
                                     else (ring_rim, pole_ring))
@@ -2034,8 +2048,8 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
             half = deflection / 2
             step = 2 * math.acos(max(-1.0, min(1.0, 1 - half / rr))) \
                 if rr > half else math.pi / 4
-            f_lo = math.asin(max(-1.0, min(1.0, (zlo - cc[2]) / rr)))
-            f_hi = math.asin(max(-1.0, min(1.0, (zhi - cc[2]) / rr)))
+            f_lo = math.asin(max(-1.0, min(1.0, (zlo - cc[pax]) / rr)))
+            f_hi = math.asin(max(-1.0, min(1.0, (zhi - cc[pax]) / rr)))
             nlat = max(2, int(math.ceil(abs(f_hi - f_lo) / step))
                        if step > 0 else 2)
             rings = [ring_lo]
@@ -2051,12 +2065,14 @@ def tessellate(body: Body, deflection: float = 0.2) -> dict:
                 # check. nlat is derived from the polar span, so the sampling
                 # has to be in the same variable the count was budgeted in.
                 ph = f_lo + (f_hi - f_lo) * j / nlat
-                z = cc[2] + rr * math.sin(ph)
+                z = cc[pax] + rr * math.sin(ph)
                 rad = rr * math.cos(ph)
-                # the ring's centre is on the sphere's axis at height z, and
+                # the ring's centre is on the sphere's axis at station z, and
                 # `_sphere_zone` has already proved the rims are coaxial with
-                # the sphere, so cc[0], cc[1] are the axis
-                org = (cc[0], cc[1], z)
+                # the sphere, so the other two components of cc ARE the axis
+                _o = list(cc)
+                _o[pax] = z
+                org = tuple(_o)
                 rings.append([
                     tuple(org[t] + rad * (math.cos(2 * math.pi * m / segs) * u[t]
                                           + math.sin(2 * math.pi * m / segs) * w[t])
