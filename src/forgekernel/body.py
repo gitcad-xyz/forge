@@ -796,8 +796,13 @@ def _face_volume_term(face: Face):
             # Δz and the offset are generally in ℚ[√d] — precisely why this
             # needed F() widened first.
             zlo, zhi = span
-            off = s.c[2] * ((zhi - s.c[2]) * (zhi - s.c[2])
-                            - (zlo - s.c[2]) * (zlo - s.c[2]))
+            # ALONG THE POLE, not along z. Archimedes and the ∮n̂dA projection
+            # are both statements about the trim AXIS; a zone (two rims) is
+            # still z-parallel by _sphere_zone's own contract, so that case
+            # keeps index 2 and only a pole-trimmed face may differ.
+            ax = _pole_axis(s) if s.pole is not None else 2
+            off = s.c[ax] * ((zhi - s.c[ax]) * (zhi - s.c[ax])
+                             - (zlo - s.c[ax]) * (zlo - s.c[ax]))
             return _pi_value(
                 0, sgn * (2 * s.r * s.r * (zhi - zlo) + off) / 3,
                 "sphere zone")
@@ -1015,31 +1020,55 @@ def _sphere_pole_span(face: Face, s: "SphereS"):
     and so `manifold_violations` needs no exemption: the rim pairs with the
     bore wall and nothing dangles.
     """
-    if s.pole is None:
-        raise ValueError("not a pole-trimmed sphere face")
-    if s.pole[0] != 0 or s.pole[1] != 0 or s.pole[2] == 0:
-        raise ValueError(
-            "a pole-trimmed sphere face whose pole is off the z axis is "
-            "outside what this term computes (K3.7)")
+    i = _pole_axis(s)
     if len(face.loops) != 1 or len(face.loops[0].edges) != 1:
         raise ValueError(
             "a pole-trimmed sphere face must carry exactly one rim (K3.7)")
     e = face.loops[0].edges[0]
     c = e.curve
+    tr = [j for j in range(3) if j != i]                # the transverse pair
     if (not isinstance(c, Circle) or e.v0 != e.v1
-            or c.n[0] != 0 or c.n[1] != 0
-            or c.c[0] != s.c[0] or c.c[1] != s.c[1] or c.r == 0):
+            or c.n[tr[0]] != 0 or c.n[tr[1]] != 0
+            or c.c[tr[0]] != s.c[tr[0]] or c.c[tr[1]] != s.c[tr[1]]
+            or c.r == 0):
         raise ValueError(
             "a pole-trimmed sphere face needs one full circular rim, "
             "coaxial with the sphere and of positive radius (K3.7)")
-    dz = c.c[2] - s.c[2]
+    dz = c.c[i] - s.c[i]
     if dz * dz + c.r * c.r != s.r * s.r:
         raise ValueError(
             "the rim of a pole-trimmed sphere face does not lie on the "
             "sphere (K3.7)")
-    if _gt(0 * s.pole[2], s.pole[2]):                  # pole points down
-        return s.c[2] - s.r, c.c[2]
-    return c.c[2], s.c[2] + s.r
+    if _gt(0 * s.pole[i], s.pole[i]):                  # pole points backwards
+        return s.c[i] - s.r, c.c[i]
+    return c.c[i], s.c[i] + s.r
+
+
+def _pole_axis(s: "SphereS") -> int:
+    """The PRINCIPAL AXIS index a pole-trimmed sphere face is trimmed along.
+
+    This used to be hard-coded to z, and that assumption reached further than
+    it looked: `_sphere_pole_span` and the cap's volume and moment terms all
+    integrate by Archimedes ALONG THE POLE, so a face whose pole sat on ±x had
+    no term at all. It surfaced when a plane-cuts-sphere was extended from a z
+    cut to an x one by turning the ball, cutting at z, and turning the answer
+    back — sound about the geometry, since a sphere absorbs every rotation,
+    and false about the code, because turning the answer back is exactly what
+    put the pole where nothing could measure it.
+
+    An OBLIQUE pole is still outside this: the transverse pair would have to
+    be constructed rather than read off, and every rim test below is written
+    against axis-aligned components. The refusal says so.
+    """
+    if s.pole is None:
+        raise ValueError("not a pole-trimmed sphere face")
+    nz = [j for j in range(3) if s.pole[j] != 0]
+    if len(nz) != 1:
+        raise ValueError(
+            "a pole-trimmed sphere face whose pole is off a principal axis "
+            "is outside what this term computes (K3.7) — the ±x, ±y and ±z "
+            "poles are exact")
+    return nz[0]
 
 
 def _gt(a, b) -> bool:
@@ -1273,15 +1302,20 @@ def centroid(body: Body):
                 # `v·c_k` is not what a naive expansion predicts.
                 zl, zh = (_sphere_pole_span(f, s) if s.pole is not None
                           else _sphere_zone(f, s))
-                a_, b_ = float(zl) - cc[2], float(zh) - cc[2]
+                # every integral below is along the TRIM AXIS; the two
+                # transverse directions share the same second moment
+                ax = _pole_axis(s) if s.pole is not None else 2
+                a_, b_ = float(zl) - cc[ax], float(zh) - cc[ax]
                 area = 2 * math.pi * rr * (b_ - a_)
-                i1z = math.pi * rr * (b_ * b_ - a_ * a_)
-                i2z = 2 * math.pi * rr * (b_ ** 3 - a_ ** 3) / 3
+                i1a = math.pi * rr * (b_ * b_ - a_ * a_)
+                i2a = 2 * math.pi * rr * (b_ ** 3 - a_ ** 3) / 3
                 i2t = math.pi * rr * (rr * rr * (b_ - a_)
                                       - (b_ ** 3 - a_ ** 3) / 3)
-                i2 = (i2t, i2t, i2z)
-                i1 = (0.0, 0.0, i1z)
-                cdot = cc[2] * i1z / rr          # ∫(c·û)dA
+                i2 = [i2t, i2t, i2t]
+                i2[ax] = i2a
+                i1 = [0.0, 0.0, 0.0]
+                i1[ax] = i1a
+                cdot = cc[ax] * i1a / rr         # ∫(c·û)dA
                 for k in range(3):
                     m[k] += sgn * 0.25 * (cc[k] * rr * area
                                           + cc[k] * cdot

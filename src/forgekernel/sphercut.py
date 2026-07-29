@@ -38,6 +38,58 @@ class SphereCutRefused(ValueError):
     from a bug and from an unwritten algorithm (ADR-0019 / #114)."""
 
 
+def cut_sphere_on_axis(sphere, axis: int, cut, keep_low: bool = True):
+    """A ``Sphere`` cut by the plane perpendicular to a PRINCIPAL axis.
+
+    ``axis`` is 0, 1 or 2. The z case is the one written out below; x and y
+    permute the coordinates into it and permute the answer back, which is
+    exact because a permutation of axes is a signed relabelling and nothing
+    here is measured until the face is built.
+    """
+    from forgekernel.quadric import Sphere
+
+    if axis == 2:
+        return cut_sphere_at_z(sphere, cut, keep_low)
+    if axis not in (0, 1):
+        raise SphereCutRefused(f"axis must be 0, 1 or 2, got {axis!r}")
+    c = (sphere.cx, sphere.cy, sphere.cz)
+    # send `axis` to z, keeping the other two in order
+    order = ([1, 2, 0] if axis == 0 else [2, 0, 1])
+    inv = [order.index(j) for j in range(3)]
+    turned = Sphere(c[order[0]], c[order[1]], c[order[2]], sphere.r)
+    out = cut_sphere_at_z(turned, cut, keep_low)
+    return _permute_body(out, inv)
+
+
+def _permute_body(body: B.Body, perm) -> B.Body:
+    """Relabel a body's axes by ``perm`` — exact, and orientation-preserving
+    because only cyclic permutations are used above (an odd permutation would
+    turn every face inside out)."""
+    def pv(v):
+        return (v[perm[0]], v[perm[1]], v[perm[2]])
+
+    def pcurve(cv):
+        if isinstance(cv, B.Circle):
+            return B.Circle(pv(cv.c), pv(cv.n), pv(cv.ref), cv.r)
+        return B.Line(pv(cv.p), pv(cv.d))
+
+    def pface(f):
+        s = f.surface
+        if isinstance(s, B.Plane):
+            surf = B.Plane(pv(s.n), s.d)
+        elif isinstance(s, B.SphereS):
+            surf = B.SphereS(pv(s.c), s.r,
+                             None if s.pole is None else pv(s.pole))
+        else:                                   # pragma: no cover - not built
+            raise SphereCutRefused(
+                f"cannot permute a {type(s).__name__} face")
+        loops = tuple(B.Loop(tuple(B.Edge(pcurve(e.curve), pv(e.v0), pv(e.v1))
+                                   for e in lp.edges)) for lp in f.loops)
+        return B.Face(surf, loops, f.sense)
+
+    return B.Body(tuple(pface(f) for f in body.faces))
+
+
 def cut_sphere_at_z(sphere, zc, keep_below: bool = True) -> B.Body:
     """A ``Sphere`` cut by the horizontal plane z = ``zc``.
 
