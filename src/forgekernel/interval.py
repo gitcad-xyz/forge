@@ -148,3 +148,141 @@ def ci_reciprocal(x: CInterval) -> CInterval:
     x.sign()                                        # raises if straddles 0
     lo, hi = Fraction(1) / x.hi, Fraction(1) / x.lo
     return CInterval(min(lo, hi), max(lo, hi))
+
+
+# -- certified trigonometry ---------------------------------------------------
+#
+# WHY THIS EXISTS, because the gap it fills is a roadmap decision and not a
+# missing convenience. Every exact rung that measures an ARC is pinned to
+# twelfths: the area of a circular segment is r^2(pi - t + sin t cos t) with
+# t = arccos(h/r), and by Niven t lands in Q*pi only at multiples of 30
+# degrees. So `flat.py` answers a flat milled on a bar at FIVE depths out of a
+# continuum, and `notch.py` decides its crossings the same way. Measured on a
+# radius-5 bar over 33 rational depths: 3 exact. The same sweep against a
+# sphere cap, whose closed form is a polynomial and carries no angle, is 33 of
+# 33. That is the whole difference between the two rungs, and it is the reason
+# the composed grid's "42 cells need only lines and circles" is a much weaker
+# statement than it sounds: a cell is scored green by ONE representative
+# parameter, and the admissible set behind it can be measure zero.
+#
+# ADR-0019 already decided what to do about this. A topological decision needs
+# a CERTIFIED SIGN, and certified includes "proven by a bracket" — an arc angle
+# has no algebraic home but it has a perfectly good rational enclosure. What
+# was missing was only the primitive.
+
+def cos_rational(t: Fraction, terms: int = 30) -> CInterval:
+    """A certified enclosure of cos(t) for rational ``t``.
+
+    Alternating series with the first omitted term as the remainder bound —
+    rigorous, not asymptotic. That bound is valid only while the omitted TAIL
+    is decreasing in magnitude, and the term ratio is t^2/((2k+1)(2k+2)), so
+    the precondition is exactly ``t^2 < (2N+1)(2N+2)`` at the first omitted
+    index N. It increases with k, so checking it at N covers the whole tail.
+
+    The domain is therefore DERIVED from ``terms`` rather than fixed. An
+    earlier version capped |t| at a hard-coded 4, which was far more
+    conservative than the mathematics required and, worse, was not the real
+    precondition: it made `sin` — which evaluates cos(pi/2 - t) — refuse over
+    part of its own natural range for a reason that had nothing to do with
+    whether the bound held. Outside the derived domain this refuses, because
+    a remainder bound that silently stops bounding is worse than none.
+    """
+    t = t if isinstance(t, Fraction) else Fraction(t)
+    t2 = t * t
+    if t2 >= (2 * terms + 1) * (2 * terms + 2):
+        raise ValueError(
+            f"cos_rational: |t| = {float(abs(t)):.4g} is too large for "
+            f"{terms} terms to bound the remainder; the alternating tail is "
+            "not yet decreasing there")
+    term = Fraction(1)                              # k = 0
+    total = Fraction(0)
+    for k in range(terms):
+        total += term if k % 2 == 0 else -term
+        term = term * t2 / ((2 * k + 1) * (2 * k + 2))
+    # `term` is now the magnitude of the FIRST OMITTED term, which bounds the
+    # remainder of an alternating series with decreasing terms
+    return CInterval(total - term, total + term)
+
+
+def arccos_rational(v: Fraction, width: Fraction = Fraction(1, 10 ** 40)
+                    ) -> CInterval:
+    """A certified enclosure of arccos(v) for -1 <= v <= 1, to ``width``.
+
+    Bisection against `cos_rational`, keeping the invariant that the true
+    root stays inside [a, b]: cos is strictly decreasing on [0, pi], so a
+    midpoint whose certified cos is entirely ABOVE v puts the root to its
+    right, and entirely below puts it to the left. If the cos bracket
+    straddles v the step is not certified and the loop STOPS rather than
+    guessing a side — [a, b] still encloses, it is merely wider than asked.
+    """
+    v = v if isinstance(v, Fraction) else Fraction(v)
+    if not (-1 <= v <= 1):
+        raise ValueError(f"arccos outside [-1, 1]: {v}")
+    # THE TWO ENDPOINTS ARE TANGENCIES and the bisection below cannot see
+    # them. cos is flat where it meets +-1, so at v = -1 the test "cos(m) < v"
+    # is never true, b never moves, and a climbs past pi into the region where
+    # cos is INCREASING again — the invariant quietly dies and the answer came
+    # back just above pi, excluding the very value it was asked for.
+    if v == 1:
+        return CInterval(Fraction(0), Fraction(0))
+    if v == -1:
+        return pi_interval()
+    a = Fraction(0)                                 # cos(0) = 1 > v
+    b = pi_interval().hi
+    # ...and the same tangency makes the STARTING bracket a claim that has to
+    # be checked rather than assumed: b must satisfy cos(b) < v for the walk
+    # to be sound, and pi's upper bound only does so for v clear of -1. Refuse
+    # rather than return a bracket whose enclosure was never established.
+    if not cos_rational(b).hi < v:
+        raise ValueError(
+            f"arccos({v}) is inside the tangency at -1; not certifiable here")
+    while b - a > width:
+        m = (a + b) / 2
+        c = cos_rational(m)
+        if c.lo > v:
+            a = m                                   # cos(m) > v: root is right
+        elif c.hi < v:
+            b = m                                   # cos(m) < v: root is left
+        else:
+            break                                   # not certified; stop here
+    return CInterval(a, b)
+
+
+def arccos(x, width: Fraction = Fraction(1, 10 ** 40)) -> CInterval:
+    """arccos of a certified interval — the enclosure of every value in it.
+
+    arccos is DECREASING, so the bracket flips: the low end comes from the
+    high end of the argument. An argument bracket that pokes marginally
+    outside [-1, 1] (a sqrt widening, say) is clamped, which is sound because
+    the true value was inside it and inside [-1, 1] both.
+    """
+    x = _as_ci(x)
+    lo = max(Fraction(-1), min(Fraction(1), x.lo))
+    hi = max(Fraction(-1), min(Fraction(1), x.hi))
+    return CInterval(arccos_rational(hi, width).lo,
+                     arccos_rational(lo, width).hi)
+
+
+def cos(x) -> CInterval:
+    """cos of a certified interval, via the 1-Lipschitz bound.
+
+    |cos u - cos v| <= |u - v| everywhere, so the midpoint's enclosure widened
+    by the argument's half-width contains every value. Sound for any argument
+    within the series domain, and it needs no case analysis over which
+    extrema the interval happens to span.
+    """
+    x = _as_ci(x)
+    c = cos_rational(x.mid)
+    half = x.width / 2
+    return CInterval(c.lo - half, c.hi + half)
+
+
+def sin(x) -> CInterval:
+    """sin of a certified interval — cos shifted by a certified pi/2.
+
+    The shift is itself an interval, so the result carries pi's enclosure as
+    well as the argument's. Stated this way rather than with a second series
+    so there is one remainder-bound argument in this file, not two.
+    """
+    half_pi = pi_interval() * CInterval.exact(Fraction(1, 2))
+    return cos(half_pi - _as_ci(x))
