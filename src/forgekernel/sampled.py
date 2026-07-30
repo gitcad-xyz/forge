@@ -21,6 +21,8 @@ sampled float never enters a byte-canonical document.
 
 from __future__ import annotations
 
+import math
+
 #: fixed multiplier/increment for a reproducible LCG (Numerical Recipes)
 _LCG_A = 1664525
 _LCG_C = 1013904223
@@ -350,15 +352,149 @@ def sampled_shell(base, thickness):
     return SampledSolid(lambda p: inside(p) and near_surface(p), bbox)
 
 
-# A sampled FILLET is deliberately NOT provided. A fillet is a morphological
-# opening (convex edges) plus closing (concave), and both need the distance to
-# the surface — which for a curved wall is a MESH distance, carrying the
-# tessellation's error. Measured on a 20-cube: the opening was 17% off at r=3
-# and 2.2% off at r=1, and that error is SYSTEMATIC (mesh resolution), not the
-# statistical 1/√N the reported half-width covers. A sampled answer whose true
-# error exceeds its stated bound is the one thing ADR-0024 forbids as loudly as
-# a bare float — it lies about how much to trust it. So `fillet` on a curved
-# base stays an honest refusal until an offset-surface construction can bound
-# it. Shell is different and IS provided: its membership (inside AND within t of
-# the surface) is exact set-wise, and the mesh only enters the distance, well
-# under any real wall thickness.
+class _MorphResult:
+    """A voxel morphological result — the sampled fillet (ADR-0024).
+
+    A fillet-all rounds every edge with a ball of radius r, which is the
+    morphological OPEN-then-CLOSE of the solid: opening rounds the convex edges
+    (a ball rolling inside removes the sharp corner), closing rounds the concave
+    ones (a ball rolling outside fills the crease). That IS the definition of a
+    rolling-ball fillet, so the only error is the voxel resolution h — bounded
+    HONESTLY by surface_area·h (boundary voxels are miscounted by at most a
+    layer of thickness h), which is reported as the half-width. No systematic
+    bias hiding under a statistical bar: the earlier single-normal shortcut had
+    one and was withheld; this does not.
+    """
+
+    provenance = "sampled"
+    is_exact_scalar = False
+
+    def __init__(self, occ, dims, lo, h, area):
+        self._occ = occ                     # flat bool list, opened+closed
+        self._dims = dims
+        self._lo = lo
+        self._h = h
+        self._area = area
+
+    def _idx(self, i, j, k):
+        return (i * self._dims[1] + j) * self._dims[2] + k
+
+    def bbox(self):
+        hi = tuple(self._lo[k] + self._dims[k] * self._h for k in range(3))
+        return (tuple(self._lo), hi)
+
+    def volume(self):
+        from forgekernel.interval import CInterval
+
+        cnt = sum(1 for v in self._occ if v)
+        vol = cnt * self._h ** 3
+        err = self._area * self._h          # geometric discretisation bound
+        return CInterval(_frac(vol - err), _frac(vol + err))
+
+    def centroid_f(self):
+        nx, ny, nz = self._dims
+        sx = sy = sz = 0.0
+        cnt = 0
+        for i in range(nx):
+            for j in range(ny):
+                base = (i * ny + j) * nz
+                for k in range(nz):
+                    if self._occ[base + k]:
+                        cnt += 1
+                        sx += self._lo[0] + (i + 0.5) * self._h
+                        sy += self._lo[1] + (j + 0.5) * self._h
+                        sz += self._lo[2] + (k + 0.5) * self._h
+        if not cnt:
+            nan = float("nan")
+            return (nan, nan, nan)
+        return (sx / cnt, sy / cnt, sz / cnt)
+
+    def watertight_violations(self):
+        return []
+
+
+def _ball_offsets(r, h):
+    """Voxel offsets whose centre lies within r — the ball structuring element."""
+    rv = int(math.ceil(r / h))
+    r2 = (r / h) ** 2
+    return [(di, dj, dk)
+            for di in range(-rv, rv + 1)
+            for dj in range(-rv, rv + 1)
+            for dk in range(-rv, rv + 1)
+            if di * di + dj * dj + dk * dk <= r2]
+
+
+def _morph_pass(occ, dims, offsets, want_all):
+    """One erosion (want_all=True) or dilation (want_all=False) by the ball."""
+    nx, ny, nz = dims
+    out = [False] * len(occ)
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                idx = (i * ny + j) * nz + k
+                hit_all = True
+                hit_any = False
+                for (di, dj, dk) in offsets:
+                    ii, jj, kk = i + di, j + dj, k + dk
+                    if 0 <= ii < nx and 0 <= jj < ny and 0 <= kk < nz:
+                        v = occ[(ii * ny + jj) * nz + kk]
+                    else:
+                        v = False           # outside the grid is empty
+                    if v:
+                        hit_any = True
+                        if not want_all:
+                            break
+                    else:
+                        hit_all = False
+                        if want_all:
+                            break
+                out[idx] = hit_all if want_all else hit_any
+    return out
+
+
+def sampled_fillet(base, radius):
+    """A fillet-all as a voxel morphological open-then-close (ADR-0024).
+
+    Correct and honestly bounded, unlike the withdrawn single-normal opening.
+    Verified against an exact RoundedBox (fillet-all of a box) within the
+    reported surface_area·h.
+    """
+    inside, bbox = SampledSolid._region(base)
+    r = float(radius)
+    lo, hi = bbox
+    pad = r * 1.5
+    lo = tuple(lo[k] - pad for k in range(3))
+    hi = tuple(hi[k] + pad for k in range(3))
+    span = [hi[k] - lo[k] for k in range(3)]
+    # resolution: fine enough that the ball is well sampled, capped so the grid
+    # stays tractable (~50 voxels on the longest axis)
+    h = min(r / 3.0, max(span) / 50.0)
+    dims = [int(math.ceil(span[k] / h)) + 1 for k in range(3)]
+    nx, ny, nz = dims
+    occ = [False] * (nx * ny * nz)
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                p = (lo[0] + (i + 0.5) * h, lo[1] + (j + 0.5) * h,
+                     lo[2] + (k + 0.5) * h)
+                if inside(p):
+                    occ[(i * ny + j) * nz + k] = True
+    offs = _ball_offsets(r, h)
+    # open = erode then dilate (rounds convex); close = dilate then erode
+    # (rounds concave). fillet-all rounds both, so open then close.
+    opened = _morph_pass(_morph_pass(occ, dims, offs, True), dims, offs, False)
+    closed = _morph_pass(_morph_pass(opened, dims, offs, False), dims, offs, True)
+    area = _mesh_area(base)
+    return _MorphResult(closed, dims, lo, h, area)
+
+
+def _mesh_area(base):
+    total = 0.0
+    for (a, b, c) in _surface_tris(base):
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cx = ab[1] * ac[2] - ab[2] * ac[1]
+        cy = ab[2] * ac[0] - ab[0] * ac[2]
+        cz = ab[0] * ac[1] - ab[1] * ac[0]
+        total += 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
+    return total

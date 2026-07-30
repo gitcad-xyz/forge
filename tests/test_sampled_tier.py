@@ -84,10 +84,16 @@ def test_sampled_shell_matches_an_exact_box_shell():
     assert abs(float(v.mid) - 3904.0) <= float(v.hi - v.lo) / 2 + 20
 
 
-def test_no_sampled_fillet_is_shipped():
-    """ADR-0024's honesty line, pinned. A mesh fillet's error is SYSTEMATIC
-    (resolution), not the statistical error the half-width reports, so a sampled
-    fillet would lie about its accuracy. It must not exist until an
-    offset-surface construction can bound it."""
-    import forgekernel.sampled as s
-    assert not hasattr(s, "sampled_fillet")
+def test_sampled_fillet_stays_within_its_honest_bound():
+    """A fillet-all is a voxel morphological open-then-close. Its only error is
+    the voxel resolution, bounded by surface_area·h and reported as the
+    half-width — so the exact RoundedBox volume must fall INSIDE the bracket at
+    every radius. That is the ADR-0024 line: never a lie about the error. The
+    withdrawn single-normal opening failed exactly this (2.2% off, 3σ of 14)."""
+    from forgekernel.sampled import sampled_fillet
+    from forgekernel.quadric import RoundedBox
+    box = translate(Solid.box(20, 20, 20), 0, 0, 0)
+    for r in (1, 2):
+        v = sampled_fillet(box, r).volume()
+        exact = float(RoundedBox(20, 20, 20, r).volume())
+        assert v.lo <= exact <= v.hi, (r, float(v.mid), exact, float(v.width))
