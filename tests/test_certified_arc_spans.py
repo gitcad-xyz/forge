@@ -144,3 +144,38 @@ def test_the_bracket_is_proven_exactly_not_trusted_from_the_float():
     # a rational needs no bracket at all and gets a zero-width one
     exact = B.certified_bracket(F(1, 5))
     assert exact.lo == exact.hi == F(1, 5)
+
+
+# -- the centroid, off the grid (ADR-0023) -----------------------------------
+
+def _flat_body(h):
+    """A flat milled at depth h on a radius-5, height-12 bar — the ADR-0023
+    off-grid construction, built here so the centroid test is self-contained."""
+    from forgekernel.quadric import Cyl
+    from forgekernel.flat import flat_cut
+    return flat_cut(Cyl(F(0), F(0), F(5), F(0), F(12)), h)
+
+
+@pytest.mark.parametrize("h", [F(1), F(7, 3), F(-3, 2), F(1, 8), F(-9, 4)])
+def test_the_off_grid_centroid_matches_the_closed_form(h):
+    """The flat is symmetric in y and in z, so its centre of mass sits at y=0
+    and z=6 EXACTLY, and its x follows the segment's first moment. A body
+    carrying an off-grid arc used to have no centroid at all — only a volume.
+    """
+    cen = B.centroid(_flat_body(h))
+    assert abs(cen[1]) < 1e-9, cen        # symmetric in y
+    assert abs(cen[2] - 6.0) < 1e-9, cen  # symmetric in z about the mid-height
+    # x is the segment centroid: negative (material kept on the low-x side)
+    assert cen[0] < 0, cen
+
+
+def test_the_band_moment_D_term_is_not_optional():
+    """The on-grid centroid formula assumes ∫cos²=∫sin²=Δθ/2, true only for the
+    quarter-turn arcs that occur on the grid (D := s₁c₁−s₀c₀ = 0). A flat's arc
+    is not a quarter-turn, so D≠0, and dropping the (D/2) band term gives a
+    plausible WRONG centre of mass. This pins that the term is carried: the x
+    centroid of an h=1 flat is ~-1.593, and the D-less value differs in the
+    third digit.
+    """
+    cen = B.centroid(_flat_body(F(1)))
+    assert abs(cen[0] - (-1.5931)) < 1e-3, cen

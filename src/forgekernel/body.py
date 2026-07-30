@@ -1596,6 +1596,163 @@ def _stitch_cracks(verts, tris, rounds: int = 40):
     return tris
 
 
+def _span_rad_f(circ: Circle, v0, v1):
+    """(span in radians CCW, c0, s0, c1, s1) for an arc, all FLOAT.
+
+    Works at ANY angle — the endpoint cos/sin come from `arc_cos_sin` exactly
+    and are floated here, because a centroid is a ratio that leaves the field
+    anyway (ADR-0019). This is the grid-free counterpart to the twelfth-index
+    span the on-grid centroid reads.
+    """
+    c0, s0 = arc_cos_sin(circ, v0)
+    c1, s1 = arc_cos_sin(circ, v1)
+    c0, s0, c1, s1 = float(c0), float(s0), float(c1), float(s1)
+    th0, th1 = math.atan2(s0, c0), math.atan2(s1, c1)
+    span = th1 - th0
+    while span <= 0:
+        span += 2 * math.pi
+    return span, c0, s0, c1, s1
+
+
+def _mixed_loop_area_centroid_offgrid(loop: Loop, nf):
+    """`_mixed_loop_area_centroid_f`, but grid-free (ADR-0023).
+
+    Identical geometry — chord polygon plus one circular segment per arc — with
+    the segment's half-angle taken from the true arc span rather than a twelfth
+    index, so a cap whose arc ends off the grid is measurable. Segment area is
+    r²(θ − sinθ)/2 and its first moment (2/3)r³sin³(θ/2) along the outward
+    bisector, exactly as the on-grid version; only the source of θ differs.
+    """
+    vs = [tuple(float(x) for x in e.v0) for e in loop.edges]
+    area, cen = _poly_area_centroid_f(vs, nf)
+    acc = [cen[k] * area for k in range(3)]
+    for e in loop.edges:
+        if not isinstance(e.curve, Circle):
+            continue
+        theta, c0, s0, c1, s1 = _span_rad_f(e.curve, e.v0, e.v1)
+        r = float(e.curve.r)
+        alpha = theta / 2.0
+        sgn = 1.0 if sum(float(e.curve.n[k]) * nf[k]
+                         for k in range(3)) > 0 else -1.0
+        a_seg = sgn * r * r * (alpha - math.sin(alpha) * math.cos(alpha))
+        c = tuple(float(x) for x in e.curve.c)
+        mid = [(float(e.v0[k]) + float(e.v1[k])) / 2 - c[k] for k in range(3)]
+        ln = math.sqrt(sum(x * x for x in mid))
+        if ln == 0:                             # half turn: chord mid IS centre
+            u, w = _circle_frame(e.curve)
+            th = math.atan2(s0, c0) + alpha
+            bis = [math.cos(th) * float(u[k]) + math.sin(th) * float(w[k])
+                   for k in range(3)]
+        else:
+            bis = [x / ln for x in mid]
+        d = (2.0 / 3.0) * r ** 3 * math.sin(alpha) ** 3
+        area += a_seg
+        for k in range(3):
+            acc[k] += sgn * d * bis[k] + a_seg * c[k]
+    return area, tuple(acc[k] / area for k in range(3)) if area else cen
+
+
+def _centroid_offgrid(body: Body):
+    """Centre of mass for a body carrying an arc off the twelfth grid.
+
+    A float centroid, like `centroid` — a ratio of ℚ[π] quantities leaves the
+    field (ADR-0019) — but grid-free, and covering only the surfaces the
+    ADR-0023 families reach: Plane and Cylinder. A sphere or cone face off the
+    grid raises, so the caller flags the centroid unavailable rather than
+    returning a partial one.
+
+    THE BAND MOMENT IS NOT THE ON-GRID FORMULA. That one uses ∫cos² = ∫sin² =
+    Δθ/2, which holds only because the arcs that occur on the grid are
+    quarter-turns (D := s₁c₁ − s₀c₀ = 0 there). A flat's arc is 2(π−θ), not a
+    quarter, so D ≠ 0 and the missing (D/2) term is exactly the difference
+    between the right centre of mass and a plausible wrong one. Derived here in
+    full and Monte-Carlo verified.
+    """
+    m = [0.0, 0.0, 0.0]
+    for f in body.faces:
+        s = f.surface
+        sgn = 1.0 if f.sense else -1.0
+        if isinstance(s, Plane):
+            nf = _unit(tuple(float(x) for x in s.n))
+            acc, area = [0.0, 0.0, 0.0], 0.0
+            for i, lp in enumerate(f.loops):
+                circ = _loop_is_circle(lp)
+                if circ is not None:
+                    a = math.pi * float(circ.r) ** 2
+                    c = tuple(float(x) for x in circ.c)
+                elif _loop_has_arcs(lp):
+                    a, c = _mixed_loop_area_centroid_offgrid(lp, nf)
+                    a = abs(a)
+                else:
+                    vs = [tuple(float(x) for x in e.v0) for e in lp.edges]
+                    a, c = _poly_area_centroid_f(vs, nf)
+                    a = abs(a)
+                w = a if i == 0 else -a
+                area += w
+                for k in range(3):
+                    acc[k] += c[k] * w
+            h = sum(nf[k] * float(x) for k, x in enumerate(_plane_point(s)))
+            for k in range(3):
+                m[k] += sgn * 0.25 * h * acc[k]
+        elif isinstance(s, Cylinder):
+            h = float(_band_height(f, s))
+            d = _unit(tuple(float(x) for x in s.d))
+            q = tuple(float(x) for x in s.p)
+            ts = [sum((float(e.curve.c[k]) - q[k]) * d[k] for k in range(3))
+                  for lp in f.loops for e in lp.edges
+                  if isinstance(e.curve, Circle)]
+            t = (min(ts) + max(ts)) / 2
+            mid = tuple(q[k] + t * d[k] for k in range(3))
+            md = sum(mid[k] * d[k] for k in range(3))
+            rr = float(s.r)
+            # accumulate the band integrals over the FORWARD rim (normal·d > 0),
+            # summing per sub-edge — the split-at-twelfths edges telescope, and
+            # per-edge summation is the true integral over their union
+            u = w = None
+            A = CS = D = 0.0
+            V = [0.0, 0.0, 0.0]
+            for lp in f.loops:
+                for e in lp.edges:
+                    if not isinstance(e.curve, Circle):
+                        continue
+                    if _key3(e.v0) == _key3(e.v1):
+                        continue
+                    if dot(e.curve.n, s.d) <= 0:
+                        continue                # backward rim
+                    if u is None:
+                        u, w = (tuple(float(x) for x in v)
+                                for v in _circle_frame(e.curve))
+                    span, c0, s0, c1, s1 = _span_rad_f(e.curve, e.v0, e.v1)
+                    A += span
+                    CS += (s1 * s1 - s0 * s0) / 2
+                    D += s1 * c1 - s0 * c0
+                    for k in range(3):
+                        V[k] += (s1 - s0) * u[k] + (c0 - c1) * w[k]
+            if u is None:                       # a full, untrimmed band
+                A, V = 2 * math.pi, [0.0, 0.0, 0.0]
+                CS = D = 0.0
+                u, w = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+            pu = sum(mid[k] * u[k] for k in range(3))
+            pw = sum(mid[k] * w[k] for k in range(3))
+            mm = [(A / 2) * (pu * u[k] + pw * w[k])
+                  + CS * (u[k] * pw + w[k] * pu)
+                  + (D / 2) * (pu * u[k] - pw * w[k]) for k in range(3)]
+            pv = sum(mid[k] * V[k] for k in range(3))
+            for k in range(3):
+                val = rr * h * (mid[k] * (pv + rr * A)
+                                + rr * (mm[k] + rr * V[k]))
+                m[k] += sgn * 0.25 * val
+        else:
+            raise ValueError(
+                f"centroid of a {type(s).__name__} face off the twelfth grid "
+                "is not implemented — ADR-0023 covers plane and cylinder")
+    vol = volume(body)
+    v = float(vol.mid) if hasattr(vol, "mid") else float(vol)
+    if v == 0:
+        raise ValueError("centroid of a zero-volume body is undefined")
+    return tuple(x / v for x in m)
+
+
 def centroid(body: Body):
     """Centre of mass, by the same per-face decomposition the volume uses.
 
@@ -1611,7 +1768,14 @@ def centroid(body: Body):
     A centre of mass is a RATIO of ℚ[π] quantities and so leaves the field
     (ADR-0019); floats are the honest boundary here, exactly as forge's other
     ``centroid_f`` do. The volume it divides by stays exact.
+
+    A body carrying an arc off the twelfth grid (ADR-0023) routes to
+    `_centroid_offgrid`, which is grid-free and — crucially — carries the band
+    moment's (D/2) term that the on-grid formula drops because on-grid arcs are
+    quarter-turns. On-grid bodies are untouched and byte-identical.
     """
+    if _needs_certified(body):
+        return _centroid_offgrid(body)
     m = [0.0, 0.0, 0.0]
     for f in body.faces:
         s = f.surface
