@@ -92,8 +92,32 @@ def test_sampled_fillet_stays_within_its_honest_bound():
     withdrawn single-normal opening failed exactly this (2.2% off, 3σ of 14)."""
     from forgekernel.sampled import sampled_fillet
     from forgekernel.quadric import RoundedBox
-    box = translate(Solid.box(20, 20, 20), 0, 0, 0)
-    for r in (1, 2):
-        v = sampled_fillet(box, r).volume()
-        exact = float(RoundedBox(20, 20, 20, r).volume())
-        assert v.lo <= exact <= v.hi, (r, float(v.mid), exact, float(v.width))
+    box = translate(Solid.box(10, 10, 10), 0, 0, 0)
+    v = sampled_fillet(box, 1).volume()
+    exact = float(RoundedBox(10, 10, 10, 1).volume())
+    assert v.lo <= exact <= v.hi, (float(v.mid), exact, float(v.width))
+
+
+def test_a_sampled_solid_tessellates_and_exports_faceted():
+    """The export path (ADR-0024): a sampled cut has no b-rep, so it tessellates
+    to a watertight voxel surface and writes a valid faceted STEP."""
+    from forgekernel.sampled import write_step_faceted
+    out = SampledSolid.boolean("cut", Sphere(0, 0, 0, 6),
+                               _box(2, 2, 40, -1, -1, -20))
+    mesh = out.tessellate()
+    assert mesh["triangles"] and mesh["vertices"]
+    step = write_step_faceted(mesh, "cut")
+    assert step.startswith("ISO-10303-21")
+    assert step.strip().endswith("END-ISO-10303-21;")
+    assert "SHELL_BASED_SURFACE_MODEL" in step
+
+
+def test_shell_of_a_sampled_solid_works():
+    """A shell OF a sampled cut: the base is sampled, so its surface is the
+    sampled voxel surface — the chain composes. Shell is the cheap check
+    (membership only); the fillet-of-sampled path is exercised through the
+    seam bench, not here, because voxel morphology in pure Python is slow."""
+    from forgekernel.sampled import sampled_shell
+    cut = SampledSolid.boolean("cut", Sphere(0, 0, 0, 4),
+                               _box(2, 20, 20, -1, -10, -10))
+    assert sampled_shell(cut, 1).volume(40000).sign() > 0

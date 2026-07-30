@@ -271,6 +271,95 @@ class SampledSolid:
         # and claiming "closed" would overstate what it is
         return []
 
+    def tessellate(self, deflection=0.2):
+        """A watertight voxel-surface mesh of the sampled set (ADR-0024).
+
+        Blocky — this is a faceted approximation of a CSG the kernel did not
+        construct exactly — but closed and valid, which is what a faceted STEP
+        export needs. The resolution follows the bounding box."""
+        lo, hi = self._bbox
+        span = [hi[k] - lo[k] for k in range(3)]
+        h = max(span) / 40.0 or 1.0
+        dims = [int(math.ceil(span[k] / h)) + 1 for k in range(3)]
+        nx, ny, nz = dims
+        occ = [False] * (nx * ny * nz)
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    p = (lo[0] + (i + 0.5) * h, lo[1] + (j + 0.5) * h,
+                         lo[2] + (k + 0.5) * h)
+                    if self._inside(p):
+                        occ[(i * ny + j) * nz + k] = True
+        return _voxel_surface_from_grid(occ, dims, tuple(lo), h)
+
+
+def write_step_faceted(mesh, name="gitcad_part"):
+    """A STEP AP214 SHELL_BASED_SURFACE_MODEL from a triangle mesh.
+
+    The honest export for a shape with no exact b-rep to emit — a sampled
+    boolean, a voxel fillet — and the fallback for an exact body the b-rep
+    writer cannot key yet. Every triangle is a planar ADVANCED_FACE; a surface
+    model (not a MANIFOLD_SOLID_BREP) so it needs no shared-edge audit and any
+    reader accepts it. FACETED, and a caller that imports it gets facets, not
+    the exact surface — the provenance on the measure says as much.
+    """
+    verts = [tuple(float(x) for x in v) for v in mesh["vertices"]]
+    tris = mesh["triangles"]
+    lines = []
+    n = [0]
+
+    def emit(s):
+        n[0] += 1
+        lines.append(f"#{n[0]}={s};")
+        return n[0]
+
+    pids = [emit(f"CARTESIAN_POINT('',({v[0]:.9g},{v[1]:.9g},{v[2]:.9g}))")
+            for v in verts]
+    faces = []
+    for (a, b, c) in tris:
+        pa, pb, pc = verts[a], verts[b], verts[c]
+        ux = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+        vx = (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2])
+        nx_ = (ux[1] * vx[2] - ux[2] * vx[1],
+               ux[2] * vx[0] - ux[0] * vx[2],
+               ux[0] * vx[1] - ux[1] * vx[0])
+        ln = (nx_[0] ** 2 + nx_[1] ** 2 + nx_[2] ** 2) ** 0.5
+        if ln == 0:
+            continue                            # degenerate triangle, skip
+        nrm = (nx_[0] / ln, nx_[1] / ln, nx_[2] / ln)
+        vps = []
+        for pid in (pids[a], pids[b], pids[c]):
+            vp = emit(f"VERTEX_POINT('',#{pid})")
+            vps.append(vp)
+        oes = []
+        for i in range(3):
+            p0, p1 = (a, b, c)[i], (a, b, c)[(i + 1) % 3]
+            d = (verts[p1][0] - verts[p0][0], verts[p1][1] - verts[p0][1],
+                 verts[p1][2] - verts[p0][2])
+            dl = (d[0] ** 2 + d[1] ** 2 + d[2] ** 2) ** 0.5 or 1.0
+            dr = emit(f"DIRECTION('',({d[0] / dl:.9g},{d[1] / dl:.9g},"
+                      f"{d[2] / dl:.9g}))")
+            vec = emit(f"VECTOR('',#{dr},{dl:.9g})")
+            ln_ = emit(f"LINE('',#{pids[p0]},#{vec})")
+            ec = emit(f"EDGE_CURVE('',#{vps[i]},#{vps[(i + 1) % 3]},#{ln_},.T.)")
+            oes.append(emit(f"ORIENTED_EDGE('',*,*,#{ec},.T.)"))
+        loop = emit(f"EDGE_LOOP('',(#{oes[0]},#{oes[1]},#{oes[2]}))")
+        fb = emit(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+        ax_d = emit(f"DIRECTION('',({nrm[0]:.9g},{nrm[1]:.9g},{nrm[2]:.9g}))")
+        rdir = emit("DIRECTION('',(1.,0.,0.))" if abs(nrm[0]) < 0.9
+                    else "DIRECTION('',(0.,1.,0.))")
+        axp = emit(f"AXIS2_PLACEMENT_3D('',#{pids[a]},#{ax_d},#{rdir})")
+        pl = emit(f"PLANE('',#{axp})")
+        faces.append(emit(f"ADVANCED_FACE('',(#{fb}),#{pl},.T.)"))
+    shell = emit(f"OPEN_SHELL('',({','.join('#%d' % f for f in faces)}))")
+    ssm = emit(f"SHELL_BASED_SURFACE_MODEL('',(#{shell}))")
+    header = ("ISO-10303-21;\nHEADER;\n"
+              f"FILE_DESCRIPTION(('faceted (ADR-0024 sampled export)'),'2;1');\n"
+              f"FILE_NAME('{name}','',(''),(''),'gitcad','forgekernel','');\n"
+              "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n")
+    body = "\n".join(lines)
+    return header + body + f"\nENDSEC;\nEND-ISO-10303-21;\n"
+
 
 def _frac(x):
     from fractions import Fraction
@@ -320,11 +409,18 @@ def _point_tri_dist2(p, a, b, c):
 
 
 def _surface_tris(shape):
-    """Triangles of a shape's surface mesh, for distance queries."""
+    """Triangles of a shape's surface mesh, for distance / area queries.
+
+    A SampledSolid or _MorphResult has no b-rep, so it supplies its own
+    voxel-surface tessellation — which is why a fillet OF a sampled cut (sphere,
+    cone) still works: the base is sampled, so its surface is sampled too."""
     from forgekernel import body as B
 
-    body = shape if isinstance(shape, B.Body) else B.to_body(shape)
-    verts, tris = _tris_of(B.tessellate(body, 0.15))
+    if isinstance(shape, (SampledSolid, _MorphResult)):
+        verts, tris = _tris_of(shape.tessellate())
+    else:
+        body = shape if isinstance(shape, B.Body) else B.to_body(shape)
+        verts, tris = _tris_of(B.tessellate(body, 0.15))
     return [(verts[i], verts[j], verts[k]) for (i, j, k) in tris]
 
 
@@ -411,6 +507,55 @@ class _MorphResult:
 
     def watertight_violations(self):
         return []
+
+    def tessellate(self, deflection=0.2):
+        return _voxel_surface_from_grid(self._occ, self._dims, self._lo,
+                                        self._h)
+
+
+def _voxel_surface_from_grid(occ, dims, lo, h):
+    """A watertight surface mesh of a voxel set: every face between an inside
+    and an outside voxel, as two triangles. Blocky but CLOSED and valid — each
+    exposed face appears exactly once — which is all a faceted STEP needs."""
+    nx, ny, nz = dims
+
+    def at(i, j, k):
+        if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
+            return occ[(i * ny + j) * nz + k]
+        return False
+
+    verts: list = []
+    vidx: dict = {}
+
+    def v(x, y, z):
+        key = (x, y, z)
+        if key not in vidx:
+            vidx[key] = len(verts)
+            verts.append((lo[0] + x * h, lo[1] + y * h, lo[2] + z * h))
+        return vidx[key]
+
+    tris = []
+    # the 6 face directions and the CCW corner order giving an OUTWARD normal
+    faces = [
+        ((1, 0, 0), [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)]),
+        ((-1, 0, 0), [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)]),
+        ((0, 1, 0), [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)]),
+        ((0, -1, 0), [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)]),
+        ((0, 0, 1), [(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]),
+        ((0, 0, -1), [(0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)]),
+    ]
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                if not at(i, j, k):
+                    continue
+                for (d, corners) in faces:
+                    if at(i + d[0], j + d[1], k + d[2]):
+                        continue                # buried face, skip
+                    q = [v(i + c[0], j + c[1], k + c[2]) for c in corners]
+                    tris.append((q[0], q[1], q[2]))
+                    tris.append((q[0], q[2], q[3]))
+    return {"vertices": [list(p) for p in verts], "triangles": tris}
 
 
 def _ball_offsets(r, h):
