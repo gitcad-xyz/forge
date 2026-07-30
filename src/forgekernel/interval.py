@@ -369,3 +369,102 @@ def sin(x) -> CInterval:
     """
     half_pi = pi_interval() * CInterval.exact(Fraction(1, 2))
     return cos(half_pi - _as_ci(x))
+
+
+def arcsin_rational(v: Fraction, width: Fraction = _ARCCOS_WIDTH) -> CInterval:
+    """A certified enclosure of arcsin(v) for -1 <= v <= 1.
+
+    arcsin(v) = pi/2 - arccos(v), both certified, so this carries pi's
+    enclosure and arccos's. It is the primitive the exact-field WALLS need: a
+    square prism through a sphere removes a volume with an arcsin in it
+    (`_EXACT_FIELD_BOUNDARY`), which is transcendental — outside every ℚ[√d][π]
+    — but perfectly bracketable, which is what turns those cells from permanent
+    refusals into certified answers.
+    """
+    v = v if isinstance(v, Fraction) else Fraction(v)
+    if not (-1 <= v <= 1):
+        raise ValueError(f"arcsin outside [-1, 1]: {v}")
+    half_pi = pi_interval() * CInterval.exact(Fraction(1, 2))
+    return half_pi - arccos_rational(v, width)
+
+
+def ln_rational(x: Fraction, width: Fraction = _ARCCOS_WIDTH) -> CInterval:
+    """A certified enclosure of ln(x) for rational x > 0.
+
+    A float PROPOSES and exact arithmetic DISPOSES, the same discipline as
+    `arccos_rational`: `math.log` supplies a candidate m, and the bracket
+    [m-w, m+w] is accepted only when exp is PROVEN to sandwich x — exp(lo) <= x
+    <= exp(hi) — each bound from a certified `exp_rational`. exp is increasing,
+    so that sandwich is a proof.
+
+    This is the second wall primitive. A square prism through a CONE emits
+    ln(1+√2) = arcsinh(1) (`_EXACT_FIELD_BOUNDARY`, "by Baker"), a genuine
+    transcendental with a perfectly good rational enclosure.
+    """
+    import math
+
+    x = x if isinstance(x, Fraction) else Fraction(x)
+    if x <= 0:
+        raise ValueError(f"ln of a non-positive rational: {x}")
+    if x == 1:
+        return CInterval(Fraction(0), Fraction(0))
+    try:
+        approx = Fraction(math.log(float(x)))
+    except (ValueError, OverflowError):                 # pragma: no cover
+        raise ValueError(f"ln({x}) is out of float range")
+    w = width
+    for _ in range(14):
+        lo, hi = approx - w, approx + w
+        if exp_rational(lo).hi <= x and exp_rational(hi).lo >= x:
+            return CInterval(lo, hi)
+        w *= 1000
+    raise ValueError(f"ln({x}) could not be certified — report this")
+
+
+def exp_rational(t: Fraction, terms: int = 40) -> CInterval:
+    """A certified enclosure of exp(t) for rational t.
+
+    Σ tᵏ/k! with a rigorous tail bound. For t <= 0 the series alternates, so
+    the first omitted term bounds the remainder. For t > 0 the tail is bounded
+    by a geometric majorant once the ratio t/(N+1) < 1: the remainder past N is
+    below tᴺ⁺¹/(N+1)!·1/(1 − t/(N+1)). The domain that keeps that ratio under a
+    half is |t| <= (N+1)/2; outside it this refuses rather than under-bound.
+    """
+    t = t if isinstance(t, Fraction) else Fraction(t)
+    if abs(t) > Fraction(terms + 1, 2):
+        raise ValueError(
+            f"exp_rational: |t| = {float(abs(t)):.4g} too large for {terms} "
+            "terms to bound the tail")
+    total = Fraction(0)
+    term = Fraction(1)                                  # t^0/0!
+    for k in range(terms):
+        total += term
+        term = term * t / (k + 1)
+    # `term` is now t^terms/terms!. Tail bound:
+    if t <= 0:
+        # alternating (for t<0): |remainder| <= |first omitted term|
+        rem = abs(term)
+        return CInterval(total - rem, total + rem)
+    # t > 0: geometric majorant with ratio q = t/(terms+1) < 1
+    q = t / (terms + 1)
+    rem = term / (1 - q)                                # >= true positive tail
+    return CInterval(total, total + rem)
+
+
+def arctan_rational(v: Fraction, width: Fraction = _ARCCOS_WIDTH) -> CInterval:
+    """A certified enclosure of arctan(v) for rational v.
+
+    arctan(v) = arcsin(v / sqrt(1+v²)), routed through the certified arcsin —
+    so no third series. The argument v/sqrt(1+v²) is bracketed first (its sqrt
+    is certified by `CInterval.sqrt`), then arcsin of the bracket. The third
+    wall primitive: a cone's fillet contributes arctan linearly (Lindemann),
+    outside every algebraic extension of ℚ[π] and again bracketable.
+    """
+    v = v if isinstance(v, Fraction) else Fraction(v)
+    denom = CInterval.exact(Fraction(1) + v * v).sqrt()
+    arg = CInterval.exact(v) * ci_reciprocal(denom)
+    # arg is in [-1, 1]; arcsin of the whole interval
+    lo = max(Fraction(-1), min(Fraction(1), arg.lo))
+    hi = max(Fraction(-1), min(Fraction(1), arg.hi))
+    return CInterval(arcsin_rational(lo, width).lo,
+                     arcsin_rational(hi, width).hi)
