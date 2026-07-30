@@ -540,6 +540,102 @@ def _arc_quarters(c: Circle, v0, v1):
     return k0, (12 if span == 0 else span)
 
 
+def arc_cos_sin(c: Circle, p):
+    """The EXACT (cos, sin) of a point's angle on the circle, in its own frame.
+
+    This is the observation ADR-0023 turns on: an arc endpoint off the twelfth
+    grid still has an exactly known cosine and sine — they are (p-c)·u/r and
+    (p-c)·w/r, plain exact arithmetic — and it is only the ANGLE that has no
+    algebraic home. `_quarter_index` answers "which sector" and refuses off the
+    grid; this answers "where exactly", always.
+
+    A flat milled on a bar is the case that matters: its chord endpoints are
+    (cx+h, cy±sqrt(r²−h²)), so the cosine is h/r — RATIONAL at every rational
+    depth — and only the sine carries the surd. That is why an arccos of a
+    rational is enough to certify the span.
+    """
+    u, w = _circle_frame(c)
+    rel = sub(p, c.c)
+    return dot(rel, u) / c.r, dot(rel, w) / c.r
+
+
+def certified_bracket(x, tries: int = 12):
+    """A rational bracket around an exact scalar, PROVEN by exact comparison.
+
+    A cosine on the twelfth grid is ℚ[√3] — cos 30° = √3/2 — so restricting
+    this to rationals would decline most of the grid and leave the certified
+    path unable to check itself against the exact one. Anything in ℚ[√d] or
+    ℚ(√p,√q) needs a bracket instead.
+
+    A float PROPOSES the bracket and an exact comparison DISPOSES of it: the
+    candidate is widened until ``lo <= x <= hi`` holds in the scalar's own exact
+    field, which is a proof, not an estimate. That distinction is the whole of
+    ADR-0019 — a float may not DECIDE a topological question, and here it
+    decides nothing; if every candidate failed we return None and the caller
+    refuses by name.
+    """
+    from forgekernel.interval import CInterval
+
+    # `Fraction`, NOT this module's `F` — exact.F WIDENS (it passes ℚ[√d]
+    # through untouched and takes a single argument), so `F(1, 10**30)` is a
+    # TypeError and `F(x)` would hand back the very surd we are trying to
+    # bracket. The distinction has bitten this codebase repeatedly.
+    exact = _exact_as_fraction(x)
+    if exact is not None:
+        return CInterval(exact, exact)
+    try:
+        approx = Fraction(float(x))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    eps = Fraction(1, 10 ** 30)
+    for _ in range(tries):
+        lo, hi = approx - eps, approx + eps
+        try:
+            if lo <= x <= hi:
+                return CInterval(lo, hi)
+        except (TypeError, ValueError):
+            return None                        # this field will not order
+        eps *= 1000
+    return None
+
+
+def arc_span_certified(c: Circle, v0, v1):
+    """The arc's angular span as a certified interval (ADR-0023), or None.
+
+    Counter-clockwise about the circle's normal, matching `_arc_quarters`'
+    convention so the two are directly comparable — and they must be: where the
+    exact path answers, this has to BRACKET it, which is the only way to trust a
+    second implementation of a number the first one already computes. That
+    agreement is a test, not a comment.
+
+    Returns None rather than guessing when the cosine cannot be bracketed.
+    """
+    from forgekernel.interval import CInterval, arccos, pi_interval
+
+    def theta(p):
+        co, si = arc_cos_sin(c, p)
+        br = certified_bracket(co)
+        if br is None:
+            return None
+        a = arccos(br)
+        # arccos lands in [0, pi]; the lower half-turn is 2pi - that. The SIGN
+        # of the sine decides which, and a sign is exactly what every exact
+        # field here can still answer even when the angle cannot.
+        neg = (si.sign() < 0) if hasattr(si, "sign") else (si < 0)
+        if not neg:
+            return a
+        two_pi = pi_interval() * CInterval.exact(Fraction(2))
+        return two_pi - a
+
+    t0, t1 = theta(v0), theta(v1)
+    if t0 is None or t1 is None:
+        return None
+    span = t1 - t0
+    if span.hi <= 0:                           # wrapped past the seam
+        span = span + pi_interval() * CInterval.exact(Fraction(2))
+    return span
+
+
 def _quarter_antiderivative(c: Circle, k: int):
     """∫n̂ dθ at θ = k·π/6, i.e. sin(θ)u − cos(θ)w. In ℚ, or ℚ[√3] off the
     quarters."""
