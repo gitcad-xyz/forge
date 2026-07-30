@@ -90,7 +90,11 @@ def test_a_chord_off_the_grid_gets_a_span_the_exact_path_refuses(h):
     # tightness separately.
     want = 2 * (math.pi - math.acos(float(h / R)))
     assert abs(float(span.mid) - want) < 1e-12, (h, span, want)
-    assert span.width < F(1, 10 ** 20)
+    # ~1e-15: the bracket is centred on `math.acos`, so the FLOAT'S OWN ERROR
+    # is the floor (see `_ARCCOS_WIDTH`). Tighter needs bisection, which is
+    # what made one flat volume take 51 seconds. Still nine orders inside
+    # what certifying a sign needs.
+    assert span.width < F(1, 10 ** 12)
 
 
 def test_the_two_arcs_of_a_chord_close_the_circle():

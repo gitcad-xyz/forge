@@ -843,11 +843,64 @@ def _rational_sqrt(x):
     return Fraction(rn, rd) if rn * rn == n and rd * rd == d else None
 
 
+def _arc_sin_span(c: Circle, v0, v1):
+    """sin of the arc's SPAN, exactly, at any angle.
+
+    sin(θ₁−θ₀) = sinθ₁cosθ₀ − cosθ₁sinθ₀, and all four are exact
+    (`arc_cos_sin`). So the segment and band terms need a bracket for the ANGLE
+    only, never for its sine — which keeps the certified answer as tight as the
+    arccos and avoids widening a quantity that was never irrational.
+    """
+    c0, s0 = arc_cos_sin(c, v0)
+    c1, s1 = arc_cos_sin(c, v1)
+    return s1 * c0 - c1 * s0
+
+
+def _needs_certified(body: Body) -> bool:
+    """Does any face carry an arc off the twelfth grid?
+
+    Decided UP FRONT rather than by catching the exact path's ValueError. That
+    exception also carries genuine malformed-face errors — "an arc on a planar
+    face whose circle is not coplanar with it" is raised from the same place —
+    and a blanket retry would quietly turn a shape that is not a shape into a
+    certified answer.
+    """
+    for face in body.faces:
+        for lp in face.loops:
+            for e in lp.edges:
+                if not isinstance(e.curve, Circle):
+                    continue
+                if _key3(e.v0) == _key3(e.v1):
+                    continue                     # a full circle is on the grid
+                if (_quarter_index(e.curve, e.v0) is None
+                        or _quarter_index(e.curve, e.v1) is None):
+                    return True
+    return False
+
+
 def volume(body: Body):
     """Exact signed volume by the divergence theorem, V = (1/3)∮ x·n̂ dA,
-    evaluated per face in CLOSED FORM. Returns a ``PiVal`` (ℚ + ℚ·π)."""
+    evaluated per face in CLOSED FORM. Returns a ``PiVal`` (ℚ + ℚ·π).
+
+    ADR-0023: a body carrying an arc off the twelfth grid has no answer in
+    ℚ[√d][π], and for those — and only those — this returns a certified
+    ``CInterval``. Nothing that answered exactly before changes: the routing is
+    decided by `_needs_certified` before any arithmetic runs, so a shape on the
+    grid never reaches the interval path and stays byte-identical.
+    """
     from forgekernel.polypi import PiPoly
     from forgekernel.quadric import PiVal
+
+    if _needs_certified(body):
+        got = volume_certified(body)
+        if got is not None:
+            return got
+        # FALL THROUGH rather than raise a message of our own. The certified path
+        # is a best-effort improvement, and where it cannot help, the exact path
+        # below raises the refusal that NAMES THE REAL BLOCKER — "a spherical
+        # patch that is not an octant", say. Replacing that with a generic
+        # "ADR-0023 does not cover this" told a caller strictly less than before
+        # and pointed at the wrong work.
 
     total = PiPoly.rational(0)
     for face in body.faces:
@@ -860,6 +913,177 @@ def volume(body: Body):
     if total.degree <= 1:
         return PiVal(total[0], total[1])
     return total
+
+
+def volume_certified(body: Body):
+    """The same divergence integral, in certified interval arithmetic, or None.
+
+    ADR-0023's measure. A SECOND implementation of a number the exact path
+    already computes, which is how silent wrong answers are born — so the
+    contract that makes it safe is stated as a test, not a comment: wherever
+    `volume` answers exactly, this must BRACKET it, over the whole corpus.
+
+    Returns None for any face it does not cover, so the caller refuses by name
+    rather than reporting a partial sum. That is the important failure mode: a
+    dropped face term leaves a plausible number, and plausible numbers are what
+    the answer audit exists to catch.
+    """
+    from forgekernel.interval import CInterval
+
+    total = CInterval.exact(Fraction(0))
+    for face in body.faces:
+        term = _face_volume_term_certified(face)
+        if term is None:
+            return None
+        total = total + term
+    return total
+
+
+def bracket_exact_scalar(x):
+    """An exact scalar — ℚ, ℚ[√d], PiVal, PiPoly — as a CInterval, or None.
+
+    π enters only through `pi_interval`'s digit-verified enclosure, so a PiVal
+    or PiPoly is bracketed by bracketing each coefficient and summing πᵏ terms.
+    """
+    from forgekernel.interval import CInterval, pi_interval
+
+    coeffs = None
+    if hasattr(x, "degree") and hasattr(x, "__getitem__"):       # PiPoly
+        coeffs = [x[i] for i in range(x.degree + 1)]
+    elif hasattr(x, "a") and hasattr(x, "b"):                    # PiVal
+        coeffs = [x.a, x.b]
+    if coeffs is None:
+        return certified_bracket(x)
+    total = CInterval.exact(Fraction(0))
+    pi = pi_interval()
+    power = CInterval.exact(Fraction(1))
+    for c in coeffs:
+        cb = certified_bracket(c)
+        if cb is None:
+            return None
+        total = total + cb * power
+        power = power * pi
+    return total
+
+
+def _face_volume_term_certified(face: Face):
+    """(1/3)∮x·n̂ dA over one face as a CInterval, or None if not covered.
+
+    THE EXACT TERM IS TRIED FIRST AND BRACKETED. That is deliberate and is what
+    keeps this honest: a second implementation of a number the kernel already
+    computes is how silent wrong answers are born, so the new arithmetic runs
+    ONLY for the faces whose exact term does not exist. Every other face — every
+    plane, every untrimmed band, every sphere zone — goes through the very code
+    the exact path uses, so there is nothing for the two to disagree about.
+
+    A first version wrote a parallel plane term and got it wrong by a factor of
+    |n|: the exact route divides by the normal's length TWICE (once inside the
+    loop area, once in the term) and normals here are not unit — a box face
+    carries n = (0,0,±800) — so a box came back 266x too large. The mismatch was
+    caught by the corpus cross-check, which is the argument for having it.
+    """
+    from forgekernel.interval import CInterval
+
+    try:
+        return bracket_exact_scalar(_face_volume_term(face))
+    except ValueError:
+        pass                    # off the twelfth grid — the ADR-0023 cases below
+
+    s = face.surface
+    sgn = 1 if face.sense else -1
+
+    def ci(x):
+        return certified_bracket(x)
+
+    if isinstance(s, Plane):
+        nn = dot(s.n, s.n)
+        ln = _rational_sqrt(nn)
+        if ln is None:
+            return None
+        acc = CInterval.exact(Fraction(0))
+        for i, lp in enumerate(face.loops):
+            area = _mixed_loop_area_certified(lp, s.n, ln)
+            if area is None:
+                return None
+            if i:
+                area = CInterval.exact(Fraction(0)) - area   # a hole subtracts
+            acc = acc + area
+        # (1/3)(d/|n|)·Area, and `_mixed_loop_area_certified` has already
+        # divided by |n| once — so |n| appears twice in total, which is the
+        # factor the first version dropped.
+        d_over = ci(s.d / (3 * ln))
+        if d_over is None:
+            return None
+        term = d_over * acc
+        return term if sgn > 0 else CInterval.exact(Fraction(0)) - term
+
+    if isinstance(s, Cylinder):
+        # x·n̂ = p·N̂ + r, so ∮x·n̂dA = r·h·(p·∫N̂dθ + r·Δθ). ∫N̂dθ is EXACT even
+        # off the grid — its antiderivative is sinθ·u − cosθ·w and both are
+        # exact — so Δθ is the only certified quantity in the whole term.
+        h = _band_height(face, s)
+        arcs = []
+        for lp in face.loops:
+            if _loop_is_circle(lp) is not None:
+                continue
+            for e in lp.edges:
+                if isinstance(e.curve, Circle) and _key3(e.v0) != _key3(e.v1):
+                    arcs.append(e)
+        if not arcs:
+            return None                          # untrimmed: the exact path has it
+        u, w = _circle_frame(arcs[0].curve)
+        fwd = [e for e in arcs if dot(e.curve.n, s.d) > 0]
+        if not fwd:
+            return None
+        dtheta = CInterval.exact(Fraction(0))
+        vint = (F(0), F(0), F(0))
+        for e in fwd:
+            span = arc_span_certified(e.curve, e.v0, e.v1)
+            if span is None:
+                return None
+            dtheta = dtheta + span
+            c0, s0 = arc_cos_sin(e.curve, e.v0)
+            c1, s1 = arc_cos_sin(e.curve, e.v1)
+            # [sinθ·u − cosθ·w] between the endpoints — exact
+            vint = tuple(vint[k] + (s1 - s0) * u[k] - (c1 - c0) * w[k]
+                         for k in range(3))
+        exact_part = ci(dot(s.p, vint))
+        rr, hh = ci(s.r), ci(h)
+        if exact_part is None or rr is None or hh is None:
+            return None
+        inner = exact_part + rr * dtheta
+        term = rr * hh * inner * CInterval.exact(Fraction(1, 3))
+        return term if sgn > 0 else CInterval.exact(Fraction(0)) - term
+
+    return None
+
+
+def _mixed_loop_area_certified(loop: Loop, n: Vec, ln):
+    """A planar loop's area as a CInterval — chord polygon plus one circular
+    segment per arc, the segment being (r²/2)(θ − sinθ) with θ certified and
+    sinθ exact. Mirrors `_mixed_loop_area` term for term on purpose: the two are
+    checked against each other, so they must be comparable line by line."""
+    from forgekernel.interval import CInterval
+
+    acc = certified_bracket(_planar_loop_area2(loop, n) / (2 * ln))
+    if acc is None:
+        return None
+    for e in loop.edges:
+        if not isinstance(e.curve, Circle):
+            continue
+        axial = dot(e.curve.n, n)
+        if any(x != 0 for x in cross(e.curve.n, n)) or axial == 0:
+            raise ValueError(
+                "an arc on a planar face whose circle is not coplanar with it "
+                "— the face is malformed, not merely unsupported")
+        theta = arc_span_certified(e.curve, e.v0, e.v1)
+        sin_b = certified_bracket(_arc_sin_span(e.curve, e.v0, e.v1))
+        r2 = certified_bracket(e.curve.r * e.curve.r)
+        if theta is None or sin_b is None or r2 is None:
+            return None
+        seg = r2 * CInterval.exact(Fraction(1, 2)) * (theta - sin_b)
+        acc = acc + (seg if axial > 0 else CInterval.exact(Fraction(0)) - seg)
+    return acc
 
 
 def _face_volume_term(face: Face):
@@ -1639,6 +1863,89 @@ def vector_area(body: Body):
             vint = _band_sweep(arcs, s)[1]
             for i in range(3):
                 out[i] = out[i] + PiPoly([h * s.r * vint[i] * sgn, F(0)])
+        else:
+            return None
+    return tuple(out)
+
+
+def vector_area_certified(body: Body):
+    """Σ Areaᵢ·n̂ᵢ as a triple of CIntervals, or None (ADR-0023).
+
+    The orientation oracle, kept AT FULL STRENGTH for bodies carrying off-grid
+    arcs. Letting `vector_area` return None for them was the easy option and it
+    would have shipped a new capability with a weaker audit than everything
+    around it — a face whose loop runs backwards still pairs its edges and can
+    still leave the volume positive, so this is the only check that sees it.
+
+    Only the PLANE areas need bracketing. A band's ∮n̂dA is r·h·∫N̂dθ, and ∫N̂dθ
+    is exact at any angle — its antiderivative is sinθ·u − cosθ·w and both are
+    exact — so the cylinder contribution stays in the exact field even here.
+    """
+    from forgekernel.interval import CInterval, pi_interval
+
+    zero = CInterval.exact(Fraction(0))
+    out = [zero, zero, zero]
+    for f in body.faces:
+        s, sgn = f.surface, (1 if f.sense else -1)
+        if isinstance(s, Plane):
+            ln = _rational_sqrt(dot(s.n, s.n))
+            if ln is None:
+                return None
+            acc = zero
+            for i, lp in enumerate(f.loops):
+                circ = _loop_is_circle(lp)
+                if circ is not None:
+                    r2 = certified_bracket(circ.r * circ.r)
+                    if r2 is None:
+                        return None
+                    a = pi_interval() * r2
+                    if i:
+                        a = zero - a
+                elif _loop_has_arcs(lp):
+                    a = _mixed_loop_area_certified(lp, s.n, ln)
+                    if a is None:
+                        return None
+                    if i:
+                        a = zero - a
+                else:
+                    a2 = _planar_loop_area2(lp, s.n)
+                    a = certified_bracket(
+                        (a2 if i == 0 else -abs(a2)) / (2 * ln))
+                    if a is None:
+                        return None
+                acc = acc + a
+            for i in range(3):
+                comp = certified_bracket(sgn * s.n[i] / ln)
+                if comp is None:
+                    return None
+                out[i] = out[i] + acc * comp
+        elif isinstance(s, Cylinder):
+            arcs = []
+            for lp in f.loops:
+                if _loop_is_circle(lp) is not None:
+                    continue
+                for e in lp.edges:
+                    if (isinstance(e.curve, Circle)
+                            and _key3(e.v0) != _key3(e.v1)):
+                        arcs.append(e)
+            if not arcs:
+                continue                    # a full band contributes nothing
+            u, w = _circle_frame(arcs[0].curve)
+            fwd = [e for e in arcs if dot(e.curve.n, s.d) > 0]
+            if not fwd:
+                return None
+            h = _band_height(f, s)
+            vint = (F(0), F(0), F(0))
+            for e in fwd:
+                c0, s0 = arc_cos_sin(e.curve, e.v0)
+                c1, s1 = arc_cos_sin(e.curve, e.v1)
+                vint = tuple(vint[k] + (s1 - s0) * u[k] - (c1 - c0) * w[k]
+                             for k in range(3))
+            for i in range(3):
+                term = certified_bracket(h * s.r * vint[i] * sgn)
+                if term is None:
+                    return None
+                out[i] = out[i] + term
         else:
             return None
     return tuple(out)

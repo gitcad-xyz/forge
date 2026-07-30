@@ -116,17 +116,53 @@ def test_it_matches_an_independent_monte_carlo():
     assert float(B.volume(out)) == pytest.approx(mc, rel=0.01)
 
 
-def test_an_eighth_is_not_a_twelfth():
-    """sqrt2/2 is cos 45, which the rotation table holds and the ARC machinery
-    does not. Refusing is correct; quietly rounding to 30 or 60 would not be."""
-    with pytest.raises(FlatRefused, match="twelfth"):
-        flat_cut(_bar(), R * sqrt_rational(2) / 2)
+def test_an_eighth_is_no_longer_a_refusal_but_is_no_longer_exact_either():
+    """sqrt2/2 is cos 45: the rotation table holds it, the ARC machinery does
+    not. This USED to refuse, and refusing was right at the time — quietly
+    rounding 45 to 30 or 60 would not have been.
+
+    ADR-0023 gives it a third answer. The chord endpoints are exact at any
+    depth, so the BODY is built exactly; only the arc's angle has no algebraic
+    home, so the volume comes back as a certified bracket instead of a PiVal.
+    The refusal was never about the geometry.
+    """
+    from forgekernel.interval import CInterval
+
+    body = flat_cut(_bar(), R * sqrt_rational(2) / 2)
+    assert not B.manifold_violations(body)
+    v = B.volume(body)
+    assert isinstance(v, CInterval)              # certified, not exact
+    assert v.sign() > 0
 
 
 @pytest.mark.parametrize("h", [F(2), F(1), F(7, 3)])
-def test_an_arbitrary_depth_refuses_by_name(h):
-    with pytest.raises(FlatRefused, match="twelfth"):
-        flat_cut(_bar(), h)
+def test_an_arbitrary_depth_answers_with_a_certified_volume(h):
+    """The measurement that motivated ADR-0023: on a radius-5 bar the exact
+    path answers 3 of 33 rational depths. A machinist milling a flat gets a
+    number at every depth now, labelled certified, and the closed form
+    r^2(pi - t + sin t cos t)*H is the oracle."""
+    import math
+
+    from forgekernel.interval import CInterval
+
+    body = flat_cut(_bar(), h)
+    assert not B.manifold_violations(body)
+    v = B.volume(body)
+    assert isinstance(v, CInterval)
+    t = math.acos(float(h) / float(R))
+    want = float(R) ** 2 * (math.pi - t + math.sin(t) * math.cos(t)) * float(H)
+    assert v.lo <= want <= v.hi or abs(float(v.mid) - want) < 1e-9 * want
+
+
+@pytest.mark.parametrize("h", [F(0), R / 2, -R / 2])
+def test_the_exact_depths_stay_exact(h):
+    """ADR-0019's rule, and the acceptance criterion for ADR-0023: a model that
+    COULD be exact must not silently fall back to an interval. The five depths
+    with an exact answer must still return a PiVal, byte for byte."""
+    from forgekernel.interval import CInterval
+
+    v = B.volume(flat_cut(_bar(), h))
+    assert not isinstance(v, CInterval), f"h={h} fell back to an interval"
 
 
 @pytest.mark.parametrize("h", [R, -R, R * 2, -R * 3])

@@ -92,6 +92,74 @@ def _arc_edges(circle, cx, cy, z, r, ks):
                  for i in range(len(ks) - 1))
 
 
+def _flat_off_grid(cyl, h) -> B.Body:
+    """The same four-face flat, at a depth with no exact arc angle (ADR-0023).
+
+    Identical in structure to the exact construction below — two caps, the
+    remaining band, the flat — and it differs in exactly one way: the chord
+    endpoints are the true intersection points ``(cx+h, cy ± sqrt(r²−h²))``
+    instead of twelfth points, and the arc is split at whichever twelfths fall
+    strictly INSIDE it. One `Edge` between two points on a circle is ambiguous
+    (there are two arcs joining them), and splitting at every twelfth the walk
+    passes is the same disambiguation the exact path uses.
+
+    Measured before it was wired up: manifold at h = 1, 5/2, 3, −1, 7/3 with
+    zero unpaired edges, and its certified volume matches the closed form
+    r²(π − θ + sinθcosθ)·H at every one of them. The audit still runs, so a
+    shell this produces has to close like any other.
+    """
+    from forgekernel.surd import sqrt_rational
+
+    r, cx, cy, z0, z1 = cyl.r, cyl.cx, cyl.cy, cyl.z0, cyl.z1
+    s = sqrt_rational(r * r - h * h)
+    cos_t = h / r
+    # the twelfths STRICTLY inside the kept arc: those whose cosine is below the
+    # chord's, i.e. further round than the chord endpoints on the axis side
+    ks = [k for k in range(1, 12)
+          if B._sin_cos_twelfths()[k][0] < cos_t]
+
+    def tw(z, k):
+        co, si = B._sin_cos_twelfths()[k % 12]
+        return (cx + r * co, cy + r * si, z)
+
+    def chain(circle, z, forward: bool):
+        pts = ([(cx + h, cy + s, z)] + [tw(z, k) for k in ks]
+               + [(cx + h, cy - s, z)])
+        if not forward:
+            pts = list(reversed(pts))
+        return tuple(B.Edge(circle, pts[i], pts[i + 1])
+                     for i in range(len(pts) - 1))
+
+    def line(p, q):
+        return B.Edge(B.Line(p, tuple(q[i] - p[i] for i in range(3))), p, q)
+
+    c_lo_dn = B.Circle((cx, cy, z0), DN, XR, r)
+    c_lo_up = B.Circle((cx, cy, z0), UP, XR, r)
+    c_hi_up = B.Circle((cx, cy, z1), UP, XR, r)
+    c_hi_dn = B.Circle((cx, cy, z1), DN, XR, r)
+    a_lo, b_lo = (cx + h, cy + s, z0), (cx + h, cy - s, z0)
+    a_hi, b_hi = (cx + h, cy + s, z1), (cx + h, cy - s, z1)
+
+    bottom = B.Face(B.Plane(DN, -z0), (B.Loop(
+        chain(c_lo_dn, z0, False) + (line(a_lo, b_lo),)),), True)
+    top = B.Face(B.Plane(UP, z1), (B.Loop(
+        chain(c_hi_up, z1, True) + (line(b_hi, a_hi),)),), True)
+    band = B.Face(B.Cylinder((cx, cy, z0), UP, r), (B.Loop(
+        chain(c_lo_up, z0, True) + (line(b_lo, b_hi),)
+        + chain(c_hi_dn, z1, False) + (line(a_hi, a_lo),)),), True)
+    flat = B.Face(B.Plane(XR, cx + h), (B.Loop((
+        line(b_lo, a_lo), line(a_lo, a_hi),
+        line(a_hi, b_hi), line(b_hi, b_lo))),), True)
+
+    out = B.Body((bottom, top, band, flat))
+    bad = B.manifold_violations(out)
+    if bad:
+        raise FlatRefused(
+            f"the off-grid flat produced a shell with {len(bad)} unpaired "
+            "edges — refusing rather than returning a body that is not closed")
+    return out
+
+
 def flat_cut(cyl, h, keep_axis_side: bool = True) -> B.Body:
     """A ``Cyl`` with one flat milled at signed offset ``h`` along +x.
 
@@ -114,12 +182,16 @@ def flat_cut(cyl, h, keep_axis_side: bool = True) -> B.Body:
 
     k = _twelfth_cos_index(h / r)
     if k is None:
-        raise FlatRefused(
-            f"h/r = {float(h / r):.6g} is not the cosine of a twelfth, so the "
-            "kept area's arc term is an arccos with no algebraic value this "
-            "kernel holds (Niven) — the exact flats are h/r in "
-            "{0, +-1/2, +-sqrt3/2}, i.e. the chord meeting the circle at a "
-            "multiple of 30 degrees")
+        # ADR-0023. Off the twelfth grid the kept area's arc term is an arccos
+        # with no algebraic value (Niven), so there is no EXACT answer — but the
+        # GEOMETRY is exact at every rational depth, because the chord meets the
+        # circle at (cx+h, cy±sqrt(r²−h²)) and that lives in ℚ[√d]. Only the
+        # measure needs certifying, and `body.volume` routes it.
+        #
+        # The exact path below is kept verbatim for the five depths that have
+        # one, so those results stay byte-identical: ADR-0019's rule is that a
+        # model which COULD be exact must not silently fall back to an interval.
+        return _flat_off_grid(cyl, h)
 
     # the chord meets the circle at +-k twelfths; keep the arc going the LONG
     # way round through 180 deg, which is the side the axis is on

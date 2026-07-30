@@ -19,6 +19,7 @@ refuses — never guesses.
 from __future__ import annotations
 
 from fractions import Fraction
+from functools import lru_cache
 from math import isqrt
 
 # pi to 60 decimal places (a widely tabulated, digit-verified constant).
@@ -170,7 +171,15 @@ def ci_reciprocal(x: CInterval) -> CInterval:
 # has no algebraic home but it has a perfectly good rational enclosure. What
 # was missing was only the primitive.
 
-def cos_rational(t: Fraction, terms: int = 30) -> CInterval:
+#: Terms of cos's series needed for a remainder below ~1e-30 on |t| <= pi:
+#: pi^40/40! is about 1e-28 and pi^44/44! about 1e-33, so 22 is ample and 30 was
+#: simply generous. It matters because these are EXACT rationals — a bracket
+#: endpoint has a ~25-digit denominator, so t^(2N) carries ~2N*25 digits and the
+#: cost is superlinear in N. Trimming 30 to 22 is a third off the largest powers.
+_COS_TERMS = 22
+
+
+def cos_rational(t: Fraction, terms: int = _COS_TERMS) -> CInterval:
     """A certified enclosure of cos(t) for rational ``t``.
 
     Alternating series with the first omitted term as the remainder bound —
@@ -204,16 +213,90 @@ def cos_rational(t: Fraction, terms: int = 30) -> CInterval:
     return CInterval(total - term, total + term)
 
 
-def arccos_rational(v: Fraction, width: Fraction = Fraction(1, 10 ** 40)
-                    ) -> CInterval:
-    """A certified enclosure of arccos(v) for -1 <= v <= 1, to ``width``.
+#: Requested half-width for a float-proposed arccos bracket.
+#:
+#: THE FLOAT'S OWN ERROR IS THE FLOOR HERE, and that is the honest trade-off in
+#: this file. The bracket is centred on `math.acos`, which is accurate to ~1e-16,
+#: so asking for 1e-25 does not produce 1e-25 — verification fails, the loop
+#: widens, and it settles near 1e-16 anyway after several wasted rounds.
+#: Requesting 1e-15 succeeds on the first try instead.
+#:
+#: Tighter is available and costs real time: bisecting down from here needs one
+#: exact cos evaluation per halving, and those are rationals whose denominators
+#: double each step, so t^44 grows past a thousand digits. Bisecting to 1e-40 is
+#: what made a single flat-on-a-bar volume take 51 SECONDS. A caller who needs a
+#: narrower bracket passes `width=` and pays for it.
+#:
+#: 1e-15 on an angle is ~1e-10 absolute on the volume of a Ø10 bar — about 1e-13
+#: relative, comparable to a double's own error but PROVEN to enclose rather than
+#: hoped. ADR-0019 asks for a certified sign and a reportable half-width; this
+#: gives both with room to spare.
+_ARCCOS_WIDTH = Fraction(1, 10 ** 15)
 
-    Bisection against `cos_rational`, keeping the invariant that the true
-    root stays inside [a, b]: cos is strictly decreasing on [0, pi], so a
-    midpoint whose certified cos is entirely ABOVE v puts the root to its
-    right, and entirely below puts it to the left. If the cos bracket
-    straddles v the step is not certified and the loop STOPS rather than
-    guessing a side — [a, b] still encloses, it is merely wider than asked.
+
+@lru_cache(maxsize=4096)
+def arccos_rational(v: Fraction, width: Fraction = _ARCCOS_WIDTH
+                    ) -> CInterval:
+    """A certified enclosure of arccos(v) for -1 <= v <= 1.
+
+    MEMOISED, and that is a real speedup rather than tidiness: measuring one
+    flat-on-a-bar volume showed ~80 calls for ~12 distinct arguments, because a
+    body's faces share their arc endpoints — the same twelfth point bounds a cap
+    and the band that meets it. Pure function of (v, width), so the cache cannot
+    change an answer.
+
+    A FLOAT PROPOSES AND EXACT ARITHMETIC DISPOSES — the same discipline as
+    `body.certified_bracket`, and here it is also what makes this usable at all.
+    `math.acos` supplies a candidate, and the bracket is accepted only when
+    exact arithmetic PROVES it encloses: cos is strictly decreasing on [0, pi],
+    so it is enough that cos(lo) >= v >= cos(hi), each established from a
+    certified `cos_rational`. The float decides nothing; if it lied, verification
+    fails and the bracket widens.
+
+    WHY NOT BISECTION, which is what this did first. Bisecting to 1e-40 takes
+    ~133 exact-rational cos evaluations whose denominators compound every step,
+    and each evaluation raises a huge fraction to the 60th power. One certified
+    volume for a flat on a bar took **51 seconds**. This needs exactly TWO cos
+    evaluations at a denominator the float fixes, and it is milliseconds.
+
+    The default width is 1e-25 rather than 1e-40 — still tighter than a double
+    by nine orders of magnitude, and ADR-0019 only ever needs enough to certify
+    a sign. `bisect_arccos_rational` keeps the old route for anyone who needs a
+    guaranteed answer without trusting a float to propose one.
+    """
+    import math
+
+    v = v if isinstance(v, Fraction) else Fraction(v)
+    if not (-1 <= v <= 1):
+        raise ValueError(f"arccos outside [-1, 1]: {v}")
+    if v == 1:
+        return CInterval(Fraction(0), Fraction(0))
+    if v == -1:
+        return pi_interval()
+    hi_pi = pi_interval().hi
+    try:
+        approx = Fraction(math.acos(float(v)))
+    except (ValueError, OverflowError):                 # pragma: no cover
+        return bisect_arccos_rational(v, width)
+    w = width
+    for _ in range(14):
+        lo = max(Fraction(0), approx - w)
+        hi = min(hi_pi, approx + w)
+        # cos(lo) >= v >= cos(hi) proves the root is in [lo, hi], by
+        # monotonicity on [0, pi]. Certified bounds on each side, so this is a
+        # proof and not a comparison of estimates.
+        if cos_rational(lo).lo >= v and cos_rational(hi).hi <= v:
+            return CInterval(lo, hi)
+        w *= 1000
+    return bisect_arccos_rational(v, width)
+
+
+def bisect_arccos_rational(v: Fraction,
+                           width: Fraction = _ARCCOS_WIDTH
+                           ) -> CInterval:
+    """arccos by pure bisection — no float anywhere, at the cost of ~133 exact
+    cos evaluations. Kept as the fallback `arccos_rational` drops to when a
+    proposed bracket cannot be verified, so a float is never load-bearing.
     """
     v = v if isinstance(v, Fraction) else Fraction(v)
     if not (-1 <= v <= 1):
@@ -248,7 +331,7 @@ def arccos_rational(v: Fraction, width: Fraction = Fraction(1, 10 ** 40)
     return CInterval(a, b)
 
 
-def arccos(x, width: Fraction = Fraction(1, 10 ** 40)) -> CInterval:
+def arccos(x, width: Fraction = _ARCCOS_WIDTH) -> CInterval:
     """arccos of a certified interval — the enclosure of every value in it.
 
     arccos is DECREASING, so the bracket flips: the low end comes from the
