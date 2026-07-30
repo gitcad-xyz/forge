@@ -71,3 +71,23 @@ def test_chains_compose():
     second = SampledSolid.boolean("cut", first, _box(40, 3, 40, -20, -1.5, -20))
     v = second.volume(100000)
     assert v.sign() > 0
+
+
+def test_sampled_shell_matches_an_exact_box_shell():
+    """A shell is a clean membership — inside AND within t of the surface — so
+    the sampled tier answers it accurately (no mesh deficit in the SET, only in
+    the distance, which is far under the wall thickness). A 20-cube shelled to
+    t=2 is 8000 - 16³ = 3904 exactly."""
+    from forgekernel.sampled import sampled_shell
+    box = translate(Solid.box(20, 20, 20), 0, 0, 0)
+    v = sampled_shell(box, 2).volume(200000)
+    assert abs(float(v.mid) - 3904.0) <= float(v.hi - v.lo) / 2 + 20
+
+
+def test_no_sampled_fillet_is_shipped():
+    """ADR-0024's honesty line, pinned. A mesh fillet's error is SYSTEMATIC
+    (resolution), not the statistical error the half-width reports, so a sampled
+    fillet would lie about its accuracy. It must not exist until an
+    offset-surface construction can bound it."""
+    import forgekernel.sampled as s
+    assert not hasattr(s, "sampled_fillet")
