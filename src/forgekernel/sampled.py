@@ -148,8 +148,8 @@ class SampledSolid:
 
     # -- construction --------------------------------------------------------
 
-    @staticmethod
-    def _region(shape):
+    @classmethod
+    def _region(cls, shape):
         """(inside_fn, bbox) for any operand.
 
         ANALYTIC membership for the primitive families — a point is in a sphere
@@ -332,6 +332,34 @@ class SampledSolid:
                     if self._inside(p):
                         occ[(i * ny + j) * nz + k] = True
         return _voxel_surface_from_grid(occ, dims, tuple(lo), h)
+
+
+def voxel_mesh(shape, cells=48):
+    """A watertight voxel-surface mesh of ANY shape `_region` can classify.
+
+    The display/export fallback for an exact representation that has no
+    canonical-B-rep converter (an `AxisStack` from a coaxial union, say):
+    without this it could be measured but never rendered or exported — a
+    dead-end. Blocky and float (meshing is where ADR-0019 permits floats), but
+    a real closed mesh. Raises if the shape cannot be classified, so a caller
+    still refuses honestly rather than shipping an empty mesh.
+    """
+    inside, bbox = SampledSolid._region(shape)
+    lo, hi = bbox
+    span = [float(hi[k]) - float(lo[k]) for k in range(3)]
+    h = max(span) / cells or 1.0
+    dims = [int(math.ceil(span[k] / h)) + 1 for k in range(3)]
+    nx, ny, nz = dims
+    occ = [False] * (nx * ny * nz)
+    lo = tuple(float(x) for x in lo)
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                p = (lo[0] + (i + 0.5) * h, lo[1] + (j + 0.5) * h,
+                     lo[2] + (k + 0.5) * h)
+                if inside(p):
+                    occ[(i * ny + j) * nz + k] = True
+    return _voxel_surface_from_grid(occ, dims, lo, h)
 
 
 def write_step_faceted(mesh, name="gitcad_part"):
