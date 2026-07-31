@@ -160,13 +160,18 @@ def _flat_off_grid(cyl, h) -> B.Body:
     return out
 
 
-def flat_cut(cyl, h, keep_axis_side: bool = True) -> B.Body:
+def flat_cut(cyl, h) -> B.Body:
     """A ``Cyl`` with one flat milled at signed offset ``h`` along +x.
 
     ``h`` is the signed distance from the axis to the flat; the material kept
     is x <= cx + h. h > 0 leaves more than half the bar, h = 0 halves it, and
     h < 0 leaves less than half. |h| < r is required — a flat that misses the
     bar is not a flat, and one that removes everything is not a solid.
+
+    (Kept side is ALWAYS x <= cx + h. A former ``keep_axis_side`` parameter was
+    vestigial — never read, so a caller passing it False silently got the same
+    solid — and is removed; to keep the far side, mirror as ``_flat_on_bar``
+    does, or negate h.)
     """
     from forgekernel.quadric import Cyl
 

@@ -1838,8 +1838,23 @@ def centroid(body: Body):
                 S = (sq(k0 + span) - sq(k0)) / 2
                 pu = sum(mid[i] * u[i] for i in range(3))
                 pw = sum(mid[i] * w[i] for i in range(3))
+                # THE D-TERM, which this on-grid path dropped exactly as the
+                # off-grid path once did (`_centroid_offgrid`). ∫cos² and ∫sin²
+                # over the band are A/2 ± D/2, not A/2 — equal only when
+                # D = sin θ₁cos θ₁ − sin θ₀cos θ₀ = 0, i.e. a quarter/half turn.
+                # A flat's band arc is neither, so omitting (D/2)(pu·u − pw·w)
+                # gave a silently wrong centre of mass — visible as a broken
+                # mirror symmetry — for any flat on a bar NOT modelled at the
+                # transverse origin (pu, pw ≠ 0). sin(kπ/6)cos(kπ/6) =
+                # sin(kπ/3)/2, whose twelfths are 0, ±√3/4.
+                _sc3 = math.sqrt(3) / 4
+                sc = lambda kk: (0.0, _sc3, _sc3, 0.0, -_sc3, -_sc3,
+                                 0.0, _sc3, _sc3, 0.0, -_sc3, -_sc3)[kk % 12]
+                D = sc(k0 + span) - sc(k0)
                 mm = tuple((A / 2) * (mid[k] - md * d[k])
-                           + S * (u[k] * pw + w[k] * pu) for k in range(3))
+                           + S * (u[k] * pw + w[k] * pu)
+                           + (D / 2) * (pu * u[k] - pw * w[k])
+                           for k in range(3))
             pv = sum(mid[k] * vn[k] for k in range(3))
             for k in range(3):
                 val = rr * h * ((mid[k]) * (pv + rr * A)

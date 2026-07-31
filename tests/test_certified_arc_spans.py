@@ -179,3 +179,25 @@ def test_the_band_moment_D_term_is_not_optional():
     """
     cen = B.centroid(_flat_body(F(1)))
     assert abs(cen[0] - (-1.5931)) < 1e-3, cen
+
+
+# -- the on-grid centroid D-term (review finding #2) -------------------------
+
+def test_the_on_grid_centroid_carries_the_D_term_off_origin():
+    """A flat milled at an EXACT depth (h=r/2) on a bar NOT at the transverse
+    origin: the on-grid centroid dropped the band-moment D-term (the same bug
+    fixed off-grid), giving a silently wrong centre of mass that broke the
+    flat's mirror symmetry. Pinned by translation covariance + mirror symmetry
+    against Monte-Carlo, all oracle-independent of the implementation."""
+    from forgekernel.flat import flat_cut
+    from forgekernel.quadric import Cyl
+    c0 = B.centroid(flat_cut(Cyl(F(0), F(0), F(4), F(0), F(10)), F(2)))
+    cT = B.centroid(flat_cut(Cyl(F(10), F(5), F(4), F(0), F(10)), F(2)))
+    # translation covariance: moving the bar by (10,5) moves the centroid by it
+    assert abs(cT[0] - (c0[0] + 10)) < 1e-6, (c0, cT)
+    assert abs(cT[1] - (c0[1] + 5)) < 1e-6, (c0, cT)
+    # mirror symmetry: the flat is symmetric about y = cy = 5
+    assert abs(cT[1] - 5.0) < 1e-9, cT
+    # on-grid now equals the off-grid (D-term) path
+    off = B._centroid_offgrid(flat_cut(Cyl(F(10), F(5), F(4), F(0), F(10)), F(2)))
+    assert all(abs(cT[k] - off[k]) < 1e-9 for k in range(3)), (cT, off)

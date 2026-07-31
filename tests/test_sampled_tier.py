@@ -121,3 +121,29 @@ def test_shell_of_a_sampled_solid_works():
     cut = SampledSolid.boolean("cut", Sphere(0, 0, 0, 4),
                                _box(2, 20, 20, -1, -10, -10))
     assert sampled_shell(cut, 1).volume(40000).sign() > 0
+
+
+def test_a_meshed_curved_operand_bracket_encloses_the_truth():
+    """The review's CRITICAL finding: a SampledSolid over a curved BODY operand
+    takes the mesh fallback, whose MC converges to the tessellation polyhedron
+    (systematically below the true curved volume). The reported half-width must
+    fold in that geometric deficit (area*deflection) so the bracket ENCLOSES the
+    truth — a statistical 3σ alone excluded it (the ADR-0019 forbidden case)."""
+    import math
+    from forgekernel import body as B
+    from forgekernel.quadric import Cyl
+    cyl_body = B.to_body(Cyl(0, 0, 5, 0, 12))          # a Body -> mesh fallback
+    box = translate(Solid.box(12, 12, 14), -6, -6, -1)  # contains the cylinder
+    v = SampledSolid.boolean("intersect", cyl_body, box).volume(150000)
+    truth = math.pi * 25 * 12
+    assert v.lo <= truth <= v.hi, (float(v.lo), float(v.hi), truth)
+
+
+def test_disjoint_intersect_answers_zero_not_a_crash():
+    """The review's finding #7: two disjoint operands give an inverted bbox; the
+    intersection is empty and must measure ~0, not raise 'degenerate interval'."""
+    from forgekernel.quadric import Sphere
+    d = SampledSolid.boolean("intersect", Sphere(0, 0, 0, 2),
+                             translate(Solid.box(2, 2, 2), 20, 20, 20))
+    v = d.volume(20000)
+    assert float(v.lo) == 0.0 and float(v.hi) == 0.0

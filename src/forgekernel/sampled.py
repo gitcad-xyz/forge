@@ -87,11 +87,33 @@ def _ray_hits_tri(o, d, a, b, c):
 
 
 class _MeshRegion:
-    """Point membership for one closed triangle mesh (odd crossings = inside)."""
+    """Point membership for one closed triangle mesh (odd crossings = inside).
 
-    def __init__(self, mesh):
+    ``area`` is the mesh surface area; with the tessellation deflection it
+    bounds the mesh's VOLUME DEFICIT vs the true curved solid — every surface
+    point lies within ``deflection`` of the mesh, so the enclosed-volume error
+    is at most ``area * deflection``. That geometric term is what the sampled
+    half-width must fold in (a statistical 3σ alone excludes the true value for
+    any curved operand — the bug this class's membership otherwise invites)."""
+
+    def __init__(self, mesh, deflection):
         self.verts, self.tris = _tris_of(mesh)
         self.bbox = _mesh_bbox(self.verts)
+        self.deflection = deflection
+        a = 0.0
+        for (i, j, k) in self.tris:
+            p0, p1, p2 = self.verts[i], self.verts[j], self.verts[k]
+            e1 = tuple(p1[t] - p0[t] for t in range(3))
+            e2 = tuple(p2[t] - p0[t] for t in range(3))
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            a += 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
+        self.area = a
+
+    @property
+    def geom_halfwidth(self):
+        return self.area * self.deflection
 
     def inside(self, p):
         lo, hi = self.bbox
@@ -142,15 +164,19 @@ class SampledSolid:
     provenance = "sampled"
     is_exact_scalar = False
 
-    def __init__(self, inside, bbox):
+    def __init__(self, inside, bbox, geom_hw=0.0):
         self._inside = inside
         self._bbox = bbox
+        # geometric (mesh-deficit) half-width, folded into the reported bound so
+        # the sampled bracket ENCLOSES the true value even when an operand had
+        # to be meshed. 0 when every operand had exact/analytic membership.
+        self._geom_hw = geom_hw
 
     # -- construction --------------------------------------------------------
 
     @classmethod
     def _region(cls, shape):
-        """(inside_fn, bbox) for any operand.
+        """(inside_fn, bbox, geom_halfwidth) for any operand.
 
         ANALYTIC membership for the primitive families — a point is in a sphere
         iff it satisfies the sphere inequality, not iff it is inside a
@@ -158,30 +184,34 @@ class SampledSolid:
         tier: a coarse mesh of a sphere r=6 has ~4% less volume than the sphere,
         and sampling THAT measures the mesh, not the solid (a first version did
         exactly this and came back 34 mm³ low, far outside its own 3σ). With
-        exact membership the only error is statistical.
+        exact membership the only error is statistical, so ``geom_halfwidth`` is
+        0 for every analytic path.
 
         A general `Body` (a cut result carrying trimmed quadric faces) has no
-        cheap exact membership, so it falls back to a fine mesh with a geometric
-        error term folded into the reported half-width — honest, coarser.
+        cheap exact membership, so it falls back to a fine mesh — and returns a
+        NON-ZERO geom_halfwidth (area·deflection) that `volume` folds into the
+        reported bound, because the mesh systematically UNDER-fills a curved
+        solid and a statistical 3σ alone would exclude the true value.
         """
         from forgekernel import body as B
         from forgekernel.brep import Solid
         from forgekernel.quadric import Cone, Cyl, Sphere
 
         if isinstance(shape, SampledSolid):
-            return shape._inside, shape._bbox
+            return shape._inside, shape._bbox, shape._geom_hw
         if isinstance(shape, Sphere):
             cx, cy, cz, r = (float(shape.cx), float(shape.cy),
                              float(shape.cz), float(shape.r))
             inside = lambda p: ((p[0] - cx) ** 2 + (p[1] - cy) ** 2
                                 + (p[2] - cz) ** 2 <= r * r)
-            return inside, ((cx - r, cy - r, cz - r), (cx + r, cy + r, cz + r))
+            return (inside, ((cx - r, cy - r, cz - r), (cx + r, cy + r, cz + r)),
+                    0.0)
         if isinstance(shape, Cyl):
             cx, cy, r = float(shape.cx), float(shape.cy), float(shape.r)
             z0, z1 = float(shape.z0), float(shape.z1)
             inside = lambda p: ((p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= r * r
                                 and z0 <= p[2] <= z1)
-            return inside, ((cx - r, cy - r, z0), (cx + r, cy + r, z1))
+            return inside, ((cx - r, cy - r, z0), (cx + r, cy + r, z1)), 0.0
         if isinstance(shape, Cone):
             cx, cy = float(shape.cx), float(shape.cy)
             r1, r2 = float(shape.r1), float(shape.r2)
@@ -193,10 +223,10 @@ class SampledSolid:
                 rad = r1 + (r2 - r1) * (p[2] - z0) / (z1 - z0)
                 return (p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= rad * rad
             rm = max(r1, r2)
-            return inside, ((cx - rm, cy - rm, z0), (cx + rm, cy + rm, z1))
+            return inside, ((cx - rm, cy - rm, z0), (cx + rm, cy + rm, z1)), 0.0
         if isinstance(shape, Solid):
             reg = _PlanarRegion(shape)
-            return reg.inside, reg.bbox
+            return reg.inside, reg.bbox, 0.0        # planar: no curvature deficit
         from forgekernel.quadric import AxisStack, DrilledSolid, RevolveSolid
 
         if isinstance(shape, RevolveSolid):
@@ -223,32 +253,36 @@ class SampledSolid:
                         if r < rc:
                             inq = not inq
                 return inq
-            return inside, ((cx - rmax, cy - rmax, min(zs)),
-                            (cx + rmax, cy + rmax, max(zs)))
+            return (inside, ((cx - rmax, cy - rmax, min(zs)),
+                             (cx + rmax, cy + rmax, max(zs))), 0.0)
         if isinstance(shape, DrilledSolid):
-            base_in, bbox = cls._region(shape.base)
-            bores = [cls._region(b)[0] for b in shape.bores]
-            return (lambda p: base_in(p) and not any(bi(p) for bi in bores),
-                    bbox)
+            base_in, bbox, gb = cls._region(shape.base)
+            bores = [cls._region(b) for b in shape.bores]
+            bins = [bi for bi, _, _ in bores]
+            g = gb + sum(bg for _, _, bg in bores)
+            return (lambda p: base_in(p) and not any(bi(p) for bi in bins),
+                    bbox, g)
         if isinstance(shape, AxisStack):
             mem = [cls._region(m) for m in shape.prims]
-            los = [b[0] for _, b in mem]
-            his = [b[1] for _, b in mem]
-            fns = [f for f, _ in mem]
+            fns = [f for f, _, _ in mem]
+            los = [b[0] for _, b, _ in mem]
+            his = [b[1] for _, b, _ in mem]
             bbox = (tuple(min(l[k] for l in los) for k in range(3)),
                     tuple(max(h[k] for h in his) for k in range(3)))
-            return (lambda p: any(f(p) for f in fns), bbox)
+            return (lambda p: any(f(p) for f in fns), bbox,
+                    sum(g for _, _, g in mem))
         # a general Body: exact membership is not cheap, so mesh finely and
-        # carry the meshing error explicitly (see `volume`)
+        # carry the meshing DEFICIT explicitly in the half-width (see `volume`).
+        deflection = 0.08
         body = shape if isinstance(shape, B.Body) else B.to_body(shape)
-        reg = _MeshRegion(B.tessellate(body, 0.08))
-        reg.is_mesh = True
-        return reg.inside, reg.bbox
+        reg = _MeshRegion(B.tessellate(body, deflection), deflection)
+        return reg.inside, reg.bbox, reg.geom_halfwidth
 
     @classmethod
     def boolean(cls, op, a, b):
-        ia, ba = cls._region(a)
-        ib, bb = cls._region(b)
+        ia, ba, ga = cls._region(a)
+        ib, bb, gb = cls._region(b)
+        geom = ga + gb                               # deficits add (conservative)
         if op == "cut":
             inside = lambda p: ia(p) and not ib(p)
             bbox = ba                                # result ⊆ a
@@ -257,12 +291,19 @@ class SampledSolid:
             bbox = (tuple(min(ba[0][k], bb[0][k]) for k in range(3)),
                     tuple(max(ba[1][k], bb[1][k]) for k in range(3)))
         elif op == "intersect":
+            lo = tuple(max(ba[0][k], bb[0][k]) for k in range(3))
+            hi = tuple(min(ba[1][k], bb[1][k]) for k in range(3))
+            if any(lo[k] > hi[k] for k in range(3)):
+                # DISJOINT operands: the intersection is empty. An inverted bbox
+                # would give a negative sampling volume and crash CInterval with
+                # 'degenerate interval' — a curved fit-check with clearance must
+                # answer ~0, not raise.
+                return cls(lambda p: False, (lo, lo), geom)
             inside = lambda p: ia(p) and ib(p)
-            bbox = (tuple(max(ba[0][k], bb[0][k]) for k in range(3)),
-                    tuple(min(ba[1][k], bb[1][k]) for k in range(3)))
+            bbox = (lo, hi)
         else:
             raise ValueError(f"sampled boolean: unknown op {op!r}")
-        return cls(inside, bbox)
+        return cls(inside, bbox, geom)
 
     # -- measures (Monte-Carlo, with a reported 3σ half-width) ---------------
 
@@ -282,19 +323,28 @@ class SampledSolid:
     def volume(self, n=200000):
         """(midpoint, half-width) as a certified-interval-shaped pair.
 
-        The estimator is hits/n · V_bbox, unbiased; its standard error is
-        V_bbox·√(p(1−p)/n) and the half-width reported is 3σ. Not a rigorous
-        enclosure — statistical — which is exactly why the provenance says so.
+        The estimator is hits/n · V_bbox, unbiased FOR THE MEMBERSHIP SET; its
+        standard error is V_bbox·√(p(1−p)/n). The reported half-width is that
+        3σ PLUS the geometric deficit ``_geom_hw`` — because when an operand had
+        to be meshed the membership set is the tessellation, which
+        systematically under-fills a curved solid, and a statistical bar alone
+        would exclude the true value (the ADR-0019 forbidden case). With
+        analytic membership _geom_hw is 0 and the bound is purely statistical.
+        Not a rigorous enclosure — the provenance says `sampled` — but its
+        stated error now covers the systematic bias too.
         """
         from forgekernel.interval import CInterval
 
+        lo, hi = self._bbox
+        if any(hi[k] <= lo[k] for k in range(3)):
+            return CInterval(_frac(0), _frac(0))     # empty set (disjoint ∩)
         hits, _pts, span = self._sample(n)
         vbox = span[0] * span[1] * span[2]
         p = hits / n
         mid = p * vbox
         import math
         sigma = vbox * math.sqrt(max(p * (1 - p), 1e-12) / n)
-        hw = 3 * sigma
+        hw = 3 * sigma + self._geom_hw
         return CInterval(_frac(mid - hw), _frac(mid + hw))
 
     def centroid_f(self, n=200000):
@@ -344,7 +394,7 @@ def voxel_mesh(shape, cells=48):
     a real closed mesh. Raises if the shape cannot be classified, so a caller
     still refuses honestly rather than shipping an empty mesh.
     """
-    inside, bbox = SampledSolid._region(shape)
+    inside, bbox, _geom = SampledSolid._region(shape)
     lo, hi = bbox
     span = [float(hi[k]) - float(lo[k]) for k in range(3)]
     h = max(span) / cells or 1.0
@@ -477,6 +527,9 @@ def _point_tri_dist2(p, a, b, c):
     return sum((p[k] - q[k]) ** 2 for k in range(3))
 
 
+_SURFACE_DEFLECTION = 0.15
+
+
 def _surface_tris(shape):
     """Triangles of a shape's surface mesh, for distance / area queries.
 
@@ -489,8 +542,20 @@ def _surface_tris(shape):
         verts, tris = _tris_of(shape.tessellate())
     else:
         body = shape if isinstance(shape, B.Body) else B.to_body(shape)
-        verts, tris = _tris_of(B.tessellate(body, 0.15))
+        verts, tris = _tris_of(B.tessellate(body, _SURFACE_DEFLECTION))
     return [(verts[i], verts[j], verts[k]) for (i, j, k) in tris]
+
+
+def _tris_area(tris):
+    a = 0.0
+    for (p0, p1, p2) in tris:
+        e1 = tuple(p1[t] - p0[t] for t in range(3))
+        e2 = tuple(p2[t] - p0[t] for t in range(3))
+        cx = e1[1] * e2[2] - e1[2] * e2[1]
+        cy = e1[2] * e2[0] - e1[0] * e2[2]
+        cz = e1[0] * e2[1] - e1[1] * e2[0]
+        a += 0.5 * (cx * cx + cy * cy + cz * cz) ** 0.5
+    return a
 
 
 def sampled_shell(base, thickness):
@@ -502,19 +567,22 @@ def sampled_shell(base, thickness):
     via the minimum distance to the surface triangles — so this samples the
     true shelled set, and its only error is statistical.
 
-    The surface distance uses a mesh, so a curved wall's distance carries the
-    tessellation's error; at deflection 0.15 that is well under the wall
-    thickness for any real shell, and it is a distance, not a topological
-    decision.
+    The surface distance uses an INSCRIBED mesh, so on a curved base the wall
+    set is biased (interior points reach the mesh at slightly less than t). That
+    bias is a VOLUME error bounded by the mesh deficit — surface_area·deflection
+    — so it is folded into the sampled half-width alongside the base's own
+    geometric term, exactly as `volume` does for the mesh boolean. A statistical
+    bar alone would exclude the truth on a curved wall.
     """
-    inside, bbox = SampledSolid._region(base)
+    inside, bbox, base_geom = SampledSolid._region(base)
     tris = _surface_tris(base)
     t2 = float(thickness) ** 2
 
     def near_surface(p):
         return any(_point_tri_dist2(p, *tri) < t2 for tri in tris)
 
-    return SampledSolid(lambda p: inside(p) and near_surface(p), bbox)
+    geom = base_geom + _tris_area(tris) * _SURFACE_DEFLECTION
+    return SampledSolid(lambda p: inside(p) and near_surface(p), bbox, geom)
 
 
 class _MorphResult:
@@ -673,7 +741,7 @@ def sampled_fillet(base, radius):
     Verified against an exact RoundedBox (fillet-all of a box) within the
     reported surface_area·h.
     """
-    inside, bbox = SampledSolid._region(base)
+    inside, bbox, _geom = SampledSolid._region(base)
     r = float(radius)
     lo, hi = bbox
     pad = r * 1.5
