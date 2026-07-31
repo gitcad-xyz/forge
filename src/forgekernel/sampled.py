@@ -197,6 +197,47 @@ class SampledSolid:
         if isinstance(shape, Solid):
             reg = _PlanarRegion(shape)
             return reg.inside, reg.bbox
+        from forgekernel.quadric import AxisStack, DrilledSolid, RevolveSolid
+
+        if isinstance(shape, RevolveSolid):
+            # point-in-solid-of-revolution: reduce to the 2D (r, z) profile
+            # polygon. Exact and O(profile), so a bolt hole through a flange no
+            # longer tessellates the revolve to thousands of triangles and
+            # ray-casts every sample against all of them — the source of the
+            # `mass_props` HANG a real bolt-circle hit (never returned in 90s).
+            cx, cy = float(shape.cx), float(shape.cy)
+            prof = [(float(r), float(z)) for r, z in shape.loop]
+            zs = [z for _, z in prof]
+            rmax = max(r for r, _ in prof)
+
+            def inside(p):
+                r = ((p[0] - cx) ** 2 + (p[1] - cy) ** 2) ** 0.5
+                z = p[2]
+                # ray-cast in (r, z) against the profile polygon
+                inq = False
+                m = len(prof)
+                for i in range(m):
+                    (r0, z0), (r1, z1) = prof[i], prof[(i + 1) % m]
+                    if (z0 > z) != (z1 > z):
+                        rc = r0 + (z - z0) * (r1 - r0) / (z1 - z0)
+                        if r < rc:
+                            inq = not inq
+                return inq
+            return inside, ((cx - rmax, cy - rmax, min(zs)),
+                            (cx + rmax, cy + rmax, max(zs)))
+        if isinstance(shape, DrilledSolid):
+            base_in, bbox = cls._region(shape.base)
+            bores = [cls._region(b)[0] for b in shape.bores]
+            return (lambda p: base_in(p) and not any(bi(p) for bi in bores),
+                    bbox)
+        if isinstance(shape, AxisStack):
+            mem = [cls._region(m) for m in shape.prims]
+            los = [b[0] for _, b in mem]
+            his = [b[1] for _, b in mem]
+            fns = [f for f, _ in mem]
+            bbox = (tuple(min(l[k] for l in los) for k in range(3)),
+                    tuple(max(h[k] for h in his) for k in range(3)))
+            return (lambda p: any(f(p) for f in fns), bbox)
         # a general Body: exact membership is not cheap, so mesh finely and
         # carry the meshing error explicitly (see `volume`)
         body = shape if isinstance(shape, B.Body) else B.to_body(shape)

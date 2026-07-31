@@ -828,6 +828,26 @@ def _solve3(rows, rhs):
     return tuple(out)
 
 
+def solid_is_convex(solid: Solid) -> bool:
+    """True iff every vertex lies on the inward side of every face plane.
+
+    A convex solid is the intersection of its face half-spaces, so this exact
+    rational test (no tolerance) characterises convexity for a planar solid.
+    Used to gate operations whose per-edge tools assume convexity — see
+    `chamfer_planar` — and mirrors `quadric._require_convex`'s reasoning.
+    """
+    planes: dict = {}
+    verts: set = set()
+    for p in solid.polys:
+        planes.setdefault(p.plane.canonical(), (p.plane.n, p.plane.d))
+        verts.update(p.verts)
+    for n, dpl in planes.values():
+        for v in verts:
+            if dot(n, v) - dpl > 0:
+                return False
+    return True
+
+
 def chamfer_planar(solid: Solid, distance, edges: list[dict] | None = None) -> Solid:
     """Exact chamfer on convex edges whose face normals admit rational
     unit vectors (axis-aligned and Pythagorean orientations). Each edge
@@ -840,6 +860,27 @@ def chamfer_planar(solid: Solid, distance, edges: list[dict] | None = None) -> S
     d = F(distance)
     if d <= 0:
         raise ValueError("chamfer wants positive distance")
+    # CONVEXITY IS REQUIRED, and skipping this check was a silent ~10x
+    # over-removal on any non-convex prism (an L-bracket chamfered at c removed
+    # volume LINEAR in c instead of the correct c^2, reported `exact`, passing
+    # every audit). Each edge tool is a parallelepiped sized to the whole-part
+    # BBOX EXTENT; on a convex solid its excess falls outside and `csg.cut`
+    # clips it to the local wedge, but on a non-convex solid the oversized tool
+    # reaches into another part of the body and removes material there too.
+    # Refuse rather than lie — the same rule `_require_convex` enforces for
+    # quadric booleans (test_boss.py). A correctly bounded local wedge tool for
+    # non-convex prisms is a real feature (K5.2), not this primitive.
+    # Keyed on the SOLID, not the edge set: the tool is bbox-sized, so it
+    # over-removes on ANY non-convex host regardless of which edges are named.
+    # (`kernel.chamfer` always passes `logical_edges(s)`, so an `edges is None`
+    # guard here never fired — the first version of this fix missed for exactly
+    # that reason.)
+    if not solid_is_convex(solid):
+        raise ValueError(
+            "chamfer of a non-convex solid is not built — each edge tool is "
+            "sized to the bounding box and only a convex solid clips it to the "
+            "local wedge; a non-convex host over-removes silently "
+            "(K5.2 general blends)")
     todo = edges if edges is not None else logical_edges(solid)
     lo, hi = solid.bbox()
     extent = (hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2]) + 1
